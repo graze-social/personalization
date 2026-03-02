@@ -1,5 +1,5 @@
 # Graze Personalization Service
-![Graze Social artwork by Jeffrey Kam https://www.jeffreykam.net/](./image.png)
+!["Music of Gounod" https://pdimagearchive.org/images/dee81f50-db65-4680-a545-bf35b3a0aa47/](./image.png)
 A high-performance microservice for real-time personalized feed ranking using the LinkLonk algorithm. Written in Rust with Axum and Redis.
 
 ## Overview

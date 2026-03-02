@@ -54,7 +54,10 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             post(personalize::author_affinity_diagnostic),
         )
         // Feed management
-        .route("/v1/feeds", get(admin::list_feeds).post(admin::register_feed))
+        .route(
+            "/v1/feeds",
+            get(admin::list_feeds).post(admin::register_feed),
+        )
         .route("/v1/feeds/:algo_id", delete(admin::deregister_feed))
         .route("/v1/feeds/status/:algo_id", get(admin::feed_status))
         .route(
@@ -107,8 +110,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/v1/thompson/success-criteria",
-            get(admin::get_thompson_success_criteria)
-                .put(admin::put_thompson_success_criteria),
+            get(admin::get_thompson_success_criteria).put(admin::put_thompson_success_criteria),
         )
         // Audit user management
         .route("/v1/audit/users", post(admin::add_audit_users))

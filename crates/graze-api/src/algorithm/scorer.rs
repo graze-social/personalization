@@ -294,10 +294,7 @@ impl Scorer {
             // Sort each co-liker's likes by time descending, assign ranks, build lookup
             let mut ranks: FxHashMap<usize, FxHashMap<&str, usize>> = FxHashMap::default();
             for (co_liker, mut entries) in per_coliker {
-                entries.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 for (rank, (post_idx, _)) in entries.iter().enumerate() {
                     ranks.entry(*post_idx).or_default().insert(co_liker, rank);
                 }

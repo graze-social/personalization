@@ -258,7 +258,12 @@ mod tests {
     #[test]
     fn test_inject_pinned_first_page_only() {
         let base_posts: Vec<(String, BlendedSource)> = (0..10)
-            .map(|i| (format!("post{}", i), BlendedSource::PostLevelPersonalization))
+            .map(|i| {
+                (
+                    format!("post{}", i),
+                    BlendedSource::PostLevelPersonalization,
+                )
+            })
             .collect();
         let special_posts = SpecialPostsResponse {
             algorithm_id: 1,
@@ -287,7 +292,12 @@ mod tests {
     #[test]
     fn test_no_duplicate_injection() {
         let base_posts: Vec<(String, BlendedSource)> = (0..10)
-            .map(|i| (format!("post{}", i), BlendedSource::PostLevelPersonalization))
+            .map(|i| {
+                (
+                    format!("post{}", i),
+                    BlendedSource::PostLevelPersonalization,
+                )
+            })
             .collect();
         let special_posts = SpecialPostsResponse {
             algorithm_id: 1,
@@ -304,8 +314,14 @@ mod tests {
 
         let (posts2, _cursor2) = inject_special_posts(base_posts, &special_posts, &cursor1, 10);
 
-        let rotating_count = posts2.iter().filter(|(u, _)| u == "at://rotating/post/1").count();
-        let sponsored_count = posts2.iter().filter(|(u, _)| u == "at://sponsored/post/1").count();
+        let rotating_count = posts2
+            .iter()
+            .filter(|(u, _)| u == "at://rotating/post/1")
+            .count();
+        let sponsored_count = posts2
+            .iter()
+            .filter(|(u, _)| u == "at://sponsored/post/1")
+            .count();
         assert_eq!(rotating_count, 0);
         assert_eq!(sponsored_count, 0);
     }
@@ -330,7 +346,12 @@ mod tests {
     #[test]
     fn test_max_interspersed_cap() {
         let base_posts: Vec<(String, BlendedSource)> = (0..10)
-            .map(|i| (format!("post{}", i), BlendedSource::PostLevelPersonalization))
+            .map(|i| {
+                (
+                    format!("post{}", i),
+                    BlendedSource::PostLevelPersonalization,
+                )
+            })
             .collect();
         let special_posts = SpecialPostsResponse {
             algorithm_id: 1,

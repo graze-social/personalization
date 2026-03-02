@@ -5,7 +5,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::Utc;
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
@@ -13,6 +12,7 @@ use axum::{
     Extension, Json,
 };
 use base64::Engine;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{debug, error, info, warn};
@@ -110,24 +110,20 @@ fn encode_feed_context(
     is_personalization_holdout: Option<bool>,
 ) -> Option<String> {
     let (source, personalization_type, fallback_tranche, attribution, personalized) = match prov {
-        ItemProvenance::Base(BlendedSource::PostLevelPersonalization) => {
-            (
-                "personalized".to_string(),
-                Some("post_level".to_string()),
-                None,
-                None,
-                true,
-            )
-        }
-        ItemProvenance::Base(BlendedSource::AuthorAffinity) => {
-            (
-                "author_affinity".to_string(),
-                Some("author_level".to_string()),
-                None,
-                None,
-                true,
-            )
-        }
+        ItemProvenance::Base(BlendedSource::PostLevelPersonalization) => (
+            "personalized".to_string(),
+            Some("post_level".to_string()),
+            None,
+            None,
+            true,
+        ),
+        ItemProvenance::Base(BlendedSource::AuthorAffinity) => (
+            "author_affinity".to_string(),
+            Some("author_level".to_string()),
+            None,
+            None,
+            true,
+        ),
         ItemProvenance::Base(BlendedSource::Fallback { tranche }) => (
             "fallback".to_string(),
             None,
@@ -617,8 +613,7 @@ pub async fn get_feed_skeleton(
                 }
                 base_posts_tagged.push((uri, BlendedSource::Fallback { tranche }));
             }
-        }
-        else if state.config.feed_cache_enabled {
+        } else if state.config.feed_cache_enabled {
             let cache_offset = feed_cursor.offset.max(0) as isize;
 
             // Check if cache exists by getting its length
@@ -701,9 +696,7 @@ pub async fn get_feed_skeleton(
                     .flatten()
                     .and_then(|s| serde_json::from_str(&s).ok());
 
-                let holdout_override = feed_config
-                    .as_ref()
-                    .and_then(|c| c.holdout_params.as_ref());
+                let holdout_override = feed_config.as_ref().and_then(|c| c.holdout_params.as_ref());
                 let treatment_override = feed_config
                     .as_ref()
                     .and_then(|c| c.treatment_params.as_ref());
@@ -713,12 +706,13 @@ pub async fn get_feed_skeleton(
                     .or(global_search_space.as_ref());
 
                 // Select Thompson Sampling parameters for this request
-                let thompson_params: SelectedParams = state.thompson.select_params_with_holdout_and_search_space(
-                    algo_id,
-                    holdout_override,
-                    treatment_override,
-                    search_space,
-                );
+                let thompson_params: SelectedParams =
+                    state.thompson.select_params_with_holdout_and_search_space(
+                        algo_id,
+                        holdout_override,
+                        treatment_override,
+                        search_space,
+                    );
 
                 // Convert Thompson params to PersonalizationParams override
                 let params_override = PersonalizationParams {
@@ -875,7 +869,10 @@ pub async fn get_feed_skeleton(
                         // Skip request-time recording when interaction_weights is configured -
                         // we only learn from likes (interaction path), otherwise fast-response
                         // signal drowns out the like signal (~100x more common).
-                        if feed_config.as_ref().is_none_or(|c| c.interaction_weights.is_empty()) {
+                        if feed_config
+                            .as_ref()
+                            .is_none_or(|c| c.interaction_weights.is_empty())
+                        {
                             state
                                 .thompson
                                 .record_observation(algo_id, &thompson_params, success);
@@ -903,9 +900,8 @@ pub async fn get_feed_skeleton(
                         fallback_reason = Some("personalization_error");
 
                         // Record failure for Thompson learning
-                        let thompson_params: SelectedParams = state
-                            .thompson
-                            .select_params_with_holdout_and_search_space(
+                        let thompson_params: SelectedParams =
+                            state.thompson.select_params_with_holdout_and_search_space(
                                 algo_id,
                                 holdout_override,
                                 treatment_override,
@@ -997,8 +993,12 @@ pub async fn get_feed_skeleton(
         .await
         .unwrap_or_else(|_| SpecialPostsResponse::empty(algo_id));
 
-    let (final_with_provenance, updated_cursor) =
-        inject_special_posts(base_posts_tagged.clone(), &special_posts, &feed_cursor, limit);
+    let (final_with_provenance, updated_cursor) = inject_special_posts(
+        base_posts_tagged.clone(),
+        &special_posts,
+        &feed_cursor,
+        limit,
+    );
 
     // ═══════════════════════════════════════════════════════════════════
     // Build response cursor
@@ -1265,9 +1265,7 @@ pub async fn send_interactions(
     // Returns immediately; background worker batches and flushes every few seconds.
     if state.config.interactions_logging_enabled {
         if let (Some(ref did), Some(ref queue)) = (&user_did, &state.interaction_queue) {
-            queue
-                .send(did.clone(), request.interactions.clone())
-                .await;
+            queue.send(did.clone(), request.interactions.clone()).await;
         }
     }
 
@@ -1351,9 +1349,7 @@ pub async fn send_interactions(
             _ => continue,
         };
 
-        let selected_params = state
-            .thompson
-            .selected_params_from_provenance(params);
+        let selected_params = state.thompson.selected_params_from_provenance(params);
 
         // Speed gate: slow response = negative signal (learn to avoid these params)
         if response_time_ms > config.speed_gate_ms {

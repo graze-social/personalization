@@ -107,7 +107,11 @@ impl InteractionsClient {
             }
         }
         // Fallback: durable write-through map (accept interactions after deregister)
-        match self.redis.hget(Keys::FEED_URI_TO_ALGO_WRITES, feed_uri).await {
+        match self
+            .redis
+            .hget(Keys::FEED_URI_TO_ALGO_WRITES, feed_uri)
+            .await
+        {
             Ok(Some(algo_id_str)) => match algo_id_str.parse::<i32>() {
                 Ok(id) => {
                     debug!(feed_uri = %feed_uri, algo_id = id, "algo_id from FEED_URI_TO_ALGO_WRITES (deregistered feed)");
@@ -319,5 +323,4 @@ mod tests {
         let decoded = InteractionsClient::decode_feed_context(&encoded);
         assert!(decoded.is_none());
     }
-
 }

@@ -289,4 +289,4 @@ docker pull dgaff/graze-personalization:latest
 
 ## License
 
-MIT
+This project is dual-licensed under the Apache License, Version 2.0 or the MIT License, at your option. See [LICENSE](LICENSE) and [LICENSE-MIT](LICENSE-MIT) for the full text.

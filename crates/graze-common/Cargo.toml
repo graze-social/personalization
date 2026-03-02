@@ -1,0 +1,48 @@
+[package]
+name = "graze-common"
+version = "0.2.0"
+edition = "2021"
+description = "Shared infrastructure for Graze personalization service"
+license = "MIT"
+
+[dependencies]
+# Redis
+deadpool-redis = { version = "0.22", features = ["connection-manager", "script", "tokio-comp", "tokio-rustls-comp"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP client (for special posts service)
+reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"], default-features = false }
+
+# WebSocket (for error types)
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging/Tracing
+tracing = "0.1"
+
+# Utilities
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+lru = "0.12"
+parking_lot = "0.12"
+dashmap = "6.1"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Async runtime (for types)
+tokio = { version = "1.43", features = ["sync", "net"] }
+async-trait = "0.1"
+
+# Web server (for metrics endpoint)
+axum = "0.8"
+
+# AT Protocol
+atproto-record = { version = "0.13", default-features = false }

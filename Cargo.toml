@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/graze-common",
+    "crates/graze-api",
+    "crates/graze-like-streamer",
+    "crates/graze-candidate-sync",
+    "crates/graze-frontdoor",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

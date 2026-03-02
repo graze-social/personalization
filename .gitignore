@@ -1,0 +1,32 @@
+# Environment files with secrets
+docker-compose.override.yml
+personalization/scripts/
+.claude/skills/
+graze_personalization/__pycache__/
+
+.env
+.env.local
+.env.*.local
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docker
+.docker/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.context/

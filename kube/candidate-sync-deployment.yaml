@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graze-personalization-candidate-sync
+  labels:
+    app: graze-personalization
+    component: candidate-sync
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: graze-personalization
+      component: candidate-sync
+  template:
+    metadata:
+      labels:
+        app: graze-personalization
+        component: candidate-sync
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: sync
+          image: dgaff/graze-personalization:latest
+          command: ["python", "-m", "graze_personalization", "candidate-sync"]
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          env:
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: redis-url
+            - name: CLICKHOUSE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: clickhouse-host
+            - name: CLICKHOUSE_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: clickhouse-port
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: clickhouse-user
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: clickhouse-password
+            - name: CLICKHOUSE_SECURE
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: clickhouse-secure
+            - name: WORKER_TYPE
+              value: "candidate-sync"
+            - name: ALGO_POSTS_LIMIT
+              value: "20000"
+            - name: SYNC_RATE_LIMIT_SECONDS
+              value: "300"
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000

@@ -1,0 +1,74 @@
+[package]
+name = "graze-like-streamer"
+version = "0.2.0"
+edition = "2021"
+description = "Graze Jetstream consumer and like graph processor"
+license = "MIT"
+
+[[bin]]
+name = "graze-like-streamer"
+path = "src/main.rs"
+
+[[bin]]
+name = "graze-backfill"
+path = "src/bin/backfill_likes.rs"
+
+[[bin]]
+name = "graze-backfill-ula"
+path = "src/bin/backfill_ula.rs"
+
+[[bin]]
+name = "graze-migrate-tranches"
+path = "src/bin/migrate_to_day_tranches.rs"
+
+[[bin]]
+name = "graze-migrate-dates"
+path = "src/bin/migrate_to_dates.rs"
+
+[[bin]]
+name = "graze-verify-migration"
+path = "src/bin/verify_migration.rs"
+
+[lib]
+name = "graze_like_streamer"
+path = "src/lib.rs"
+
+[dependencies]
+# Internal dependencies
+graze-common = { path = "../graze-common" }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full", "signal"] }
+
+# WebSocket (for Jetstream)
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+rand = "0.8"
+bloomfilter = "1.0"
+rayon = "1.10"
+dashmap = "6.1"
+parking_lot = "0.12"
+rustc-hash = "2.0"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging/Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# AT Protocol
+atproto-record = { version = "0.13", default-features = false }
+
+# Metrics
+prometheus-client = "0.22"

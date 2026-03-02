@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graze-personalization-like-streamer
+  labels:
+    app: graze-personalization
+    component: like-streamer
+spec:
+  replicas: 1  # Singleton - only one instance should run
+  strategy:
+    type: Recreate  # No rolling update for singleton
+  selector:
+    matchLabels:
+      app: graze-personalization
+      component: like-streamer
+  template:
+    metadata:
+      labels:
+        app: graze-personalization
+        component: like-streamer
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: streamer
+          image: dgaff/graze-personalization:latest
+          command: ["python", "-m", "graze_personalization", "like-streamer"]
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          envFrom:
+            - configMapRef:
+                name: graze-personalization-config
+          env:
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: redis-url
+            - name: WORKER_TYPE
+              value: "like-streamer"
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      terminationGracePeriodSeconds: 30

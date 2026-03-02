@@ -1,0 +1,46 @@
+[package]
+name = "graze-frontdoor"
+version = "0.2.0"
+edition = "2021"
+description = "Graze HTTP request router with DID allowlist"
+license = "MIT"
+
+[[bin]]
+name = "graze-frontdoor"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace crates
+graze-common = { path = "../graze-common" }
+
+# Async runtime
+tokio = { version = "1.43", features = ["full", "signal"] }
+
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Redis
+deadpool-redis = { version = "0.22", features = ["connection-manager", "tokio-comp", "tokio-rustls-comp"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# Metrics
+prometheus-client = "0.22"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+
+# URL parsing
+url = "2.5"
+
+# Error handling
+anyhow = "1.0"
+
+# Logging/Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# AT Protocol
+atproto-record = { version = "0.13", default-features = false }

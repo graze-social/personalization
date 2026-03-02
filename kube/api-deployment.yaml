@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graze-personalization-api
+  labels:
+    app: graze-personalization
+    component: api
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: graze-personalization
+      component: api
+  template:
+    metadata:
+      labels:
+        app: graze-personalization
+        component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: api
+          image: dgaff/graze-personalization:latest
+          command: ["python", "-m", "graze_personalization", "api"]
+          ports:
+            - containerPort: 8080
+              name: http
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "1000m"
+          env:
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: redis-url
+            - name: CLICKHOUSE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: clickhouse-host
+            - name: CLICKHOUSE_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: clickhouse-port
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: clickhouse-user
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: clickhouse-password
+            - name: CLICKHOUSE_SECURE
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: clickhouse-secure
+            - name: ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: graze-personalization-secrets
+                  key: admin-api-key
+            - name: WORKER_TYPE
+              value: "api"
+            - name: HTTP_WORKERS
+              value: "1"
+            - name: PERSONALIZATION_HOLDOUT_RATE
+              value: "0"
+            - name: DEFAULT_MAX_USER_LIKES
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: default-max-user-likes
+            - name: DEFAULT_MAX_SOURCES_PER_POST
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: default-max-sources-per-post
+            - name: DEFAULT_MAX_TOTAL_SOURCES
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: default-max-total-sources
+            - name: DEFAULT_MIN_CO_LIKES
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: default-min-co-likes
+            - name: INVERTED_MIN_POST_LIKES
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: default-min-post-likes
+            - name: INVERTED_MAX_LIKERS_PER_POST
+              valueFrom:
+                configMapKeyRef:
+                  name: graze-personalization-config
+                  key: default-max-likers-per-post
+          livenessProbe:
+            httpGet:
+              path: /internal/alive
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /internal/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000

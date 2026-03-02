@@ -1,0 +1,109 @@
+services:
+  # Redis for local development only (production uses external Redis)
+  redis:
+    image: redis:8-alpine
+    ports:
+      - "6380:6379"
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --appendonly no
+      --save ""
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    profiles:
+      - local-redis
+
+  # API Workers
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+      ssh:
+        - default
+    image: dgaff/personalization:latestrs
+    platform: linux/amd64
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    # Uses default entrypoint: /app/graze-api
+
+  # Like Streamer Worker
+  like-streamer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+      ssh:
+        - default
+    image: dgaff/personalization:latestrs
+    platform: linux/amd64
+    env_file:
+      - .env
+    entrypoint: ["/app/graze-like-streamer"]
+    profiles:
+      - full
+
+  # Candidate Sync Worker
+  candidate-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+      ssh:
+        - default
+    image: dgaff/personalization:latestrs
+    platform: linux/amd64
+    env_file:
+      - .env
+    entrypoint: ["/app/graze-candidate-sync"]
+    profiles:
+      - full
+
+  # Backfill Tool (run manually with: docker compose run backfill --hours 24)
+  backfill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+      ssh:
+        - default
+    image: dgaff/personalization:latestrs
+    platform: linux/amd64
+    env_file:
+      - .env
+    entrypoint: ["/app/graze-backfill"]
+    profiles:
+      - tools
+
+  # Migration Tool (run manually)
+  migrate-tranches:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+      ssh:
+        - default
+    image: dgaff/personalization:latestrs
+    platform: linux/amd64
+    env_file:
+      - .env
+    entrypoint: ["/app/graze-migrate-tranches"]
+    profiles:
+      - tools
+
+volumes:
+  redis-data:

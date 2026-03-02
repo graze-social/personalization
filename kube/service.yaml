@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: graze-personalization-api
+  labels:
+    app: graze-personalization
+    component: api
+spec:
+  selector:
+    app: graze-personalization
+    component: api
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: graze-personalization-ingress
+  labels:
+    app: graze-personalization
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: personalization.internal.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: graze-personalization-api
+                port:
+                  number: 80

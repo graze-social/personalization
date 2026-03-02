@@ -17,6 +17,7 @@ pub use author_affinity::AuthorColikerWorker;
 pub use coliker::ColikerWorker;
 pub use diversity::{diversify_posts, DiversityConfig, DiversityResult};
 pub use feed_cache::{FeedCache, FeedCacheStats};
+pub use graze_common::models::FeedSuccessConfig;
 pub use liker_cache::{CacheStats, LikerCache};
 pub use params::{apply_thompson_params, get_preset, merge_params, LinkLonkParams};
 pub use proof::{compute_proof, LinkLonkProof, ProofCollector};
@@ -26,7 +27,6 @@ pub use scoring_core::{
     aggregate_coliker_weights_normalized_parallel, aggregate_coliker_weights_parallel, score_posts,
     score_posts_parallel, score_posts_topk, to_fx_hashmap, ScoredPostResult,
 };
-pub use graze_common::models::FeedSuccessConfig;
 pub use thompson::{
     FeedOutcome, FeedOutcomeDetails, SelectedParams, ThompsonConfig, ThompsonLearner,
 };

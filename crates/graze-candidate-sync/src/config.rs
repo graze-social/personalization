@@ -113,9 +113,13 @@ impl Config {
                 .to_lowercase()
                 .trim()
                 .to_string(),
-            candidate_http_url: std::env::var("CANDIDATE_HTTP_URL")
-                .ok()
-                .and_then(|s| if s.trim().is_empty() { None } else { Some(s.trim().to_string()) }),
+            candidate_http_url: std::env::var("CANDIDATE_HTTP_URL").ok().and_then(|s| {
+                if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s.trim().to_string())
+                }
+            }),
 
             // ClickHouse (when candidate_source is clickhouse)
             clickhouse_host: default_env("CLICKHOUSE_HOST", "localhost"),

@@ -45,13 +45,12 @@ pub async fn docs_page(Path(name): Path<String>) -> Response {
         "configuration" => ("text/markdown; charset=utf-8", CONFIGURATION),
         "admin-api" => ("text/markdown; charset=utf-8", ADMIN_API),
         _ => {
-            return (StatusCode::NOT_FOUND, "No such doc. Use: feed-lifecycle, architecture, configuration, admin-api").into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                "No such doc. Use: feed-lifecycle, architecture, configuration, admin-api",
+            )
+                .into_response();
         }
     };
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, content_type)],
-        body,
-    )
-        .into_response()
+    (StatusCode::OK, [(header::CONTENT_TYPE, content_type)], body).into_response()
 }

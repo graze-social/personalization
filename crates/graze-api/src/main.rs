@@ -14,9 +14,9 @@ use graze_api::interaction_queue;
 use graze_api::metrics::Metrics;
 use graze_api::AppState;
 use graze_common::{
-    maybe_run_metrics_server, ClickHouseConfig, ClickHouseInteractionWriter,
-    InteractionsClient, InteractionsConfig, NoOpInteractionWriter, RedisClient, RedisConfig,
-    SpecialPostsClient, SpecialPostsSource, UriInterner,
+    maybe_run_metrics_server, ClickHouseConfig, ClickHouseInteractionWriter, InteractionsClient,
+    InteractionsConfig, NoOpInteractionWriter, RedisClient, RedisConfig, SpecialPostsClient,
+    SpecialPostsSource, UriInterner,
 };
 
 #[tokio::main]
@@ -74,7 +74,10 @@ async fn main() -> anyhow::Result<()> {
             };
             match RedisClient::new(&logger_config).await {
                 Ok(client) => {
-                    debug!(redis_requests_logger = "configured", "Requests logger Redis connected");
+                    debug!(
+                        redis_requests_logger = "configured",
+                        "Requests logger Redis connected"
+                    );
                     Some(Arc::new(client))
                 }
                 Err(e) => {
@@ -159,7 +162,10 @@ async fn main() -> anyhow::Result<()> {
         let queue_sender = interaction_queue::InteractionQueueSender::new(tx);
         let shutdown_tx_for_signal = shutdown_tx.clone();
         // Store shutdown_tx for the shutdown signal
-        (Some(queue_sender), Some((worker_handle, shutdown_tx_for_signal)))
+        (
+            Some(queue_sender),
+            Some((worker_handle, shutdown_tx_for_signal)),
+        )
     } else {
         (None, None)
     };

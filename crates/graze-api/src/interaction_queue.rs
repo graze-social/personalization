@@ -55,8 +55,7 @@ pub async fn run_interaction_worker(
 
     info!(
         batch_interval_ms,
-        batch_size,
-        "Interaction queue worker started"
+        batch_size, "Interaction queue worker started"
     );
 
     loop {
@@ -101,7 +100,10 @@ pub async fn run_interaction_worker(
 
     // Flush remaining on shutdown
     if !batch.is_empty() {
-        info!(remaining = batch.len(), "Flushing remaining interactions on shutdown");
+        info!(
+            remaining = batch.len(),
+            "Flushing remaining interactions on shutdown"
+        );
         if let Err(e) = interactions.persist_interactions_batch(&batch).await {
             warn!(error = %e, "Failed to persist final interaction batch");
         }

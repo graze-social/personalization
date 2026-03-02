@@ -252,7 +252,14 @@ pub fn stagger_posts(
             .collect(),
         fallback
             .into_iter()
-            .map(|u| (u, BlendedSource::Fallback { tranche: String::new() }))
+            .map(|u| {
+                (
+                    u,
+                    BlendedSource::Fallback {
+                        tranche: String::new(),
+                    },
+                )
+            })
             .collect(),
         stagger_factor,
     )
@@ -377,7 +384,8 @@ pub async fn get_blended_posts_with_stats(
     let personalized_count = personalized_from_linklonk.len();
 
     let mut personalized_final: Vec<(String, BlendedSource)> = personalized_from_linklonk;
-    let mut exclude_set: HashSet<String> = personalized_final.iter().map(|(u, _)| u.clone()).collect();
+    let mut exclude_set: HashSet<String> =
+        personalized_final.iter().map(|(u, _)| u.clone()).collect();
 
     // Author-affinity supplementation: if post-level personalization is thin,
     // use author-level co-likers (coarse LinkLonk) to fill the gap
@@ -420,10 +428,7 @@ pub async fn get_blended_posts_with_stats(
                     if let Some(uri) = uri_map.get(&post_id) {
                         if !exclude_set.contains(uri) {
                             exclude_set.insert(uri.clone());
-                            personalized_final.push((
-                                uri.clone(),
-                                BlendedSource::AuthorAffinity,
-                            ));
+                            personalized_final.push((uri.clone(), BlendedSource::AuthorAffinity));
                             author_affinity_count += 1;
                         }
                     }

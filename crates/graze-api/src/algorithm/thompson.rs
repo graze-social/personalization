@@ -313,7 +313,12 @@ impl ThompsonLearner {
                 self.config.min_colikes_default,
             ));
         let (max_user_likes_opts, max_user_likes_def) = search_space_override
-            .map(|s| (s.max_user_likes_options.as_slice(), s.max_user_likes_default))
+            .map(|s| {
+                (
+                    s.max_user_likes_options.as_slice(),
+                    s.max_user_likes_default,
+                )
+            })
             .unwrap_or((
                 self.config.max_user_likes_options.as_slice(),
                 self.config.max_user_likes_default,
@@ -428,7 +433,11 @@ impl ThompsonLearner {
             ("max_checks", max_checks_opts, max_checks_def),
             ("min_colikes", min_colikes_opts, min_colikes_def),
             ("max_user_likes", max_user_likes_opts, max_user_likes_def),
-            ("max_src_per_post", max_src_per_post_opts, max_src_per_post_def),
+            (
+                "max_src_per_post",
+                max_src_per_post_opts,
+                max_src_per_post_def,
+            ),
             ("seed_pool", seed_pool_opts, seed_pool_def),
             ("corater_decay", corater_decay_opts, corater_decay_def),
         ];
@@ -496,7 +505,9 @@ impl ThompsonLearner {
             max_algo_checks: p.max_algo_checks.unwrap_or(c.max_checks_default),
             min_co_likes: p.min_co_likes.unwrap_or(c.min_colikes_default),
             max_user_likes: p.max_user_likes.unwrap_or(c.max_user_likes_default),
-            max_sources_per_post: p.max_sources_per_post.unwrap_or(c.max_sources_per_post_default),
+            max_sources_per_post: p
+                .max_sources_per_post
+                .unwrap_or(c.max_sources_per_post_default),
             seed_sample_pool: p.seed_sample_pool.unwrap_or(c.seed_pool_default),
             corater_decay_pct: p.corater_decay_pct.unwrap_or(c.corater_decay_default),
             is_holdout: false,
@@ -830,7 +841,7 @@ mod tests {
         };
 
         let config = ThompsonConfig {
-            holdout_rate: 0.0, // 0% holdout so we hit treatment path
+            holdout_rate: 0.0,     // 0% holdout so we hit treatment path
             exploration_prob: 0.0, // No exploration
             ..Default::default()
         };

@@ -18,9 +18,7 @@ use crate::AppState;
 use graze_common::models::{
     FeedSuccessConfig, FeedThompsonConfig, PersonalizeRequest, ThompsonSearchSpace,
 };
-use graze_common::services::special_posts::{
-    SpecialPost, SpecialPostsResponse, SponsoredPost,
-};
+use graze_common::services::special_posts::{SpecialPost, SpecialPostsResponse, SponsoredPost};
 use graze_common::{hash_did, Keys};
 
 /// GET /v1/feeds
@@ -101,7 +99,10 @@ pub async fn register_feed(
     {
         if old_uri != feed_uri {
             let _ = state.redis.hdel(Keys::SUPPORTED_FEEDS, &old_uri).await;
-            let _ = state.redis.hdel(Keys::ALGO_ID_TO_FEED_URI, &algo_id_str).await;
+            let _ = state
+                .redis
+                .hdel(Keys::ALGO_ID_TO_FEED_URI, &algo_id_str)
+                .await;
         }
     }
 
@@ -158,7 +159,11 @@ pub async fn register_feed(
 
     // Enqueue one sync so candidate pool and fallback tranches are populated quickly
     let pending_key = "pending:syncs";
-    match state.redis.sadd(pending_key, std::slice::from_ref(&algo_id_str)).await {
+    match state
+        .redis
+        .sadd(pending_key, std::slice::from_ref(&algo_id_str))
+        .await
+    {
         Ok(added) if added > 0 => {
             if let Err(e) = state.redis.lpush(Keys::SYNC_QUEUE, &algo_id_str).await {
                 warn!(algo_id, error = %e, "failed_to_queue_sync");
@@ -250,7 +255,10 @@ pub async fn deregister_feed(
     };
 
     let _ = state.redis.hdel(Keys::SUPPORTED_FEEDS, &feed_uri).await;
-    let _ = state.redis.hdel(Keys::ALGO_ID_TO_FEED_URI, &algo_id_str).await;
+    let _ = state
+        .redis
+        .hdel(Keys::ALGO_ID_TO_FEED_URI, &algo_id_str)
+        .await;
     let _ = state.redis.hdel(Keys::FEED_ACCESS, &algo_id_str).await;
     // Intentionally do not remove from FEED_URI_TO_ALGO_WRITES so interaction writes still work
 
@@ -376,11 +384,7 @@ pub async fn put_feed_thompson_config(
 ///
 /// Get global Thompson search space. Returns default if not set.
 pub async fn get_thompson_search_space(State(state): State<Arc<AppState>>) -> Response {
-    match state
-        .redis
-        .get_string(Keys::thompson_search_space())
-        .await
-    {
+    match state.redis.get_string(Keys::thompson_search_space()).await {
         Ok(Some(json_str)) => match serde_json::from_str::<ThompsonSearchSpace>(&json_str) {
             Ok(config) => (StatusCode::OK, Json(config)).into_response(),
             Err(e) => (
@@ -432,40 +436,103 @@ pub async fn put_thompson_search_space(
         }
         Ok(())
     };
-    if let Err(e) = validate(&config.min_likes_options, config.min_likes_default, "min_likes") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.min_likes_options,
+        config.min_likes_default,
+        "min_likes",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
-    if let Err(e) = validate(&config.max_likers_options, config.max_likers_default, "max_likers") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.max_likers_options,
+        config.max_likers_default,
+        "max_likers",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
-    if let Err(e) = validate(&config.max_sources_options, config.max_sources_default, "max_sources") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.max_sources_options,
+        config.max_sources_default,
+        "max_sources",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
-    if let Err(e) = validate(&config.max_checks_options, config.max_checks_default, "max_checks") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.max_checks_options,
+        config.max_checks_default,
+        "max_checks",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
-    if let Err(e) = validate(&config.min_colikes_options, config.min_colikes_default, "min_colikes") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.min_colikes_options,
+        config.min_colikes_default,
+        "min_colikes",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
-    if let Err(e) = validate(&config.max_user_likes_options, config.max_user_likes_default, "max_user_likes") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.max_user_likes_options,
+        config.max_user_likes_default,
+        "max_user_likes",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
-    if let Err(e) = validate(&config.max_sources_per_post_options, config.max_sources_per_post_default, "max_sources_per_post") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.max_sources_per_post_options,
+        config.max_sources_per_post_default,
+        "max_sources_per_post",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
-    if let Err(e) = validate(&config.seed_pool_options, config.seed_pool_default, "seed_pool") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.seed_pool_options,
+        config.seed_pool_default,
+        "seed_pool",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
-    if let Err(e) = validate(&config.corater_decay_options, config.corater_decay_default, "corater_decay") {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "ValidationError", "message": e })))
+    if let Err(e) = validate(
+        &config.corater_decay_options,
+        config.corater_decay_default,
+        "corater_decay",
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ValidationError", "message": e })),
+        )
             .into_response();
     }
 
@@ -505,7 +572,9 @@ pub async fn put_thompson_search_space(
                     if let Some(suffix) = key.strip_prefix("feed_thompson_config:") {
                         if let Ok(algo_id) = suffix.parse::<i32>() {
                             if let Ok(Some(json_str)) = state.redis.get_string(&key).await {
-                                if let Ok(cfg) = serde_json::from_str::<FeedThompsonConfig>(&json_str) {
+                                if let Ok(cfg) =
+                                    serde_json::from_str::<FeedThompsonConfig>(&json_str)
+                                {
                                     if cfg.search_space.is_some() {
                                         algo_ids_with_algo_config.push(algo_id);
                                     }
@@ -523,11 +592,7 @@ pub async fn put_thompson_search_space(
                 .thompson
                 .clear_bandits_for_global_use(&algo_ids_with_algo_config);
             info!("thompson_search_space_updated");
-            (
-                StatusCode::OK,
-                Json(json!({ "success": true })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(json!({ "success": true }))).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -611,11 +676,7 @@ pub async fn put_thompson_success_criteria(
     {
         Ok(()) => {
             info!("thompson_success_criteria_updated");
-            (
-                StatusCode::OK,
-                Json(json!({ "success": true })),
-            )
-                .into_response()
+            (StatusCode::OK, Json(json!({ "success": true }))).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1229,19 +1290,12 @@ pub async fn add_candidates(
         .redis
         .hset_multiple(
             &meta_key,
-            &[
-                ("last_updated", &now.to_string()),
-                ("source", "admin"),
-            ],
+            &[("last_updated", &now.to_string()), ("source", "admin")],
         )
         .await;
 
     info!(algo_id, added = uri_to_id.len(), "candidates_added");
-    (
-        StatusCode::OK,
-        Json(json!({ "added": uri_to_id.len() })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({ "added": uri_to_id.len() }))).into_response()
 }
 
 /// DELETE /v1/feeds/:algo_id/candidates
@@ -1266,11 +1320,7 @@ pub async fn remove_candidates(
         return r;
     }
     if body.uris.is_empty() {
-        return (
-            StatusCode::OK,
-            Json(json!({ "removed": 0 })),
-        )
-            .into_response();
+        return (StatusCode::OK, Json(json!({ "removed": 0 }))).into_response();
     }
 
     let uri_to_id = match state.interner.get_ids_batch(&body.uris).await {
@@ -1304,11 +1354,7 @@ pub async fn remove_candidates(
     };
 
     info!(algo_id, removed, "candidates_removed");
-    (
-        StatusCode::OK,
-        Json(json!({ "removed": removed })),
-    )
-        .into_response()
+    (StatusCode::OK, Json(json!({ "removed": removed }))).into_response()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1319,7 +1365,10 @@ fn special_posts_key(algo_id: i32) -> String {
     Keys::special_posts(algo_id)
 }
 
-async fn load_special_posts(state: &AppState, algo_id: i32) -> Result<SpecialPostsResponse, Response> {
+async fn load_special_posts(
+    state: &AppState,
+    algo_id: i32,
+) -> Result<SpecialPostsResponse, Response> {
     let key = special_posts_key(algo_id);
     let raw = state.redis.get_string(&key).await.map_err(|e| {
         (
@@ -1363,16 +1412,20 @@ async fn save_special_posts(
             .into_response()
     })?;
     // Persist with long TTL (10 years) when managed via admin
-    state.redis.set_ex(&key, &json, 315_360_000).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": "RedisError",
-                "message": format!("{}", e)
-            })),
-        )
-            .into_response()
-    })?;
+    state
+        .redis
+        .set_ex(&key, &json, 315_360_000)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": "RedisError",
+                    "message": format!("{}", e)
+                })),
+            )
+                .into_response()
+        })?;
     Ok(())
 }
 

@@ -13,6 +13,11 @@ pub mod models;
 pub mod redis;
 pub mod services;
 
+pub use clickhouse::{
+    AdminOnlyCandidateSource, CandidateQueryParams, CandidateSource, ClickHouseCandidateSource,
+    ClickHouseConfig, ClickHouseInteractionWriter, HttpCandidateSource, InteractionWriter,
+    NoOpInteractionWriter,
+};
 pub use error::{GrazeError, Result};
 pub use redis::{
     // New date-based functions
@@ -32,11 +37,6 @@ pub use redis::{
     ScriptManager,
     DAY_TRANCHES,
     DEFAULT_RETENTION_DAYS,
-};
-pub use clickhouse::{
-    AdminOnlyCandidateSource, CandidateQueryParams, CandidateSource, ClickHouseCandidateSource,
-    ClickHouseConfig, ClickHouseInteractionWriter, HttpCandidateSource, InteractionWriter,
-    NoOpInteractionWriter,
 };
 pub use services::{
     InteractionsClient, InteractionsConfig, SpecialPost, SpecialPostsClient, SpecialPostsResponse,

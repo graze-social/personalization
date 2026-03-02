@@ -31,7 +31,10 @@ pub struct FeedContextProvenance {
 
     /// When personalized: post_level (exact post co-likers) | author_level (author-affinity co-likers).
     /// Omitted for non-personalized sources.
-    #[serde(rename = "personalization_type", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "personalization_type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub personalization_type: Option<String>,
 
     /// When source is fallback: popular | velocity | discovery. Otherwise omitted.
@@ -64,7 +67,10 @@ pub struct FeedContextProvenance {
 
     /// True if this request was in the personalization holdout (control group for A/B test).
     /// These requests skip LinkLonk entirely and serve only the non-personalized fallback blend.
-    #[serde(rename = "is_personalization_holdout", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "is_personalization_holdout",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub is_personalization_holdout: Option<bool>,
 }
 
@@ -73,7 +79,10 @@ pub struct FeedContextProvenance {
 pub struct ProvenanceParams {
     #[serde(rename = "min_post_likes", skip_serializing_if = "Option::is_none")]
     pub min_post_likes: Option<usize>,
-    #[serde(rename = "max_likers_per_post", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "max_likers_per_post",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_likers_per_post: Option<usize>,
     #[serde(rename = "max_total_sources", skip_serializing_if = "Option::is_none")]
     pub max_total_sources: Option<usize>,
@@ -83,7 +92,10 @@ pub struct ProvenanceParams {
     pub min_co_likes: Option<usize>,
     #[serde(rename = "max_user_likes", skip_serializing_if = "Option::is_none")]
     pub max_user_likes: Option<usize>,
-    #[serde(rename = "max_sources_per_post", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "max_sources_per_post",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub max_sources_per_post: Option<usize>,
     #[serde(rename = "seed_sample_pool", skip_serializing_if = "Option::is_none")]
     pub seed_sample_pool: Option<usize>,

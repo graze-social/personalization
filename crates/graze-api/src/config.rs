@@ -238,9 +238,13 @@ impl Config {
             redis_pool_size: parse_usize_env("REDIS_POOL_SIZE", 100),
             redis_connect_max_retries: parse_u32_env("REDIS_CONNECT_MAX_RETRIES", 10),
             redis_connect_initial_delay_ms: parse_u64_env("REDIS_CONNECT_INITIAL_DELAY_MS", 500),
-            redis_requests_logger_url: std::env::var("REDIS_REQUESTS_LOGGER")
-                .ok()
-                .and_then(|s| if s.trim().is_empty() { None } else { Some(s) }),
+            redis_requests_logger_url: std::env::var("REDIS_REQUESTS_LOGGER").ok().and_then(|s| {
+                if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }),
 
             // Inverted Algorithm
             inverted_algorithm_enabled: parse_bool_env("INVERTED_ALGORITHM_ENABLED", true),
@@ -303,15 +307,9 @@ impl Config {
                 .to_lowercase()
                 .trim()
                 .to_string(),
-            interactions_batch_interval_ms: parse_u64_env(
-                "INTERACTIONS_BATCH_INTERVAL_MS",
-                3000,
-            ),
+            interactions_batch_interval_ms: parse_u64_env("INTERACTIONS_BATCH_INTERVAL_MS", 3000),
             interactions_batch_size: parse_usize_env("INTERACTIONS_BATCH_SIZE", 200),
-            interactions_queue_capacity: parse_usize_env(
-                "INTERACTIONS_QUEUE_CAPACITY",
-                5000,
-            ),
+            interactions_queue_capacity: parse_usize_env("INTERACTIONS_QUEUE_CAPACITY", 5000),
 
             // Special Posts
             special_posts_source: default_env("SPECIAL_POSTS_SOURCE", "remote")
@@ -412,9 +410,13 @@ impl Config {
             read_only_mode: parse_bool_env("READ_ONLY_MODE", false),
 
             // Admin API key (empty string = auth disabled)
-            admin_api_key: std::env::var("ADMIN_API_KEY")
-                .ok()
-                .and_then(|s| if s.is_empty() { None } else { Some(s) }),
+            admin_api_key: std::env::var("ADMIN_API_KEY").ok().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
+            }),
 
             // Personalization Holdout (A/B test)
             personalization_holdout_rate: parse_f64_env("PERSONALIZATION_HOLDOUT_RATE", 0.5),

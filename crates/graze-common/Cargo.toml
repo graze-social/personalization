@@ -45,4 +45,4 @@ async-trait = "0.1"
 axum = "0.8"
 
 # AT Protocol
-atproto-record = { version = "0.13", default-features = false }
+atproto-record = { version = "0.14", default-features = false }

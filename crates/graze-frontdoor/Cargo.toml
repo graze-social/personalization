@@ -43,4 +43,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # AT Protocol
-atproto-record = { version = "0.13", default-features = false }
+atproto-record = { version = "0.14", default-features = false }

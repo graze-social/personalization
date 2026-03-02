@@ -1,5 +1,5 @@
 # Graze Personalization Service
-
+![Graze Social artwork by Jeffrey Kam https://www.jeffreykam.net/](./image.png)
 A high-performance microservice for real-time personalized feed ranking using the LinkLonk algorithm. Written in Rust with Axum and Redis.
 
 ## Overview

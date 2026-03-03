@@ -15,8 +15,8 @@ pub mod services;
 
 pub use clickhouse::{
     AdminOnlyCandidateSource, CandidateQueryParams, CandidateSource, ClickHouseCandidateSource,
-    ClickHouseConfig, ClickHouseInteractionWriter, HttpCandidateSource, InteractionWriter,
-    NoOpInteractionWriter,
+    ClickHouseConfig, ClickHouseImpressionWriter, ClickHouseInteractionWriter, HttpCandidateSource,
+    ImpressionWriter, InteractionWriter, NoOpImpressionWriter, NoOpInteractionWriter,
 };
 pub use error::{GrazeError, Result};
 pub use redis::{
@@ -38,6 +38,7 @@ pub use redis::{
     DAY_TRANCHES,
     DEFAULT_RETENTION_DAYS,
 };
+pub use models::{FeedImpressionRow, FeedInteractionRow};
 pub use services::{
     InteractionsClient, InteractionsConfig, SpecialPost, SpecialPostsClient, SpecialPostsResponse,
     SpecialPostsSource, SponsoredPost, UriInterner,

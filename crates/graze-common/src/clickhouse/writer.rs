@@ -89,12 +89,13 @@ impl InteractionWriter for ClickHouseInteractionWriter {
         action_rows: Vec<UserActionLogRow>,
     ) -> Result<()> {
         if !feed_rows.is_empty() {
-            let columns = "did, interaction_feed_context, feed_uri, attribution, interaction_item, interaction_event, interaction_request_id, occurred";
+            let columns = "did, impression_id, interaction_feed_context, feed_uri, attribution, interaction_item, interaction_event, interaction_request_id, occurred";
             let data: Vec<Vec<String>> = feed_rows
                 .into_iter()
                 .map(|row| {
                     vec![
                         escape_tab_value(&row.did),
+                        escape_tab_value(&row.impression_id),
                         escape_tab_value(&row.interaction_feed_context),
                         escape_tab_value(&row.feed_uri),
                         escape_tab_value(&row.attribution),

@@ -12,12 +12,15 @@ use axum::{
     Extension, Json,
 };
 use base64::Engine;
-use chrono::Utc;
+use chrono::{Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
-use crate::algorithm::{FeedOutcome, FeedSuccessConfig, SelectedParams};
+use crate::algorithm::{
+    get_preset, merge_params, FeedOutcome, FeedSuccessConfig, PostFeatures, SelectedParams,
+    ScoringResult,
+};
 use crate::api::cursor::FeedCursor;
 use crate::api::fallback::{
     get_blended_posts_with_stats, get_fallback_blend, load_user_liked_uris, BlendedSource,
@@ -27,8 +30,8 @@ use crate::api::RequestId;
 use crate::audit::{emit_skip_log, should_audit, AuditCollector};
 use crate::AppState;
 use graze_common::models::{
-    FeedContextProvenance, FeedSkeletonResponse, FeedThompsonConfig, PersonalizationParams,
-    ProvenanceParams, SkeletonFeedPost, ThompsonSearchSpace,
+    FeedContextProvenance, FeedImpressionRow, FeedSkeletonResponse, FeedThompsonConfig,
+    PersonalizationParams, ProvenanceParams, SkeletonFeedPost, ThompsonSearchSpace,
 };
 use graze_common::services::special_posts::SpecialPostsResponse;
 use graze_common::{hash_did, Keys};
@@ -110,6 +113,7 @@ fn encode_feed_context(
     prov: &ItemProvenance,
     thompson_meta: Option<&ResponseThompsonMeta>,
     is_personalization_holdout: Option<bool>,
+    impression_id: Option<String>,
 ) -> Option<String> {
     let (source, personalization_type, fallback_tranche, attribution, personalized) = match prov {
         ItemProvenance::Base(BlendedSource::PostLevelPersonalization) => (
@@ -177,6 +181,7 @@ fn encode_feed_context(
         response_time_ms,
         is_holdout,
         is_personalization_holdout,
+        impression_id,
     };
     ctx.encode()
 }
@@ -469,6 +474,7 @@ pub async fn get_feed_skeleton(
                         &prov,
                         None,
                         None,
+                        None,
                     );
                     SkeletonFeedPost {
                         post: uri,
@@ -529,6 +535,7 @@ pub async fn get_feed_skeleton(
             response_time_ms: None,
             is_holdout: None,
             is_personalization_holdout: None,
+            impression_id: None,
         }
         .encode();
         let response = FeedSkeletonResponse {
@@ -549,6 +556,13 @@ pub async fn get_feed_skeleton(
     let mut response_thompson_meta: Option<ResponseThompsonMeta> = None;
     let mut is_personalization_holdout_for_provenance = false;
     let is_fallback_only = feed_cursor.fallback_only;
+    // ML state: uri_to_features map and scoring result, populated by the ML scoring path
+    let mut ml_uri_to_features: rustc_hash::FxHashMap<String, PostFeatures> =
+        rustc_hash::FxHashMap::default();
+    let mut ml_scoring_result: Option<ScoringResult> = None;
+    // Hoisted so impression logging (outside user_has_data block) can reference them
+    let user_hash: String = user_did.as_ref().map(|d| hash_did(d)).unwrap_or_default();
+    let is_first_page = feed_cursor.is_first_page();
 
     // ═══════════════════════════════════════════════════════════════════
     // Handle fallback-only mode (personalization exhausted or holdout)
@@ -587,9 +601,7 @@ pub async fn get_feed_skeleton(
     // Check feed cache first (per-user, stores multiple pages)
     // ═══════════════════════════════════════════════════════════════════
     else if let Some(ref did) = user_did {
-        let user_hash = hash_did(did);
         let feed_cache_key = Keys::feed_cache(algo_id, &user_hash);
-        let is_first_page = feed_cursor.is_first_page();
 
         // Personalization holdout: 5% of first-page requests get non-personalized blend for A/B test
         if is_first_page
@@ -742,68 +754,173 @@ pub async fn get_feed_skeleton(
                     limit
                 };
 
-                // Try personalization with Thompson-selected parameters
-                match state
-                    .algorithm
-                    .personalize_with_audit(
-                        did,
-                        algo_id,
-                        fetch_limit,
-                        None,
-                        Some(&params_override),
-                        None,
-                        audit.as_mut(),
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        // Capture scoring stats for Thompson learning
-                        let posts_checked = result.meta.posts_checked.unwrap_or(0);
-                        let posts_scored = result.meta.total_scored.unwrap_or(0);
-                        let _scoring_time_ms = result.meta.scoring_time_ms.unwrap_or(0.0);
+                // Try personalization with Thompson-selected parameters.
+                // When ML is enabled, call compute_personalization() directly so we get
+                // PostFeatures for impression logging and optional re-ranking.
+                // When disabled, fall back to the cache-aware personalize_with_audit().
+                let ml_active = state.config.ml_impressions_enabled
+                    || state.config.ml_reranker_enabled;
 
-                        // Collect post IDs that need conversion to URIs
-                        let posts_to_convert: Vec<i64> = result
-                            .posts
-                            .iter()
-                            .filter(|p| p.uri.is_empty())
-                            .filter_map(|p| p.post_id.parse::<i64>().ok())
-                            .collect();
-
-                        // Batch lookup URIs from interner
-                        let id_to_uri = state
-                            .interner
-                            .get_uris_batch(&posts_to_convert)
+                // Produce (personalized_uris, posts_checked, posts_scored) via either path
+                let perso_result: crate::error::Result<(Vec<String>, usize, usize)> =
+                    if ml_active {
+                        let base_params = get_preset("default");
+                        let params_for_ml = merge_params(base_params, Some(&params_override));
+                        let audit_ref = audit.as_mut();
+                        match state
+                            .algorithm
+                            .compute_personalization(&user_hash, algo_id, &params_for_ml, audit_ref)
                             .await
-                            .unwrap_or_default();
+                        {
+                            Ok(scoring_result) => {
+                                let posts_checked = scoring_result.posts_checked;
+                                let posts_scored = scoring_result.scored_count;
 
-                        // Convert posts to URIs and track for audit
-                        let personalized_uris: Vec<String> = result
-                            .posts
-                            .into_iter()
-                            .filter_map(|p| {
-                                let uri = if !p.uri.is_empty() {
-                                    Some(p.uri.clone())
-                                } else if let Ok(id) = p.post_id.parse::<i64>() {
-                                    id_to_uri.get(&id).cloned()
-                                } else {
-                                    None
-                                };
+                                // Optional ML re-ranking before URI conversion
+                                let scored_posts_ordered: Vec<(f64, String)> =
+                                    if state.config.ml_reranker_enabled
+                                        && !scoring_result.post_features.is_empty()
+                                    {
+                                        if let Some(ref ranker) = state.ml_ranker {
+                                            let now_ch = Utc::now();
+                                            let richness = if scoring_result.posts_checked > 0 {
+                                                scoring_result.scored_count as f32
+                                                    / scoring_result.posts_checked as f32
+                                            } else {
+                                                0.0
+                                            };
+                                            let with_features: Vec<(f64, String, PostFeatures)> =
+                                                scoring_result
+                                                    .scored_posts
+                                                    .iter()
+                                                    .zip(scoring_result.post_features.iter())
+                                                    .map(|((s, id), f)| {
+                                                        (*s, id.clone(), f.clone())
+                                                    })
+                                                    .collect();
+                                            ranker.rerank(
+                                                &with_features,
+                                                0u32, // user_like_count (not yet available here)
+                                                0u8,  // user_segment: default cold
+                                                richness,
+                                                now_ch.hour() as u8,
+                                                now_ch.weekday().num_days_from_monday() as u8,
+                                                is_first_page,
+                                                thompson_params.is_holdout,
+                                            )
+                                        } else {
+                                            scoring_result.scored_posts.clone()
+                                        }
+                                    } else {
+                                        scoring_result.scored_posts.clone()
+                                    };
 
-                                // Track personalized posts in audit
-                                if let Some(ref uri) = uri {
-                                    if let Some(ref mut a) = audit {
-                                        a.add_personalized_post(&p.post_id, uri, p.score);
+                                // Convert post IDs to URIs
+                                let ids: Vec<i64> = scored_posts_ordered
+                                    .iter()
+                                    .take(fetch_limit)
+                                    .filter_map(|(_, id)| id.parse().ok())
+                                    .collect();
+                                let id_to_uri = state
+                                    .interner
+                                    .get_uris_batch(&ids)
+                                    .await
+                                    .unwrap_or_default();
+
+                                // Build uri_to_features map for impression logging
+                                for ((_, id_str), feat) in scoring_result
+                                    .scored_posts
+                                    .iter()
+                                    .zip(scoring_result.post_features.iter())
+                                {
+                                    if let Ok(int_id) = id_str.parse::<i64>() {
+                                        if let Some(uri) = id_to_uri.get(&int_id) {
+                                            ml_uri_to_features.insert(uri.clone(), feat.clone());
+                                        }
                                     }
                                 }
 
-                                uri
-                            })
-                            .collect();
+                                let personalized_uris: Vec<String> = scored_posts_ordered
+                                    .iter()
+                                    .take(fetch_limit)
+                                    .filter_map(|(score, id_str)| {
+                                        let uri = id_str
+                                            .parse::<i64>()
+                                            .ok()
+                                            .and_then(|i| id_to_uri.get(&i).cloned())?;
+                                        if let Some(ref mut a) = audit {
+                                            a.add_personalized_post(id_str, &uri, *score);
+                                        }
+                                        Some(uri)
+                                    })
+                                    .collect();
 
+                                ml_scoring_result = Some(scoring_result);
+                                Ok((personalized_uris, posts_checked, posts_scored))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        // Standard path: cache-aware personalize_with_audit()
+                        match state
+                            .algorithm
+                            .personalize_with_audit(
+                                did,
+                                algo_id,
+                                fetch_limit,
+                                None,
+                                Some(&params_override),
+                                None,
+                                audit.as_mut(),
+                            )
+                            .await
+                        {
+                            Ok(result) => {
+                                let posts_checked = result.meta.posts_checked.unwrap_or(0);
+                                let posts_scored = result.meta.total_scored.unwrap_or(0);
+
+                                let posts_to_convert: Vec<i64> = result
+                                    .posts
+                                    .iter()
+                                    .filter(|p| p.uri.is_empty())
+                                    .filter_map(|p| p.post_id.parse::<i64>().ok())
+                                    .collect();
+                                let id_to_uri = state
+                                    .interner
+                                    .get_uris_batch(&posts_to_convert)
+                                    .await
+                                    .unwrap_or_default();
+
+                                let personalized_uris: Vec<String> = result
+                                    .posts
+                                    .into_iter()
+                                    .filter_map(|p| {
+                                        let uri = if !p.uri.is_empty() {
+                                            Some(p.uri.clone())
+                                        } else if let Ok(id) = p.post_id.parse::<i64>() {
+                                            id_to_uri.get(&id).cloned()
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(ref uri) = uri {
+                                            if let Some(ref mut a) = audit {
+                                                a.add_personalized_post(&p.post_id, uri, p.score);
+                                            }
+                                        }
+                                        uri
+                                    })
+                                    .collect();
+
+                                Ok((personalized_uris, posts_checked, posts_scored))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    };
+
+                match perso_result {
+                    Ok((personalized_uris, posts_checked, posts_scored)) => {
                         // Apply progressive blending with appropriate limit
                         let blend_limit = if is_first_page && state.config.feed_cache_enabled {
-                            // Blend entire batch for caching
                             fetch_limit
                         } else {
                             limit
@@ -839,8 +956,9 @@ pub async fn get_feed_skeleton(
                                 .await;
                         }
 
-                        // Record Thompson observation (only for non-holdout requests)
-                        let total_response_time_ms = request_start.elapsed().as_secs_f64() * 1000.0;
+                        // Record Thompson observation
+                        let total_response_time_ms =
+                            request_start.elapsed().as_secs_f64() * 1000.0;
                         let outcome = FeedOutcome {
                             total_posts: blend_result.posts.len().min(limit),
                             personalized_posts: blend_result.personalized_count,
@@ -848,7 +966,7 @@ pub async fn get_feed_skeleton(
                             fallback_posts: blend_result.fallback_count,
                             posts_checked,
                             posts_scored,
-                            colikers_used: 0, // TODO: track at co-liker level
+                            colikers_used: 0,
                             response_time_ms: total_response_time_ms,
                         };
 
@@ -860,7 +978,6 @@ pub async fn get_feed_skeleton(
                             .clone();
                         let (success, details) = outcome.evaluate(&success_config);
 
-                        // Log Thompson learning outcome
                         debug!(
                             algo_id,
                             is_holdout = thompson_params.is_holdout,
@@ -875,10 +992,6 @@ pub async fn get_feed_skeleton(
                             "thompson_observation"
                         );
 
-                        // Record observation for learning (skipped for holdout group).
-                        // Skip request-time recording when interaction_weights is configured -
-                        // we only learn from likes (interaction path), otherwise fast-response
-                        // signal drowns out the like signal (~100x more common).
                         if feed_config
                             .as_ref()
                             .is_none_or(|c| c.interaction_weights.is_empty())
@@ -910,7 +1023,7 @@ pub async fn get_feed_skeleton(
                         fallback_reason = Some("personalization_error");
 
                         // Record failure for Thompson learning
-                        let thompson_params: SelectedParams =
+                        let thompson_params_err: SelectedParams =
                             state.thompson.select_params_with_holdout_and_search_space(
                                 algo_id,
                                 holdout_override,
@@ -919,7 +1032,7 @@ pub async fn get_feed_skeleton(
                             );
                         state
                             .thompson
-                            .record_observation(algo_id, &thompson_params, false);
+                            .record_observation(algo_id, &thompson_params_err, false);
 
                         base_posts_tagged = get_fallback_blend(
                             &state.redis,
@@ -1087,10 +1200,29 @@ pub async fn get_feed_skeleton(
         meta.response_time_ms = request_start.elapsed().as_secs_f64() * 1000.0;
     }
 
+    // Generate per-post impression IDs for ML tracking (only for non-special posts)
+    let ml_impressions_active = state.config.ml_impressions_enabled
+        && state.impression_queue.is_some()
+        && !user_hash.is_empty();
+    let impression_ids: Vec<Option<String>> = if ml_impressions_active {
+        final_with_provenance
+            .iter()
+            .map(|(_, prov)| match prov {
+                ItemProvenance::Pinned { .. }
+                | ItemProvenance::Rotating { .. }
+                | ItemProvenance::Sponsored { .. } => None,
+                _ => Some(format!("{:016x}", rand::random::<u64>())),
+            })
+            .collect()
+    } else {
+        vec![None; final_with_provenance.len()]
+    };
+
     let feed: Vec<SkeletonFeedPost> = final_with_provenance
         .iter()
         .enumerate()
         .map(|(depth, (uri, prov))| {
+            let impression_id = impression_ids.get(depth).and_then(|id| id.clone());
             let feed_context = encode_feed_context(
                 &query.feed,
                 algo_id,
@@ -1104,6 +1236,7 @@ pub async fn get_feed_skeleton(
                 } else {
                     None
                 },
+                impression_id,
             );
             SkeletonFeedPost {
                 post: uri.clone(),
@@ -1117,6 +1250,101 @@ pub async fn get_feed_skeleton(
         count_injected(&feed_cursor, &response_cursor);
 
     let response_time_ms = request_start.elapsed().as_millis();
+
+    // ═══════════════════════════════════════════════════════════════════
+    // ML Impression logging (fire-and-forget, only when enabled)
+    // ═══════════════════════════════════════════════════════════════════
+    if ml_impressions_active {
+        if let Some(ref imp_queue) = state.impression_queue {
+            let richness_ratio = ml_scoring_result
+                .as_ref()
+                .map(|sr| {
+                    if sr.posts_checked > 0 {
+                        sr.scored_count as f32 / sr.posts_checked as f32
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(0.0);
+            let served_at = Utc::now();
+            let hour_of_day = served_at.hour() as u8;
+            let day_of_week = served_at.weekday().num_days_from_monday() as u8;
+            let is_holdout_flag = response_thompson_meta
+                .as_ref()
+                .map(|m| m.is_holdout)
+                .unwrap_or(false);
+            let is_exploration_flag = response_thompson_meta
+                .as_ref()
+                .map(|m| m.params.is_exploration)
+                .unwrap_or(false);
+            let resp_time_ms = response_time_ms as f32;
+
+            let mut impression_rows: Vec<FeedImpressionRow> = Vec::new();
+            for ((depth, (uri, source)), imp_id_opt) in final_with_provenance
+                .iter()
+                .enumerate()
+                .zip(impression_ids.iter())
+            {
+                let imp_id = match imp_id_opt {
+                    Some(id) => id.clone(),
+                    None => continue, // skip special posts
+                };
+                let features = ml_uri_to_features
+                    .get(uri)
+                    .cloned()
+                    .unwrap_or_default();
+                let source_str = match source {
+                    ItemProvenance::Base(BlendedSource::PostLevelPersonalization) => {
+                        "personalized"
+                    }
+                    ItemProvenance::Base(BlendedSource::AuthorAffinity) => "author_affinity",
+                    ItemProvenance::Base(BlendedSource::Fallback { .. }) => "fallback",
+                    _ => "other",
+                };
+                impression_rows.push(FeedImpressionRow {
+                    impression_id: imp_id,
+                    user_hash: user_hash.clone(),
+                    post_id: uri.clone(),
+                    algo_id,
+                    served_at,
+                    depth: depth.min(u8::MAX as usize) as u8,
+                    source: source_str.to_string(),
+                    is_holdout: is_holdout_flag,
+                    is_exploration: is_exploration_flag,
+                    response_time_ms: resp_time_ms,
+                    is_first_page,
+                    raw_score: features.raw_score,
+                    final_score: features.final_score,
+                    num_paths: features.num_paths,
+                    liker_count: features.liker_count,
+                    popularity_penalty: features.popularity_penalty,
+                    paths_boost: features.paths_boost,
+                    max_contribution: features.max_contribution,
+                    score_concentration: features.score_concentration,
+                    newest_like_age_hours: features.newest_like_age_hours,
+                    oldest_like_age_hours: features.oldest_like_age_hours,
+                    was_liker_cache_hit: features.was_liker_cache_hit,
+                    coliker_count: features.coliker_count,
+                    top_coliker_weight: features.top_coliker_weight,
+                    top5_weight_sum: features.top5_weight_sum,
+                    mean_coliker_weight: features.mean_coliker_weight,
+                    weight_concentration: features.weight_concentration,
+                    user_like_count: 0, // TODO: query from Redis in a follow-up
+                    user_segment: "unknown".to_string(),
+                    richness_ratio,
+                    hour_of_day,
+                    day_of_week,
+                });
+            }
+
+            if !impression_rows.is_empty() {
+                let queue = imp_queue.clone();
+                tokio::spawn(async move {
+                    queue.send_batch(impression_rows).await;
+                });
+            }
+        }
+    }
 
     let response = FeedSkeletonResponse {
         feed,
@@ -1410,6 +1638,10 @@ pub async fn send_interactions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::special_posts::ItemProvenance;
+    use graze_common::models::FeedContextProvenance;
+
+    // ─── URI helpers ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_uri_to_compact() {
@@ -1430,5 +1662,112 @@ mod tests {
     fn test_uri_roundtrip() {
         let uri = "at://did:plc:xyz789/app.bsky.feed.post/abc123";
         assert_eq!(compact_to_uri(&uri_to_compact(uri)), uri);
+    }
+
+    // ─── encode_feed_context: impression_id threading ────────────────────────
+
+    fn call_encode(
+        prov: &ItemProvenance,
+        impression_id: Option<String>,
+    ) -> Option<String> {
+        encode_feed_context(
+            "at://did:plc:svc/app.bsky.feed.generator/test",
+            1,
+            0,
+            10,
+            5,
+            prov,
+            None,
+            None,
+            impression_id,
+        )
+    }
+
+    #[test]
+    fn test_encode_feed_context_impression_id_present() {
+        let prov = ItemProvenance::Base(BlendedSource::PostLevelPersonalization);
+        let encoded = call_encode(&prov, Some("cafebabe00112233".to_string()))
+            .expect("should encode");
+        let decoded = FeedContextProvenance::decode(&encoded).expect("should decode");
+        assert_eq!(
+            decoded.impression_id,
+            Some("cafebabe00112233".to_string())
+        );
+    }
+
+    #[test]
+    fn test_encode_feed_context_impression_id_none() {
+        let prov = ItemProvenance::Base(BlendedSource::PostLevelPersonalization);
+        let encoded = call_encode(&prov, None).expect("should encode");
+        let decoded = FeedContextProvenance::decode(&encoded).expect("should decode");
+        assert_eq!(decoded.impression_id, None);
+    }
+
+    #[test]
+    fn test_encode_feed_context_special_post_no_impression_id() {
+        // Special posts (pinned/rotating/sponsored) should never get impression IDs
+        let provs = [
+            ItemProvenance::Pinned { attribution: "pin-test".to_string() },
+            ItemProvenance::Rotating { attribution: "rot-test".to_string() },
+            ItemProvenance::Sponsored { attribution: "spon-test".to_string() },
+        ];
+        for prov in &provs {
+            // Passing None always works; assert we don't accidentally embed one
+            let encoded = call_encode(prov, None).expect("should encode");
+            let decoded = FeedContextProvenance::decode(&encoded).expect("should decode");
+            assert_eq!(decoded.impression_id, None);
+        }
+    }
+
+    // ─── Impression ID format ────────────────────────────────────────────────
+
+    #[test]
+    fn test_impression_id_is_16_hex_chars() {
+        // IDs are generated as format!("{:016x}", rand::random::<u64>())
+        let id = format!("{:016x}", 0x_a3f9bc7d_21e84c05_u64);
+        assert_eq!(id.len(), 16);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_impression_ids_are_unique() {
+        let ids: Vec<String> = (0..100)
+            .map(|_| format!("{:016x}", rand::random::<u64>()))
+            .collect();
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        // Probability of collision in 100 draws from 2^64 is negligible
+        assert_eq!(unique.len(), ids.len());
+    }
+
+    // ─── encode_feed_context: provenance fields ───────────────────────────────
+
+    #[test]
+    fn test_encode_feed_context_personalized_source() {
+        let prov = ItemProvenance::Base(BlendedSource::PostLevelPersonalization);
+        let encoded = call_encode(&prov, None).unwrap();
+        let decoded = FeedContextProvenance::decode(&encoded).unwrap();
+        assert_eq!(decoded.source, "personalized");
+        assert!(decoded.personalized);
+    }
+
+    #[test]
+    fn test_encode_feed_context_author_affinity_source() {
+        let prov = ItemProvenance::Base(BlendedSource::AuthorAffinity);
+        let encoded = call_encode(&prov, None).unwrap();
+        let decoded = FeedContextProvenance::decode(&encoded).unwrap();
+        assert_eq!(decoded.source, "author_affinity");
+        assert!(decoded.personalized);
+    }
+
+    #[test]
+    fn test_encode_feed_context_fallback_source() {
+        let prov = ItemProvenance::Base(BlendedSource::Fallback {
+            tranche: "trending".to_string(),
+        });
+        let encoded = call_encode(&prov, None).unwrap();
+        let decoded = FeedContextProvenance::decode(&encoded).unwrap();
+        assert_eq!(decoded.source, "fallback");
+        assert!(!decoded.personalized);
+        assert_eq!(decoded.fallback_tranche, Some("trending".to_string()));
     }
 }

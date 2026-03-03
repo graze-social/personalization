@@ -168,10 +168,7 @@ impl OnnxRanker {
             .enumerate()
             .map(|(i, (ll_score, post_id, _))| {
                 // Each row has 2 values: P(negative), P(positive). Column 1 = P(positive).
-                let ml_prob = prob_data
-                    .get(i * 2 + 1)
-                    .copied()
-                    .unwrap_or(0.5) as f64;
+                let ml_prob = prob_data.get(i * 2 + 1).copied().unwrap_or(0.5) as f64;
                 let ml_clamped = ml_prob.clamp(1e-9, 1.0 - 1e-9);
                 let score = ll_score.max(1e-9).powf(alpha) * ml_clamped.powf(beta);
                 (score, post_id.clone())
@@ -190,7 +187,13 @@ mod tests {
 
     fn dummy_posts(n: usize) -> Vec<(f64, String, PostFeatures)> {
         (0..n)
-            .map(|i| (1.0 / (i + 1) as f64, format!("post_{}", i), PostFeatures::default()))
+            .map(|i| {
+                (
+                    1.0 / (i + 1) as f64,
+                    format!("post_{}", i),
+                    PostFeatures::default(),
+                )
+            })
             .collect()
     }
 
@@ -294,9 +297,7 @@ mod tests {
         let n = posts.len();
         let mut flat: Vec<f32> = Vec::with_capacity(n * FEATURE_COUNT);
         for (i, (_, _, feat)) in posts.iter().enumerate() {
-            let arr = feat.to_array(
-                i as u8, 0, 0, 0.0, 0, 0, false, false,
-            );
+            let arr = feat.to_array(i as u8, 0, 0, 0.0, 0, 0, false, false);
             flat.extend_from_slice(&arr);
         }
         let matrix = Array2::<f32>::from_shape_vec((n, FEATURE_COUNT), flat).unwrap();

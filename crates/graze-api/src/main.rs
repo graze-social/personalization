@@ -198,7 +198,9 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         if config.ml_reranker_enabled {
-            tracing::warn!("ML_RERANKER_ENABLED=true but ML_MODEL_PATH is empty; re-ranker disabled");
+            tracing::warn!(
+                "ML_RERANKER_ENABLED=true but ML_MODEL_PATH is empty; re-ranker disabled"
+            );
         }
         None
     };
@@ -213,11 +215,12 @@ async fn main() -> anyhow::Result<()> {
             password: config.clickhouse_password.clone(),
             secure: config.clickhouse_secure,
         });
-        let impression_writer: Arc<dyn graze_common::ImpressionWriter> = if config.interactions_writer == "none" {
-            Arc::new(NoOpImpressionWriter)
-        } else {
-            Arc::new(ClickHouseImpressionWriter::new(ch_config))
-        };
+        let impression_writer: Arc<dyn graze_common::ImpressionWriter> =
+            if config.interactions_writer == "none" {
+                Arc::new(NoOpImpressionWriter)
+            } else {
+                Arc::new(ClickHouseImpressionWriter::new(ch_config))
+            };
 
         let (tx, rx) = tokio::sync::mpsc::channel(config.ml_impressions_queue_capacity);
         let (imp_shutdown_tx, _) = broadcast::channel::<()>(1);

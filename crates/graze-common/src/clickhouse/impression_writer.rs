@@ -165,7 +165,11 @@ fn escape_tab_value(s: &str) -> String {
 }
 
 fn bool_to_ch(b: bool) -> String {
-    if b { "1".to_string() } else { "0".to_string() }
+    if b {
+        "1".to_string()
+    } else {
+        "0".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -283,9 +287,11 @@ mod tests {
         ];
 
         assert_eq!(
-            column_count, values.len(),
+            column_count,
+            values.len(),
             "column list has {} items but serialised row has {} values",
-            column_count, values.len()
+            column_count,
+            values.len()
         );
     }
 

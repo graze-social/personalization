@@ -279,7 +279,11 @@ mod tests {
             .decode(&encoded)
             .expect("base64");
         let json = String::from_utf8(raw).expect("utf8");
-        assert!(!json.contains("\"iid\""), "iid key should be omitted when None, got: {}", json);
+        assert!(
+            !json.contains("\"iid\""),
+            "iid key should be omitted when None, got: {}",
+            json
+        );
     }
 
     #[test]
@@ -308,7 +312,14 @@ mod tests {
             .decode(&encoded)
             .expect("base64");
         let json = String::from_utf8(raw).expect("utf8");
-        assert!(json.contains("\"iid\""), "expected compact key 'iid', got: {}", json);
-        assert!(!json.contains("\"impression_id\""), "long key must not appear");
+        assert!(
+            json.contains("\"iid\""),
+            "expected compact key 'iid', got: {}",
+            json
+        );
+        assert!(
+            !json.contains("\"impression_id\""),
+            "long key must not appear"
+        );
     }
 }

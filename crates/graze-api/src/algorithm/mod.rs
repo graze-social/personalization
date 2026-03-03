@@ -5,8 +5,8 @@
 mod author_affinity;
 mod coliker;
 mod diversity;
-mod feed_cache;
 pub mod features;
+mod feed_cache;
 mod liker_cache;
 mod params;
 mod proof;
@@ -17,8 +17,8 @@ mod thompson;
 pub use author_affinity::AuthorColikerWorker;
 pub use coliker::ColikerWorker;
 pub use diversity::{diversify_posts, DiversityConfig, DiversityResult};
-pub use feed_cache::{FeedCache, FeedCacheStats};
 pub use features::{NetworkStats, PostFeatures, FEATURE_COUNT, FEATURE_NAMES};
+pub use feed_cache::{FeedCache, FeedCacheStats};
 pub use graze_common::models::FeedSuccessConfig;
 pub use liker_cache::{CacheStats, LikerCache};
 pub use params::{apply_thompson_params, get_preset, merge_params, LinkLonkParams};
@@ -279,7 +279,14 @@ impl LinkLonkAlgorithm {
         // Step 3: Score posts using co-liker weights
         let scoring_result = self
             .scorer
-            .score(user_hash, algo_id, &coliker_weights, params, network_stats, audit)
+            .score(
+                user_hash,
+                algo_id,
+                &coliker_weights,
+                params,
+                network_stats,
+                audit,
+            )
             .await?;
 
         debug!(

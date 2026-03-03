@@ -19,6 +19,7 @@ pub use clickhouse::{
     ImpressionWriter, InteractionWriter, NoOpImpressionWriter, NoOpInteractionWriter,
 };
 pub use error::{GrazeError, Result};
+pub use models::{FeedImpressionRow, FeedInteractionRow};
 pub use redis::{
     // New date-based functions
     date_from_timestamp,
@@ -38,7 +39,6 @@ pub use redis::{
     DAY_TRANCHES,
     DEFAULT_RETENTION_DAYS,
 };
-pub use models::{FeedImpressionRow, FeedInteractionRow};
 pub use services::{
     InteractionsClient, InteractionsConfig, SpecialPost, SpecialPostsClient, SpecialPostsResponse,
     SpecialPostsSource, SponsoredPost, UriInterner,

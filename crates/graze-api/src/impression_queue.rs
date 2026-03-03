@@ -99,7 +99,10 @@ pub async fn run_impression_worker(
 
     // Flush remaining on shutdown
     if !batch.is_empty() {
-        info!(remaining = batch.len(), "Flushing remaining impressions on shutdown");
+        info!(
+            remaining = batch.len(),
+            "Flushing remaining impressions on shutdown"
+        );
         flush(&writer, &mut batch).await;
     }
 
@@ -131,7 +134,12 @@ mod tests {
     impl RecordingWriter {
         fn new() -> (Self, Arc<Mutex<Vec<FeedImpressionRow>>>) {
             let rows = Arc::new(Mutex::new(Vec::new()));
-            (Self { rows: Arc::clone(&rows) }, rows)
+            (
+                Self {
+                    rows: Arc::clone(&rows),
+                },
+                rows,
+            )
         }
     }
 
@@ -196,9 +204,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // batch_size=3, very long interval so only size trigger fires
-        let handle = tokio::spawn(run_impression_worker(
-            rx, shutdown_rx, writer, 60_000, 3,
-        ));
+        let handle = tokio::spawn(run_impression_worker(rx, shutdown_rx, writer, 60_000, 3));
 
         // Send exactly 3 rows — should trigger a flush
         for i in 0..3 {
@@ -226,9 +232,7 @@ mod tests {
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
         // batch_size=100 so only shutdown triggers flush
-        let handle = tokio::spawn(run_impression_worker(
-            rx, shutdown_rx, writer, 60_000, 100,
-        ));
+        let handle = tokio::spawn(run_impression_worker(rx, shutdown_rx, writer, 60_000, 100));
 
         for i in 0..5 {
             tx.send(make_row(&format!("shutdown_{}", i))).await.unwrap();
@@ -252,9 +256,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<FeedImpressionRow>(1);
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-        let handle = tokio::spawn(run_impression_worker(
-            rx, shutdown_rx, writer, 60_000, 10,
-        ));
+        let handle = tokio::spawn(run_impression_worker(rx, shutdown_rx, writer, 60_000, 10));
 
         let _ = shutdown_tx.send(());
         let _ = handle.await;

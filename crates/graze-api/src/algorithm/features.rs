@@ -49,7 +49,6 @@ pub const FEATURE_NAMES: [&str; FEATURE_COUNT] = [
 #[derive(Debug, Clone, Default)]
 pub struct PostFeatures {
     // --- Scoring features (from the hot loop over post likers) ---
-
     /// Raw weighted co-liker sum before boosts/penalties.
     pub raw_score: f32,
     /// Final score after paths_boost × popularity_penalty.
@@ -74,7 +73,6 @@ pub struct PostFeatures {
     pub was_liker_cache_hit: bool,
 
     // --- Network features (computed from source_weights before scoring) ---
-
     /// Total co-likers in the user's co-liker graph.
     pub coliker_count: u16,
     /// Weight of the highest-weight co-liker.
@@ -251,14 +249,14 @@ mod tests {
     fn test_to_array_context_fields() {
         let f = make_features();
         let arr = f.to_array(7, 1234, 2, 0.85, 14, 3, true, false);
-        assert_eq!(arr[16], 7.0);    // depth
+        assert_eq!(arr[16], 7.0); // depth
         assert_eq!(arr[17], 1234.0); // user_like_count
-        assert_eq!(arr[18], 2.0);    // user_segment_encoded (active)
-        assert_eq!(arr[19], 0.85);   // richness_ratio
-        assert_eq!(arr[20], 14.0);   // hour_of_day
-        assert_eq!(arr[21], 3.0);    // day_of_week
-        assert_eq!(arr[22], 1.0);    // is_first_page = true
-        assert_eq!(arr[23], 0.0);    // is_holdout = false
+        assert_eq!(arr[18], 2.0); // user_segment_encoded (active)
+        assert_eq!(arr[19], 0.85); // richness_ratio
+        assert_eq!(arr[20], 14.0); // hour_of_day
+        assert_eq!(arr[21], 3.0); // day_of_week
+        assert_eq!(arr[22], 1.0); // is_first_page = true
+        assert_eq!(arr[23], 0.0); // is_holdout = false
     }
 
     #[test]

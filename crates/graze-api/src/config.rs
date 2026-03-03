@@ -603,9 +603,15 @@ mod tests {
         assert!(!parse_bool_env("ML_RERANKER_ENABLED", false));
         assert_eq!(parse_f32_env("ML_RERANKER_ALPHA", 1.0), 1.0);
         assert_eq!(parse_f32_env("ML_RERANKER_BETA", 0.3), 0.3);
-        assert_eq!(parse_u64_env("ML_IMPRESSIONS_BATCH_INTERVAL_MS", 5000), 5000);
+        assert_eq!(
+            parse_u64_env("ML_IMPRESSIONS_BATCH_INTERVAL_MS", 5000),
+            5000
+        );
         assert_eq!(parse_usize_env("ML_IMPRESSIONS_BATCH_SIZE", 500), 500);
-        assert_eq!(parse_usize_env("ML_IMPRESSIONS_QUEUE_CAPACITY", 10000), 10000);
+        assert_eq!(
+            parse_usize_env("ML_IMPRESSIONS_QUEUE_CAPACITY", 10000),
+            10000
+        );
     }
 
     // ─── Boolean parsing ──────────────────────────────────────────────────────
@@ -658,10 +664,7 @@ mod tests {
     #[test]
     fn test_ml_model_path_override() {
         let _g = EnvGuard::set(&[("ML_MODEL_PATH", "/tmp/model.onnx")]);
-        assert_eq!(
-            std::env::var("ML_MODEL_PATH").unwrap(),
-            "/tmp/model.onnx"
-        );
+        assert_eq!(std::env::var("ML_MODEL_PATH").unwrap(), "/tmp/model.onnx");
     }
 
     #[test]
@@ -681,7 +684,10 @@ mod tests {
     #[test]
     fn test_ml_batch_interval_override() {
         let _g = EnvGuard::set(&[("ML_IMPRESSIONS_BATCH_INTERVAL_MS", "2500")]);
-        assert_eq!(parse_u64_env("ML_IMPRESSIONS_BATCH_INTERVAL_MS", 5000), 2500);
+        assert_eq!(
+            parse_u64_env("ML_IMPRESSIONS_BATCH_INTERVAL_MS", 5000),
+            2500
+        );
     }
 
     #[test]
@@ -693,7 +699,10 @@ mod tests {
     #[test]
     fn test_ml_queue_capacity_override() {
         let _g = EnvGuard::set(&[("ML_IMPRESSIONS_QUEUE_CAPACITY", "5000")]);
-        assert_eq!(parse_usize_env("ML_IMPRESSIONS_QUEUE_CAPACITY", 10000), 5000);
+        assert_eq!(
+            parse_usize_env("ML_IMPRESSIONS_QUEUE_CAPACITY", 10000),
+            5000
+        );
     }
 
     // ─── Numeric parsing edge cases ──────────────────────────────────────────

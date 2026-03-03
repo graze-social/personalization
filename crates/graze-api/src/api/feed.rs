@@ -19,7 +19,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::algorithm::{FeedOutcome, FeedSuccessConfig, SelectedParams};
 use crate::api::cursor::FeedCursor;
-use crate::api::fallback::{get_blended_posts_with_stats, get_fallback_blend, BlendedSource};
+use crate::api::fallback::{
+    get_blended_posts_with_stats, get_fallback_blend, load_user_liked_uris, BlendedSource,
+};
 use crate::api::special_posts::{count_injected, inject_special_posts, ItemProvenance};
 use crate::api::RequestId;
 use crate::audit::{emit_skip_log, should_audit, AuditCollector};
@@ -661,14 +663,22 @@ pub async fn get_feed_skeleton(
         // If cache miss and NOT holdout, run personalization (only on first page when cache enabled)
         // When holdout, we already set base_posts_tagged from fallback above - do not overwrite.
         if !feed_cache_hit && !is_personalization_holdout_for_provenance {
-            // Check if user has any likes in date-based keys (check today first as most likely)
+            // Check if user has any likes in date-based keys.
+            // Check today and yesterday so users who liked before UTC midnight still
+            // get the personalization path rather than falling to unfiltered fallback.
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
             let today = graze_common::today_date();
+            let yesterday = graze_common::date_from_timestamp(now_secs - 86400.0);
             let user_likes_key_today = Keys::user_likes_date(&user_hash, &today);
-            let user_has_data = state
-                .redis
-                .exists(&user_likes_key_today)
-                .await
-                .unwrap_or(false);
+            let user_likes_key_yesterday = Keys::user_likes_date(&user_hash, &yesterday);
+            let (exists_today, exists_yesterday) = tokio::join!(
+                state.redis.exists(&user_likes_key_today),
+                state.redis.exists(&user_likes_key_yesterday),
+            );
+            let user_has_data = exists_today.unwrap_or(false) || exists_yesterday.unwrap_or(false);
 
             if user_has_data {
                 // Load feed-specific Thompson config (holdout override, etc.)
@@ -961,6 +971,27 @@ pub async fn get_feed_skeleton(
         .into_iter()
         .map(|(u, t)| (u, BlendedSource::Fallback { tranche: t }))
         .collect();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Universal liked-post filter: remove posts the user already liked
+    // from every feed response, regardless of which path produced them.
+    // Catches feed-cache hits, fallback paths, and anything else.
+    // ═══════════════════════════════════════════════════════════════════
+    if state.config.liked_posts_filter_enabled {
+        if let Some(ref did) = user_did {
+            let filter_hash = hash_did(did);
+            let liked_uris = load_user_liked_uris(
+                &state.redis,
+                &state.interner,
+                &filter_hash,
+                state.config.liked_posts_filter_max,
+            )
+            .await;
+            if !liked_uris.is_empty() {
+                base_posts_tagged.retain(|(uri, _)| !liked_uris.contains(uri));
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════

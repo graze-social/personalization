@@ -84,6 +84,14 @@ pub struct Config {
     pub warm_user_trending_ratio: f64,
 
     // ═══════════════════════════════════════════════════════════════════════════════
+    // Liked Posts Filter Configuration
+    // ═══════════════════════════════════════════════════════════════════════════════
+    /// When true, filter out already-liked posts from every feed response.
+    pub liked_posts_filter_enabled: bool,
+    /// Max number of liked posts to load for the universal filter (higher than scorer's cap).
+    pub liked_posts_filter_max: usize,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
     // Seen Posts Configuration
     // ═══════════════════════════════════════════════════════════════════════════════
     pub seen_posts_ttl_hours: u32,
@@ -296,6 +304,10 @@ impl Config {
             warm_user_max_likes: parse_usize_env("WARM_USER_MAX_LIKES", 20),
             cold_user_trending_ratio: parse_f64_env("COLD_USER_TRENDING_RATIO", 0.8),
             warm_user_trending_ratio: parse_f64_env("WARM_USER_TRENDING_RATIO", 0.5),
+
+            // Liked Posts Filter
+            liked_posts_filter_enabled: parse_bool_env("LIKED_POSTS_FILTER_ENABLED", true),
+            liked_posts_filter_max: parse_usize_env("LIKED_POSTS_FILTER_MAX", 2000),
 
             // Seen Posts
             seen_posts_ttl_hours: parse_u32_env("SEEN_POSTS_TTL_HOURS", 48),

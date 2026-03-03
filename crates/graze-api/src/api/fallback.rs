@@ -518,6 +518,46 @@ async fn get_user_like_count(redis: &RedisClient, user_hash: &str) -> u64 {
     counts.into_iter().sum::<usize>() as u64
 }
 
+/// Load a user's recently liked post URIs for universal feed deduplication.
+///
+/// Fetches up to `max_likes` liked post IDs from the retention window, converts
+/// them to URIs via the interner, and returns a HashSet for O(1) lookup.
+/// Used to filter already-liked posts from every outgoing feed response.
+pub async fn load_user_liked_uris(
+    redis: &RedisClient,
+    interner: &UriInterner,
+    user_hash: &str,
+    max_likes: usize,
+) -> HashSet<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
+    let keys = Keys::user_likes_retention(user_hash, DEFAULT_RETENTION_DAYS);
+    let liked_items = match redis
+        .zrevrangebyscore_merged(&keys, now, 0.0, max_likes)
+        .await
+    {
+        Ok(items) => items,
+        Err(_) => return HashSet::new(),
+    };
+
+    if liked_items.is_empty() {
+        return HashSet::new();
+    }
+
+    let ids: Vec<i64> = liked_items
+        .into_iter()
+        .filter_map(|(id_str, _)| id_str.parse::<i64>().ok())
+        .collect();
+
+    match interner.get_uris_batch(&ids).await {
+        Ok(map) => map.into_values().collect(),
+        Err(_) => HashSet::new(),
+    }
+}
+
 /// Get popular posts as a simple fallback (legacy function).
 pub async fn get_popular_posts(
     redis: &RedisClient,

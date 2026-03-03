@@ -337,11 +337,8 @@ impl Scorer {
             vec![]
         };
         // Map from post_id -> PostFeatures, built during the fast path when collect=true
-        let mut features_by_id: rustc_hash::FxHashMap<String, PostFeatures> = if collect {
-            rustc_hash::FxHashMap::default()
-        } else {
-            rustc_hash::FxHashMap::default()
-        };
+        let mut features_by_id: rustc_hash::FxHashMap<String, PostFeatures> =
+            rustc_hash::FxHashMap::default();
 
         if let Some(ref mut a) = audit {
             // Audit-enabled path

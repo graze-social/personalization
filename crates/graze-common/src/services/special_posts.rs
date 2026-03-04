@@ -31,10 +31,6 @@ pub enum SpecialPostsSource {
     },
 }
 
-/// Global rotating post URI - added to sticky posts pool.
-const GLOBAL_POST_URI: &str =
-    "at://did:plc:i6y3jdklpvkjvynvsrnqfdoq/app.bsky.feed.post/3mdelwlvqm22h";
-
 /// A special post (pinned or sticky/rotating) to inject into feeds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpecialPost {
@@ -142,12 +138,7 @@ impl SpecialPostsClient {
             }
             SpecialPostsSource::Remote { api_base_url } => {
                 debug!(algo_id, "special_posts_cache_miss");
-                let mut response = self.fetch_from_api(algo_id, api_base_url).await;
-
-                response.sticky.push(SpecialPost {
-                    attribution: "ns_global".to_string(),
-                    post: GLOBAL_POST_URI.to_string(),
-                });
+                let response = self.fetch_from_api(algo_id, api_base_url).await;
 
                 self.store_in_cache(&cache_key, &response).await;
 

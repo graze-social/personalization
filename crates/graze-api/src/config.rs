@@ -118,6 +118,8 @@ pub struct Config {
     pub special_posts_source: String,
     /// API base URL when special_posts_source is remote.
     pub special_posts_api_base: String,
+    /// Bearer token for authenticating with the special posts API.
+    pub special_posts_api_token: String,
 
     // ═══════════════════════════════════════════════════════════════════════════════
     // Feed Access Sync Configuration
@@ -334,6 +336,10 @@ impl Config {
             )
             .trim()
             .to_string(),
+            special_posts_api_token: std::env::var("SPECIAL_POSTS_API_TOKEN")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
 
             // Feed Access Sync
             feed_access_sync_enabled: parse_bool_env("FEED_ACCESS_SYNC_ENABLED", true),

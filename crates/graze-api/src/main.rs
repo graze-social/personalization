@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         SpecialPostsSource::Remote {
             api_base_url: config.special_posts_api_base.clone(),
+            api_token: config.special_posts_api_token.clone(),
         }
     };
     let special_posts = Arc::new(SpecialPostsClient::new(redis.clone(), special_posts_source));

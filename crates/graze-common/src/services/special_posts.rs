@@ -28,6 +28,8 @@ pub enum SpecialPostsSource {
     Remote {
         /// Base URL (e.g. "https://api.graze.social/app/my_feeds").
         api_base_url: String,
+        /// Bearer token for authenticating with the special posts API.
+        api_token: String,
     },
 }
 
@@ -140,9 +142,12 @@ impl SpecialPostsClient {
                 debug!(algo_id, "special_posts_local_miss");
                 Ok(SpecialPostsResponse::empty(algo_id))
             }
-            SpecialPostsSource::Remote { api_base_url } => {
+            SpecialPostsSource::Remote {
+                api_base_url,
+                api_token,
+            } => {
                 debug!(algo_id, "special_posts_cache_miss");
-                let mut response = self.fetch_from_api(algo_id, api_base_url).await;
+                let mut response = self.fetch_from_api(algo_id, api_base_url, api_token).await;
 
                 response.sticky.push(SpecialPost {
                     attribution: "ns_global".to_string(),
@@ -189,11 +194,16 @@ impl SpecialPostsClient {
     }
 
     /// Fetch special posts from the external API.
-    async fn fetch_from_api(&self, algo_id: i32, api_base_url: &str) -> SpecialPostsResponse {
+    async fn fetch_from_api(
+        &self,
+        algo_id: i32,
+        api_base_url: &str,
+        api_token: &str,
+    ) -> SpecialPostsResponse {
         let url = format!("{}/{}/special-posts", api_base_url, algo_id);
         let start = std::time::Instant::now();
 
-        match self.http_client.get(&url).send().await {
+        match self.http_client.get(&url).bearer_auth(api_token).send().await {
             Ok(response) => {
                 let fetch_time_ms = start.elapsed().as_millis();
 

@@ -194,7 +194,13 @@ impl SpecialPostsClient {
         let url = format!("{}/{}/special-posts", api_base_url, algo_id);
         let start = std::time::Instant::now();
 
-        match self.http_client.get(&url).bearer_auth(api_token).send().await {
+        match self
+            .http_client
+            .get(&url)
+            .bearer_auth(api_token)
+            .send()
+            .await
+        {
             Ok(response) => {
                 let fetch_time_ms = start.elapsed().as_millis();
 

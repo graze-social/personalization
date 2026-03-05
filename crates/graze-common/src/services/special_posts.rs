@@ -143,7 +143,7 @@ impl SpecialPostsClient {
                 api_token,
             } => {
                 debug!(algo_id, "special_posts_cache_miss");
-                let response = self.fetch_from_api(algo_id, api_base_url).await;
+                let response = self.fetch_from_api(algo_id, api_base_url, api_token).await;
 
                 self.store_in_cache(&cache_key, &response).await;
 

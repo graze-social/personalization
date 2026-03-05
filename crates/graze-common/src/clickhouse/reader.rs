@@ -32,7 +32,8 @@ pub struct CandidateQueryParams {
 
 /// ClickHouse-backed candidate source.
 ///
-/// Use when `CANDIDATE_SOURCE=clickhouse`. Queries `algorithm_posts_v2`.
+/// Use when `CANDIDATE_SOURCE=clickhouse`. Queries `algorithm_posts_v2` and
+/// excludes posts marked hidden in `hidden_status` (same semantics as feed queries).
 pub struct ClickHouseCandidateSource {
     http_client: Client,
     config: Arc<ClickHouseConfig>,
@@ -69,13 +70,19 @@ impl ClickHouseCandidateSource {
         );
 
         let query = r#"
-            SELECT uri
-            FROM {database:Identifier}.algorithm_posts_v2
-            WHERE algo_id = {algo_id:Int32}
-              AND bluesky_created_at >= {min_time:DateTime}
-              AND bluesky_created_at <= created_at + INTERVAL 1 HOUR
-              AND bluesky_created_at <= now()
-            ORDER BY bluesky_created_at DESC
+            SELECT p.uri
+            FROM {database:Identifier}.algorithm_posts_v2 p
+            LEFT JOIN (
+                SELECT uri, hidden
+                FROM {database:Identifier}.hidden_status
+                WHERE algo_id = {algo_id:Int32}
+            ) h ON p.uri = h.uri
+            WHERE p.algo_id = {algo_id:Int32}
+              AND COALESCE(h.hidden, false) = false
+              AND p.bluesky_created_at >= {min_time:DateTime}
+              AND p.bluesky_created_at <= p.created_at + INTERVAL 1 HOUR
+              AND p.bluesky_created_at <= now()
+            ORDER BY p.bluesky_created_at DESC
             LIMIT {limit:Int32}
             FORMAT JSONCompact
         "#;

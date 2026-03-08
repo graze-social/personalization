@@ -237,6 +237,29 @@ pub struct Config {
     pub clickhouse_password: String,
     pub clickhouse_database: String,
     pub clickhouse_secure: bool,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // ML Ranking Configuration
+    // ═══════════════════════════════════════════════════════════════════════════════
+    /// Log ML feature vectors to ClickHouse `feed_impressions` at serve time.
+    /// Required to accumulate training data. Does NOT activate the ONNX re-ranker.
+    pub ml_impressions_enabled: bool,
+    /// Apply ONNX model re-ranking after LinkLonk scoring.
+    /// Requires `ML_MODEL_PATH` to point to a valid .onnx file.
+    pub ml_reranker_enabled: bool,
+    /// Filesystem path to the ranking_model.onnx file. Empty = no model loaded.
+    pub ml_model_path: String,
+    /// Exponent on the LinkLonk score in the blended re-ranking formula:
+    ///   final = linkLonk^alpha * ml_prob^beta
+    pub ml_reranker_alpha: f32,
+    /// Exponent on the ML model probability in the blended re-ranking formula.
+    pub ml_reranker_beta: f32,
+    /// Interval between ClickHouse impression batch flushes (ms).
+    pub ml_impressions_batch_interval_ms: u64,
+    /// Max impression rows to buffer before flushing.
+    pub ml_impressions_batch_size: usize,
+    /// mpsc channel capacity for the impression queue.
+    pub ml_impressions_queue_capacity: usize,
 }
 
 impl Config {
@@ -453,6 +476,19 @@ impl Config {
             clickhouse_password: default_env("CLICKHOUSE_PASSWORD", ""),
             clickhouse_database: default_env("CLICKHOUSE_DATABASE", "default"),
             clickhouse_secure: parse_bool_env("CLICKHOUSE_SECURE", false),
+
+            // ML Ranking
+            ml_impressions_enabled: parse_bool_env("ML_IMPRESSIONS_ENABLED", false),
+            ml_reranker_enabled: parse_bool_env("ML_RERANKER_ENABLED", false),
+            ml_model_path: default_env("ML_MODEL_PATH", ""),
+            ml_reranker_alpha: parse_f32_env("ML_RERANKER_ALPHA", 1.0),
+            ml_reranker_beta: parse_f32_env("ML_RERANKER_BETA", 0.3),
+            ml_impressions_batch_interval_ms: parse_u64_env(
+                "ML_IMPRESSIONS_BATCH_INTERVAL_MS",
+                5000,
+            ),
+            ml_impressions_batch_size: parse_usize_env("ML_IMPRESSIONS_BATCH_SIZE", 500),
+            ml_impressions_queue_capacity: parse_usize_env("ML_IMPRESSIONS_QUEUE_CAPACITY", 10000),
         }
     }
 
@@ -508,9 +544,190 @@ fn parse_f64_env(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+fn parse_f32_env(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 fn parse_bool_env(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(v) => matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"),
         Err(_) => default,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Guard that removes a set of env vars on drop, restoring prior values.
+    struct EnvGuard(Vec<(String, Option<String>)>);
+
+    impl EnvGuard {
+        fn set(vars: &[(&str, &str)]) -> Self {
+            let saved = vars
+                .iter()
+                .map(|(k, v)| {
+                    let prior = std::env::var(k).ok();
+                    std::env::set_var(k, v);
+                    (k.to_string(), prior)
+                })
+                .collect();
+            Self(saved)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, prior) in &self.0 {
+                match prior {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    // ─── Default values ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ml_defaults_are_off() {
+        // Ensure no leftover env vars from other tests affect defaults
+        let _guard = EnvGuard::set(&[
+            ("ML_IMPRESSIONS_ENABLED", ""),
+            ("ML_RERANKER_ENABLED", ""),
+            ("ML_MODEL_PATH", ""),
+        ]);
+        // Remove them so the defaults fire
+        std::env::remove_var("ML_IMPRESSIONS_ENABLED");
+        std::env::remove_var("ML_RERANKER_ENABLED");
+        std::env::remove_var("ML_MODEL_PATH");
+
+        assert!(!parse_bool_env("ML_IMPRESSIONS_ENABLED", false));
+        assert!(!parse_bool_env("ML_RERANKER_ENABLED", false));
+        assert_eq!(parse_f32_env("ML_RERANKER_ALPHA", 1.0), 1.0);
+        assert_eq!(parse_f32_env("ML_RERANKER_BETA", 0.3), 0.3);
+        assert_eq!(
+            parse_u64_env("ML_IMPRESSIONS_BATCH_INTERVAL_MS", 5000),
+            5000
+        );
+        assert_eq!(parse_usize_env("ML_IMPRESSIONS_BATCH_SIZE", 500), 500);
+        assert_eq!(
+            parse_usize_env("ML_IMPRESSIONS_QUEUE_CAPACITY", 10000),
+            10000
+        );
+    }
+
+    // ─── Boolean parsing ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_bool_true_variants() {
+        for value in &["true", "True", "TRUE", "1", "yes", "YES", "Yes"] {
+            let _g = EnvGuard::set(&[("_TEST_BOOL_VAR", value)]);
+            assert!(
+                parse_bool_env("_TEST_BOOL_VAR", false),
+                "expected true for {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_false_variants() {
+        for value in &["false", "False", "FALSE", "0", "no", "off", "anything_else"] {
+            let _g = EnvGuard::set(&[("_TEST_BOOL_VAR", value)]);
+            assert!(
+                !parse_bool_env("_TEST_BOOL_VAR", true),
+                "expected false for {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_bool_missing_returns_default() {
+        std::env::remove_var("_TEST_BOOL_MISSING");
+        assert!(parse_bool_env("_TEST_BOOL_MISSING", true));
+        assert!(!parse_bool_env("_TEST_BOOL_MISSING", false));
+    }
+
+    // ─── ML env var overrides ────────────────────────────────────────────────
+
+    #[test]
+    fn test_ml_impressions_enabled_override() {
+        let _g = EnvGuard::set(&[("ML_IMPRESSIONS_ENABLED", "true")]);
+        assert!(parse_bool_env("ML_IMPRESSIONS_ENABLED", false));
+    }
+
+    #[test]
+    fn test_ml_reranker_enabled_override() {
+        let _g = EnvGuard::set(&[("ML_RERANKER_ENABLED", "1")]);
+        assert!(parse_bool_env("ML_RERANKER_ENABLED", false));
+    }
+
+    #[test]
+    fn test_ml_model_path_override() {
+        let _g = EnvGuard::set(&[("ML_MODEL_PATH", "/tmp/model.onnx")]);
+        assert_eq!(std::env::var("ML_MODEL_PATH").unwrap(), "/tmp/model.onnx");
+    }
+
+    #[test]
+    fn test_ml_reranker_alpha_override() {
+        let _g = EnvGuard::set(&[("ML_RERANKER_ALPHA", "0.7")]);
+        let v = parse_f32_env("ML_RERANKER_ALPHA", 1.0);
+        assert!((v - 0.7).abs() < 1e-6, "got {}", v);
+    }
+
+    #[test]
+    fn test_ml_reranker_beta_override() {
+        let _g = EnvGuard::set(&[("ML_RERANKER_BETA", "0.5")]);
+        let v = parse_f32_env("ML_RERANKER_BETA", 0.3);
+        assert!((v - 0.5).abs() < 1e-6, "got {}", v);
+    }
+
+    #[test]
+    fn test_ml_batch_interval_override() {
+        let _g = EnvGuard::set(&[("ML_IMPRESSIONS_BATCH_INTERVAL_MS", "2500")]);
+        assert_eq!(
+            parse_u64_env("ML_IMPRESSIONS_BATCH_INTERVAL_MS", 5000),
+            2500
+        );
+    }
+
+    #[test]
+    fn test_ml_batch_size_override() {
+        let _g = EnvGuard::set(&[("ML_IMPRESSIONS_BATCH_SIZE", "250")]);
+        assert_eq!(parse_usize_env("ML_IMPRESSIONS_BATCH_SIZE", 500), 250);
+    }
+
+    #[test]
+    fn test_ml_queue_capacity_override() {
+        let _g = EnvGuard::set(&[("ML_IMPRESSIONS_QUEUE_CAPACITY", "5000")]);
+        assert_eq!(
+            parse_usize_env("ML_IMPRESSIONS_QUEUE_CAPACITY", 10000),
+            5000
+        );
+    }
+
+    // ─── Numeric parsing edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn test_parse_f32_invalid_falls_back_to_default() {
+        let _g = EnvGuard::set(&[("_TEST_F32_VAR", "not_a_number")]);
+        assert_eq!(parse_f32_env("_TEST_F32_VAR", 1.23), 1.23);
+    }
+
+    #[test]
+    fn test_parse_usize_invalid_falls_back_to_default() {
+        let _g = EnvGuard::set(&[("_TEST_USIZE_VAR", "abc")]);
+        assert_eq!(parse_usize_env("_TEST_USIZE_VAR", 42), 42);
+    }
+
+    #[test]
+    fn test_parse_u64_invalid_falls_back_to_default() {
+        let _g = EnvGuard::set(&[("_TEST_U64_VAR", "-1")]);
+        assert_eq!(parse_u64_env("_TEST_U64_VAR", 99), 99);
     }
 }

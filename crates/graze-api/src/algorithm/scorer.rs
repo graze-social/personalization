@@ -13,6 +13,7 @@ use rand::thread_rng;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::debug;
 
+use crate::algorithm::features::{NetworkStats, PostFeatures};
 use crate::algorithm::liker_cache::LikerCache;
 use crate::algorithm::params::LinkLonkParams;
 use crate::audit::{AuditCollector, PostBreakdownData};
@@ -26,8 +27,12 @@ const DEFAULT_MAX_SCORER_RESULTS: usize = 500;
 /// Result of scoring operation, including the scored posts themselves.
 #[derive(Debug, Clone)]
 pub struct ScoringResult {
-    /// The scored posts: (score, post_id)
+    /// The scored posts: (score, post_id), sorted descending.
     pub scored_posts: Vec<(f64, String)>,
+    /// Per-post ML features, parallel to `scored_posts`.
+    /// Populated only when `collect_features` is true on the `Scorer`.
+    /// Empty when feature collection is disabled (default).
+    pub post_features: Vec<PostFeatures>,
     pub scored_count: usize,
     pub posts_checked: usize,
     pub posts_skipped_no_likers: usize,
@@ -52,6 +57,9 @@ pub struct Scorer {
     min_overlapping_colikers: usize,
     read_only: bool,
     liker_cache_enabled: bool,
+    /// Collect `PostFeatures` during scoring for ML impression logging / re-ranking.
+    /// Enabled when `ML_IMPRESSIONS_ENABLED` or `ML_RERANKER_ENABLED` is true.
+    collect_features: bool,
 }
 
 impl Scorer {
@@ -67,12 +75,15 @@ impl Scorer {
             min_overlapping_colikers: config.min_overlapping_colikers,
             read_only: config.read_only_mode,
             liker_cache_enabled: config.liker_cache_enabled,
+            collect_features: config.ml_impressions_enabled || config.ml_reranker_enabled,
         }
     }
 
     /// Score posts for a user using the inverted algorithm.
     ///
     /// If `audit` is provided, detailed scoring information will be collected.
+    /// If `network_stats` is provided, `PostFeatures` are collected and returned
+    /// in `ScoringResult.post_features` (only when `collect_features` is true).
     /// Returns scored posts directly to avoid re-fetching from Redis.
     pub async fn score(
         &self,
@@ -80,6 +91,7 @@ impl Scorer {
         algo_id: i32,
         source_weights: &HashMap<String, f64>,
         params: &LinkLonkParams,
+        network_stats: Option<NetworkStats>,
         mut audit: Option<&mut AuditCollector>,
     ) -> Result<ScoringResult> {
         let start_time = Instant::now();
@@ -139,6 +151,7 @@ impl Scorer {
             );
             return Ok(ScoringResult {
                 scored_posts: Vec::new(),
+                post_features: Vec::new(),
                 scored_count: 0,
                 posts_checked: 0,
                 posts_skipped_no_likers: 0,
@@ -166,6 +179,7 @@ impl Scorer {
         if candidates.is_empty() {
             return Ok(ScoringResult {
                 scored_posts: Vec::new(),
+                post_features: Vec::new(),
                 scored_count: 0,
                 posts_checked: 0,
                 posts_skipped_no_likers: 0,
@@ -204,6 +218,7 @@ impl Scorer {
         if posts_to_score.is_empty() {
             return Ok(ScoringResult {
                 scored_posts: Vec::new(),
+                post_features: Vec::new(),
                 scored_count: 0,
                 posts_checked: candidates.len(),
                 posts_skipped_no_likers,
@@ -310,6 +325,21 @@ impl Scorer {
             (posts_to_score.len() / 5).clamp(100, DEFAULT_MAX_SCORER_RESULTS * 2);
         let mut post_scores: Vec<(f64, String)> = Vec::with_capacity(estimated_capacity);
 
+        // Per-post cache-hit lookup for feature collection
+        let collect = self.collect_features && network_stats.is_some();
+        let is_cache_hit: Vec<bool> = if collect && self.liker_cache_enabled {
+            let miss_set: rustc_hash::FxHashSet<usize> =
+                cache_miss_indices.iter().copied().collect();
+            (0..posts_to_score.len())
+                .map(|i| !miss_set.contains(&i))
+                .collect()
+        } else {
+            vec![]
+        };
+        // Map from post_id -> PostFeatures, built during the fast path when collect=true
+        let mut features_by_id: rustc_hash::FxHashMap<String, PostFeatures> =
+            rustc_hash::FxHashMap::default();
+
         if let Some(ref mut a) = audit {
             // Audit-enabled path
             for (post_idx, ((post_id, liker_count), likers)) in
@@ -389,6 +419,10 @@ impl Scorer {
                 let mut score = 0.0;
                 let mut overlap_count = 0usize;
                 let post_ranks = corater_ranks.get(&post_idx);
+                // Feature-collection accumulators (zero-cost when collect=false)
+                let mut max_contrib = 0.0_f32;
+                let mut newest_age_secs = f64::MAX;
+                let mut oldest_age_secs = 0.0_f64;
 
                 for (liker_hash, like_time) in likers {
                     if let Some(weight) = source_weights.get(liker_hash) {
@@ -407,7 +441,21 @@ impl Scorer {
                         } else {
                             1.0
                         };
-                        score += capped_weight * recency_weight * decay_mult;
+                        let contribution = capped_weight * recency_weight * decay_mult;
+                        score += contribution;
+
+                        if collect {
+                            let c = contribution as f32;
+                            if c > max_contrib {
+                                max_contrib = c;
+                            }
+                            if age_seconds < newest_age_secs {
+                                newest_age_secs = age_seconds;
+                            }
+                            if age_seconds > oldest_age_secs {
+                                oldest_age_secs = age_seconds;
+                            }
+                        }
                     }
                 }
 
@@ -427,10 +475,45 @@ impl Scorer {
                     } else {
                         1.0
                     };
-                    post_scores.push((
-                        score_after_paths * popularity_penalty,
-                        (*post_id).to_string(),
-                    ));
+                    let final_score = score_after_paths * popularity_penalty;
+                    post_scores.push((final_score, (*post_id).to_string()));
+
+                    if collect {
+                        let ns = network_stats.as_ref().unwrap();
+                        let score_conc = if score > 0.0 {
+                            max_contrib / score as f32
+                        } else {
+                            0.0
+                        };
+                        features_by_id.insert(
+                            (*post_id).to_string(),
+                            PostFeatures {
+                                raw_score: score as f32,
+                                final_score: final_score as f32,
+                                num_paths: overlap_count.min(u16::MAX as usize) as u16,
+                                liker_count: (*liker_count).min(u32::MAX as usize) as u32,
+                                popularity_penalty: popularity_penalty as f32,
+                                paths_boost: paths_boost as f32,
+                                max_contribution: max_contrib,
+                                score_concentration: score_conc,
+                                newest_like_age_hours: if newest_age_secs == f64::MAX {
+                                    0.0
+                                } else {
+                                    (newest_age_secs / 3600.0) as f32
+                                },
+                                oldest_like_age_hours: (oldest_age_secs / 3600.0) as f32,
+                                was_liker_cache_hit: is_cache_hit
+                                    .get(post_idx)
+                                    .copied()
+                                    .unwrap_or(false),
+                                coliker_count: ns.coliker_count,
+                                top_coliker_weight: ns.top_coliker_weight,
+                                top5_weight_sum: ns.top5_weight_sum,
+                                mean_coliker_weight: ns.mean_coliker_weight,
+                                weight_concentration: ns.weight_concentration,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -440,6 +523,16 @@ impl Scorer {
         post_scores.truncate(DEFAULT_MAX_SCORER_RESULTS);
 
         let scored_count = post_scores.len();
+
+        // Build post_features parallel to post_scores (after sort/truncate)
+        let post_features: Vec<PostFeatures> = if collect {
+            post_scores
+                .iter()
+                .filter_map(|(_, id)| features_by_id.remove(id))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // Populate local liker cache with fetched data (after scoring is done)
         // This clone is necessary since the cache needs owned data
@@ -480,6 +573,7 @@ impl Scorer {
 
         Ok(ScoringResult {
             scored_posts: post_scores,
+            post_features,
             scored_count,
             posts_checked: candidates.len(),
             posts_skipped_no_likers,

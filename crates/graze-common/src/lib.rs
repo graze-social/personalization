@@ -15,10 +15,11 @@ pub mod services;
 
 pub use clickhouse::{
     AdminOnlyCandidateSource, CandidateQueryParams, CandidateSource, ClickHouseCandidateSource,
-    ClickHouseConfig, ClickHouseInteractionWriter, HttpCandidateSource, InteractionWriter,
-    NoOpInteractionWriter,
+    ClickHouseConfig, ClickHouseImpressionWriter, ClickHouseInteractionWriter, HttpCandidateSource,
+    ImpressionWriter, InteractionWriter, NoOpImpressionWriter, NoOpInteractionWriter,
 };
 pub use error::{GrazeError, Result};
+pub use models::{FeedImpressionRow, FeedInteractionRow};
 pub use redis::{
     // New date-based functions
     date_from_timestamp,

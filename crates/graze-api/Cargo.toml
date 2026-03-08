@@ -68,3 +68,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # AT Protocol
 atproto-record = { version = "0.14", default-features = false }
+
+# ML Ranking — ONNX Runtime for LightGBM inference.
+# download-binaries: fetches ORT shared library at build time (convenient for dev).
+# For production Docker builds set ORT_LIB_LOCATION or bundle the .so manually.
+ort = { version = "2.0.0-rc.11", features = ["download-binaries"] }
+ndarray = "0.17"
+
+[dev-dependencies]
+async-trait = "0.1"

@@ -5,6 +5,7 @@
 mod author_affinity;
 mod coliker;
 mod diversity;
+pub mod features;
 mod feed_cache;
 mod liker_cache;
 mod params;
@@ -16,6 +17,7 @@ mod thompson;
 pub use author_affinity::AuthorColikerWorker;
 pub use coliker::ColikerWorker;
 pub use diversity::{diversify_posts, DiversityConfig, DiversityResult};
+pub use features::{NetworkStats, PostFeatures, FEATURE_COUNT, FEATURE_NAMES};
 pub use feed_cache::{FeedCache, FeedCacheStats};
 pub use graze_common::models::FeedSuccessConfig;
 pub use liker_cache::{CacheStats, LikerCache};
@@ -255,6 +257,7 @@ impl LinkLonkAlgorithm {
             );
             return Ok(ScoringResult {
                 scored_posts: Vec::new(),
+                post_features: Vec::new(),
                 scored_count: 0,
                 posts_checked: 0,
                 posts_skipped_no_likers: 0,
@@ -265,10 +268,25 @@ impl LinkLonkAlgorithm {
             });
         }
 
-        // Step 2: Score posts using co-liker weights
+        // Step 2: Optionally compute NetworkStats for ML feature collection
+        let network_stats = if self.config.ml_impressions_enabled || self.config.ml_reranker_enabled
+        {
+            Some(NetworkStats::from_source_weights(&coliker_weights))
+        } else {
+            None
+        };
+
+        // Step 3: Score posts using co-liker weights
         let scoring_result = self
             .scorer
-            .score(user_hash, algo_id, &coliker_weights, params, audit)
+            .score(
+                user_hash,
+                algo_id,
+                &coliker_weights,
+                params,
+                network_stats,
+                audit,
+            )
             .await?;
 
         debug!(

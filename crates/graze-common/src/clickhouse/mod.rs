@@ -11,6 +11,7 @@
 pub mod admin_only_source;
 pub mod config;
 pub mod http_source;
+pub mod impression_writer;
 pub mod reader;
 pub mod traits;
 pub mod writer;
@@ -18,6 +19,7 @@ pub mod writer;
 pub use admin_only_source::AdminOnlyCandidateSource;
 pub use config::ClickHouseConfig;
 pub use http_source::HttpCandidateSource;
+pub use impression_writer::{ClickHouseImpressionWriter, ImpressionWriter, NoOpImpressionWriter};
 pub use reader::{CandidateQueryParams, ClickHouseCandidateSource};
 pub use traits::{CandidateSource, InteractionWriter};
 pub use writer::{ClickHouseInteractionWriter, NoOpInteractionWriter};

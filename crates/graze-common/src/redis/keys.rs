@@ -324,6 +324,10 @@ impl Keys {
     /// One JSON payload per feed hit; consumed elsewhere for post_render_log etc.
     pub const LOG_TASKS: &'static str = "log_tasks";
 
+    /// Feed request log queue: one JSON payload per incoming getFeedSkeleton call,
+    /// regardless of whether the response was empty.
+    pub const FEED_REQUESTS: &'static str = "feed_requests";
+
     /// Feed access tracking HSET: `feed:access`
     ///
     /// HASH mapping algo_id -> timestamp for rolling sync scheduling.

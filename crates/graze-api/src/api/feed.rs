@@ -296,6 +296,21 @@ pub async fn get_feed_skeleton(
         "feed_skeleton_request"
     );
 
+    // Log that this feed was requested (fire-and-forget, unconditional)
+    if let Some(ref redis_logger) = state.redis_requests_logger {
+        let feed_uri = query.feed.clone();
+        let redis_logger = redis_logger.clone();
+        tokio::spawn(async move {
+            let event = serde_json::json!({
+                "feed_uri": feed_uri,
+                "requested_at": Utc::now().to_rfc3339(),
+            });
+            if let Ok(json) = serde_json::to_string(&event) {
+                let _ = redis_logger.rpush(Keys::FEED_REQUESTS, &[json]).await;
+            }
+        });
+    }
+
     // Look up feed URI to get algo_id
     let algo_id_str = match state.redis.hget(Keys::SUPPORTED_FEEDS, &query.feed).await {
         Ok(Some(id)) => id,

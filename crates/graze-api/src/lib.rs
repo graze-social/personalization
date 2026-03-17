@@ -8,8 +8,10 @@ pub mod api;
 pub mod audit;
 pub mod config;
 pub mod error;
+pub mod impression_queue;
 pub mod interaction_queue;
 pub mod metrics;
+pub mod ml;
 
 use std::sync::Arc;
 
@@ -18,6 +20,8 @@ use graze_common::{InteractionsClient, RedisClient, SpecialPostsClient, UriInter
 
 use crate::algorithm::{LinkLonkAlgorithm, ThompsonLearner};
 use crate::config::Config;
+use crate::impression_queue::ImpressionQueueSender;
+use crate::ml::OnnxRanker;
 
 /// Shared application state for the API server.
 pub struct AppState {
@@ -36,4 +40,8 @@ pub struct AppState {
     pub interaction_queue: Option<interaction_queue::InteractionQueueSender>,
     /// Optional Redis client for post-render / request logging (log_tasks queue). None when REDIS_REQUESTS_LOGGER unset.
     pub redis_requests_logger: Option<Arc<RedisClient>>,
+    /// ONNX re-ranker. Some when ML_RERANKER_ENABLED=true and ML_MODEL_PATH is set.
+    pub ml_ranker: Option<Arc<OnnxRanker>>,
+    /// Sender for the impression queue (ML feature logging). Some when ML_IMPRESSIONS_ENABLED=true.
+    pub impression_queue: Option<ImpressionQueueSender>,
 }

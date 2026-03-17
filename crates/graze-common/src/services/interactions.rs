@@ -31,6 +31,10 @@ pub struct FeedContext {
     pub feed_uri: Option<String>,
     /// Custom attribution string
     pub attribution: Option<String>,
+    /// ML impression ID (16-char hex). Set when ML_IMPRESSIONS_ENABLED=true.
+    /// Key is "iid" to keep feedContext payloads compact.
+    #[serde(rename = "iid")]
+    pub impression_id: Option<String>,
 }
 
 /// Client that prepares interaction rows and writes them via an `InteractionWriter`.
@@ -142,20 +146,22 @@ impl InteractionsClient {
 
         for interaction in interactions {
             // Decode feedContext
-            let (feed_uri, attribution) = match &interaction.feed_context {
+            let (feed_uri, attribution, impression_id) = match &interaction.feed_context {
                 Some(ctx) => {
                     let decoded = Self::decode_feed_context(ctx);
                     (
                         decoded.as_ref().and_then(|d| d.feed_uri.clone()),
                         decoded.as_ref().and_then(|d| d.attribution.clone()),
+                        decoded.as_ref().and_then(|d| d.impression_id.clone()),
                     )
                 }
-                None => (None, None),
+                None => (None, None, None),
             };
 
             // Build feed_interactions_buffer row
             interaction_rows.push(FeedInteractionRow {
                 did: user_did.to_string(),
+                impression_id: impression_id.unwrap_or_default(),
                 interaction_feed_context: interaction.feed_context.clone().unwrap_or_default(),
                 feed_uri: feed_uri.clone().unwrap_or_default(),
                 attribution: attribution.clone().unwrap_or_default(),

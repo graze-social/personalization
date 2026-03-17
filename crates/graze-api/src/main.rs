@@ -10,13 +10,16 @@ use tracing_subscriber::EnvFilter;
 use graze_api::algorithm::{LinkLonkAlgorithm, ThompsonLearner};
 use graze_api::api::create_router;
 use graze_api::config::Config;
+use graze_api::impression_queue;
 use graze_api::interaction_queue;
 use graze_api::metrics::Metrics;
+use graze_api::ml::OnnxRanker;
 use graze_api::AppState;
 use graze_common::{
-    maybe_run_metrics_server, ClickHouseConfig, ClickHouseInteractionWriter, InteractionsClient,
-    InteractionsConfig, NoOpInteractionWriter, RedisClient, RedisConfig, SpecialPostsClient,
-    SpecialPostsSource, UriInterner,
+    maybe_run_metrics_server, ClickHouseConfig, ClickHouseImpressionWriter,
+    ClickHouseInteractionWriter, InteractionsClient, InteractionsConfig, NoOpImpressionWriter,
+    NoOpInteractionWriter, RedisClient, RedisConfig, SpecialPostsClient, SpecialPostsSource,
+    UriInterner,
 };
 
 #[tokio::main]
@@ -171,6 +174,79 @@ async fn main() -> anyhow::Result<()> {
         (None, None)
     };
 
+    // Load ONNX re-ranker when ML_RERANKER_ENABLED=true and ML_MODEL_PATH is set
+    let ml_ranker: Option<Arc<OnnxRanker>> = if config.ml_reranker_enabled
+        && !config.ml_model_path.is_empty()
+    {
+        match OnnxRanker::load(
+            &config.ml_model_path,
+            config.ml_reranker_alpha,
+            config.ml_reranker_beta,
+        ) {
+            Ok(ranker) => {
+                info!(
+                    path = %config.ml_model_path,
+                    alpha = config.ml_reranker_alpha,
+                    beta = config.ml_reranker_beta,
+                    "ONNX re-ranker loaded"
+                );
+                Some(Arc::new(ranker))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, path = %config.ml_model_path, "Failed to load ONNX model; re-ranker disabled");
+                None
+            }
+        }
+    } else {
+        if config.ml_reranker_enabled {
+            tracing::warn!(
+                "ML_RERANKER_ENABLED=true but ML_MODEL_PATH is empty; re-ranker disabled"
+            );
+        }
+        None
+    };
+
+    // Create impression queue and worker when ML impressions are enabled
+    let (impression_queue, impression_worker_handle) = if config.ml_impressions_enabled {
+        let ch_config = Arc::new(ClickHouseConfig {
+            host: config.clickhouse_host.clone(),
+            port: config.clickhouse_port,
+            database: config.clickhouse_database.clone(),
+            user: config.clickhouse_user.clone(),
+            password: config.clickhouse_password.clone(),
+            secure: config.clickhouse_secure,
+        });
+        let impression_writer: Arc<dyn graze_common::ImpressionWriter> =
+            if config.interactions_writer == "none" {
+                Arc::new(NoOpImpressionWriter)
+            } else {
+                Arc::new(ClickHouseImpressionWriter::new(ch_config))
+            };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(config.ml_impressions_queue_capacity);
+        let (imp_shutdown_tx, _) = broadcast::channel::<()>(1);
+        let imp_shutdown_rx = imp_shutdown_tx.subscribe();
+
+        let handle = tokio::spawn(impression_queue::run_impression_worker(
+            rx,
+            imp_shutdown_rx,
+            impression_writer,
+            config.ml_impressions_batch_interval_ms,
+            config.ml_impressions_batch_size,
+        ));
+
+        let sender = impression_queue::ImpressionQueueSender::new(tx);
+        info!(
+            queue_capacity = config.ml_impressions_queue_capacity,
+            batch_size = config.ml_impressions_batch_size,
+            batch_interval_ms = config.ml_impressions_batch_interval_ms,
+            "ML impression queue started"
+        );
+        (Some(sender), Some((handle, imp_shutdown_tx)))
+    } else {
+        (None, None)
+    };
+
     // Create application state
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -187,6 +263,8 @@ async fn main() -> anyhow::Result<()> {
         interactions,
         interaction_queue,
         redis_requests_logger,
+        ml_ranker,
+        impression_queue,
     });
 
     // Build router
@@ -196,11 +274,15 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     info!(address = %bind_addr, "API server listening");
 
-    // Shutdown signal: waits for ctrl_c, then notifies the interaction worker
-    let shutdown_tx = worker_handle.as_ref().map(|(_, tx)| tx.clone());
+    // Shutdown signal: waits for ctrl_c, then notifies all workers
+    let interaction_shutdown_tx = worker_handle.as_ref().map(|(_, tx)| tx.clone());
+    let impression_shutdown_tx = impression_worker_handle.as_ref().map(|(_, tx)| tx.clone());
     let shutdown_future = async move {
         shutdown_signal().await;
-        if let Some(tx) = shutdown_tx {
+        if let Some(tx) = interaction_shutdown_tx {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = impression_shutdown_tx {
             let _ = tx.send(());
         }
     };
@@ -219,8 +301,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Wait for interaction worker to flush remaining and exit
+    // Wait for workers to flush remaining and exit
     if let Some((handle, _)) = worker_handle {
+        let _ = handle.await;
+    }
+    if let Some((handle, _)) = impression_worker_handle {
         let _ = handle.await;
     }
 

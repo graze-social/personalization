@@ -72,6 +72,12 @@ pub struct FeedContextProvenance {
         skip_serializing_if = "Option::is_none"
     )]
     pub is_personalization_holdout: Option<bool>,
+
+    /// ML impression ID: 16-char hex string linking this post impression to
+    /// `feed_impressions` and `feed_interactions` for training label joins.
+    /// Omitted when `ML_IMPRESSIONS_ENABLED=false` (default).
+    #[serde(rename = "iid", skip_serializing_if = "Option::is_none")]
+    pub impression_id: Option<String>,
 }
 
 /// Compact personalization params for provenance.
@@ -172,6 +178,7 @@ mod tests {
             response_time_ms: Some(150.0),
             is_holdout: Some(false),
             is_personalization_holdout: None,
+            impression_id: None,
         };
         let encoded = ctx.encode().expect("encode");
         let decoded = FeedContextProvenance::decode(&encoded).expect("decode");
@@ -193,5 +200,126 @@ mod tests {
     #[test]
     fn test_decode_feed_context_invalid_base64() {
         assert!(FeedContextProvenance::decode("!!!invalid!!!").is_none());
+    }
+
+    // ─── impression_id round-trip ─────────────────────────────────────────────
+
+    #[test]
+    fn test_impression_id_present_round_trips() {
+        let ctx = FeedContextProvenance {
+            feed_uri: "at://did:plc:abc/app.bsky.feed.generator/feed".to_string(),
+            algo_id: 1,
+            depth: 3,
+            personalized: true,
+            source: "personalized".to_string(),
+            personalization_type: None,
+            fallback_tranche: None,
+            total: 30,
+            personalized_count: 20,
+            attribution: None,
+            params: None,
+            response_time_ms: None,
+            is_holdout: None,
+            is_personalization_holdout: None,
+            impression_id: Some("a3f9bc7d21e84c05".to_string()),
+        };
+        let encoded = ctx.encode().expect("encode");
+        let decoded = FeedContextProvenance::decode(&encoded).expect("decode");
+        assert_eq!(decoded.impression_id, Some("a3f9bc7d21e84c05".to_string()));
+    }
+
+    #[test]
+    fn test_impression_id_none_round_trips() {
+        let ctx = FeedContextProvenance {
+            feed_uri: "at://did:plc:abc/app.bsky.feed.generator/feed".to_string(),
+            algo_id: 1,
+            depth: 0,
+            personalized: false,
+            source: "fallback".to_string(),
+            personalization_type: None,
+            fallback_tranche: None,
+            total: 10,
+            personalized_count: 0,
+            attribution: None,
+            params: None,
+            response_time_ms: None,
+            is_holdout: None,
+            is_personalization_holdout: None,
+            impression_id: None,
+        };
+        let encoded = ctx.encode().expect("encode");
+        let decoded = FeedContextProvenance::decode(&encoded).expect("decode");
+        assert_eq!(decoded.impression_id, None);
+    }
+
+    #[test]
+    fn test_impression_id_absent_from_json_when_none() {
+        // When impression_id is None, the key "iid" must not appear in the
+        // base64 payload (skip_serializing_if = "Option::is_none").
+        let ctx = FeedContextProvenance {
+            feed_uri: "at://did:plc:abc/app.bsky.feed.generator/feed".to_string(),
+            algo_id: 1,
+            depth: 0,
+            personalized: false,
+            source: "fallback".to_string(),
+            personalization_type: None,
+            fallback_tranche: None,
+            total: 10,
+            personalized_count: 0,
+            attribution: None,
+            params: None,
+            response_time_ms: None,
+            is_holdout: None,
+            is_personalization_holdout: None,
+            impression_id: None,
+        };
+        let encoded = ctx.encode().expect("encode");
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE
+            .decode(&encoded)
+            .expect("base64");
+        let json = String::from_utf8(raw).expect("utf8");
+        assert!(
+            !json.contains("\"iid\""),
+            "iid key should be omitted when None, got: {}",
+            json
+        );
+    }
+
+    #[test]
+    fn test_impression_id_uses_compact_iid_key() {
+        // When impression_id is Some, it must be serialised as "iid" not "impression_id"
+        let ctx = FeedContextProvenance {
+            feed_uri: "at://did:plc:abc/app.bsky.feed.generator/feed".to_string(),
+            algo_id: 1,
+            depth: 0,
+            personalized: true,
+            source: "personalized".to_string(),
+            personalization_type: None,
+            fallback_tranche: None,
+            total: 5,
+            personalized_count: 5,
+            attribution: None,
+            params: None,
+            response_time_ms: None,
+            is_holdout: None,
+            is_personalization_holdout: None,
+            impression_id: Some("deadbeef12345678".to_string()),
+        };
+        let encoded = ctx.encode().expect("encode");
+        use base64::Engine;
+        let raw = base64::engine::general_purpose::URL_SAFE
+            .decode(&encoded)
+            .expect("base64");
+        let json = String::from_utf8(raw).expect("utf8");
+        assert!(
+            json.contains("\"iid\""),
+            "expected compact key 'iid', got: {}",
+            json
+        );
+        assert!(
+            !json.contains("\"impression_id\""),
+            "long key must not appear"
+        );
     }
 }

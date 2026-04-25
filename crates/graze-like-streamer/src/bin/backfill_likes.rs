@@ -21,7 +21,9 @@ use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::EnvFilter;
 
 use graze_common::services::UriInterner;
-use graze_common::{hash_did, Keys, RedisClient};
+use graze_common::{
+    author_did_from_at_uri, hash_did, should_process_like_event, Keys, RedisClient,
+};
 use graze_like_streamer::config::Config;
 
 // ============================================================================
@@ -92,20 +94,6 @@ fn parse_like_event(message: &str) -> Option<LikeEvent> {
         post_uri,
         timestamp,
     })
-}
-
-fn extract_author_did(post_uri: &str) -> Option<&str> {
-    if !post_uri.starts_with("at://") {
-        return None;
-    }
-    let path = &post_uri[5..];
-    let end = path.find('/')?;
-    let did = &path[..end];
-    if did.starts_with("did:") {
-        Some(did)
-    } else {
-        None
-    }
 }
 
 // ============================================================================
@@ -310,6 +298,13 @@ impl BackfillRunner {
                     last_event_time = Instant::now();
 
                     if let Some(event) = parse_like_event(&text) {
+                        if !should_process_like_event(
+                            &event.user_did,
+                            &event.post_uri,
+                            self.config.exclusion_dids.as_ref(),
+                        ) {
+                            continue;
+                        }
                         // Check if we've reached the end
                         if event.timestamp >= self.backfill_config.end_cursor {
                             info!(
@@ -455,7 +450,7 @@ impl BackfillRunner {
                 .push((timestamp_sec, user_hash.clone()));
 
             // Author-level tracking
-            if let Some(author_did) = extract_author_did(&event.post_uri) {
+            if let Some(author_did) = author_did_from_at_uri(&event.post_uri) {
                 let author_hash = hash_did(author_did);
 
                 // Author likers

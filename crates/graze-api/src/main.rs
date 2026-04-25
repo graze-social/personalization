@@ -35,6 +35,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = Config::from_env();
+    info!(
+        exclusion_did_count = config.exclusion_dids.len(),
+        "api_exclusion_config"
+    );
     let bind_addr = format!("{}:{}", config.http_host, config.http_port);
 
     // Capture metrics port before wrapping config in Arc
@@ -139,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
         interactions_config,
         redis.clone(),
         interaction_writer,
+        config.exclusion_dids.clone(),
     ));
     info!(
         interactions_logging_enabled = config.interactions_logging_enabled,

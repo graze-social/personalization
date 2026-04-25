@@ -2,7 +2,10 @@
 //!
 //! All configuration is loaded from environment variables.
 
-use graze_common::RedisConfig;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use graze_common::{exclusion_set_from_env_opt, RedisConfig};
 
 /// Application settings loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -237,6 +240,11 @@ pub struct Config {
     pub clickhouse_password: String,
     pub clickhouse_database: String,
     pub clickhouse_secure: bool,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Privacy / opt-out (EXCLUSION_LIST)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    pub exclusion_dids: Arc<HashSet<String>>,
 }
 
 impl Config {
@@ -453,6 +461,8 @@ impl Config {
             clickhouse_password: default_env("CLICKHOUSE_PASSWORD", ""),
             clickhouse_database: default_env("CLICKHOUSE_DATABASE", "default"),
             clickhouse_secure: parse_bool_env("CLICKHOUSE_SECURE", false),
+
+            exclusion_dids: exclusion_set_from_env_opt(std::env::var("EXCLUSION_LIST").ok()),
         }
     }
 

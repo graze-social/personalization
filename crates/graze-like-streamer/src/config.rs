@@ -2,7 +2,10 @@
 //!
 //! All configuration is loaded from environment variables.
 
-use graze_common::RedisConfig;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use graze_common::{exclusion_set_from_env_opt, RedisConfig};
 
 /// Application settings loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -61,6 +64,11 @@ pub struct Config {
     // Metrics Configuration
     // ═══════════════════════════════════════════════════════════════════════════════
     pub metrics_port: u16,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Privacy / opt-out (EXCLUSION_LIST)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    pub exclusion_dids: Arc<HashSet<String>>,
 }
 
 impl Config {
@@ -111,6 +119,9 @@ impl Config {
 
             // Metrics
             metrics_port: parse_u16_env("METRICS_PORT", 0),
+
+            // Privacy: comma/newline-separated DIDs to skip for like ingestion
+            exclusion_dids: exclusion_set_from_env_opt(std::env::var("EXCLUSION_LIST").ok()),
         }
     }
 

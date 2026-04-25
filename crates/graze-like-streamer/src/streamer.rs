@@ -24,7 +24,10 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use graze_common::services::UriInterner;
 use graze_common::Result;
-use graze_common::{date_from_timestamp, hash_did, ttl_for_date, Keys, RedisClient};
+use graze_common::{
+    author_did_from_at_uri, date_from_timestamp, hash_did, should_process_like_event, ttl_for_date,
+    Keys, RedisClient,
+};
 
 /// A like event from Jetstream.
 #[derive(Debug, Clone)]
@@ -61,23 +64,6 @@ struct JetstreamRecord {
 #[derive(Debug, Deserialize)]
 struct JetstreamSubject {
     uri: Option<String>,
-}
-
-/// Extract author DID from AT-URI.
-///
-/// AT-URI format: at://did:plc:xxx/app.bsky.feed.post/rkey
-fn extract_author_did(post_uri: &str) -> Option<&str> {
-    if !post_uri.starts_with("at://") {
-        return None;
-    }
-    let path = &post_uri[5..];
-    let end = path.find('/')?;
-    let did = &path[..end];
-    if did.starts_with("did:") {
-        Some(did)
-    } else {
-        None
-    }
 }
 
 /// Calculate backoff delay with jitter to prevent thundering herd.
@@ -211,6 +197,7 @@ impl LikeStreamer {
         let event_tx_clone = event_tx.clone();
         drop(event_tx); // Drop original so event_rx.recv() returns None when task exits
         let read_timeout = Duration::from_secs(self.config.jetstream_read_timeout_seconds);
+        let exclusion_dids = self.config.exclusion_dids.clone();
         let mut shutdown_rx_msg = shutdown_tx.subscribe();
         let mut msg_task = tokio::spawn(async move {
             loop {
@@ -219,6 +206,13 @@ impl LikeStreamer {
                         match result {
                             Ok(Some(Ok(Message::Text(text)))) => {
                                 if let Some(event) = parse_like_event(&text) {
+                                    if !should_process_like_event(
+                                        &event.user_did,
+                                        &event.post_uri,
+                                        exclusion_dids.as_ref(),
+                                    ) {
+                                        continue;
+                                    }
                                     if event_tx_clone.send(event).await.is_err() {
                                         warn!("Event channel closed, stopping message task");
                                         break;
@@ -442,7 +436,7 @@ impl LikeStreamer {
                 .push((timestamp_sec, user_hash.clone()));
 
             // Author-level tracking
-            if let Some(author_did) = extract_author_did(&event.post_uri) {
+            if let Some(author_did) = author_did_from_at_uri(&event.post_uri) {
                 let author_hash = hash_did(author_did);
 
                 // User liked authors - track for increment (NOT date-based, accumulates counts)
@@ -819,43 +813,43 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_author_did_valid_uri() {
+    fn test_author_did_from_at_uri_valid_uri() {
         let uri = "at://did:plc:author123/app.bsky.feed.post/rkey456";
-        let result = extract_author_did(uri);
+        let result = author_did_from_at_uri(uri);
         assert_eq!(result, Some("did:plc:author123"));
     }
 
     #[test]
-    fn test_extract_author_did_different_collection() {
+    fn test_author_did_from_at_uri_different_collection() {
         let uri = "at://did:plc:author123/app.bsky.feed.generator/abc";
-        let result = extract_author_did(uri);
+        let result = author_did_from_at_uri(uri);
         assert_eq!(result, Some("did:plc:author123"));
     }
 
     #[test]
-    fn test_extract_author_did_web_did() {
+    fn test_author_did_from_at_uri_web_did() {
         let uri = "at://did:web:example.com/app.bsky.feed.post/xyz";
-        let result = extract_author_did(uri);
+        let result = author_did_from_at_uri(uri);
         assert_eq!(result, Some("did:web:example.com"));
     }
 
     #[test]
-    fn test_extract_author_did_invalid_prefix() {
+    fn test_author_did_from_at_uri_invalid_prefix() {
         let uri = "https://did:plc:author123/app.bsky.feed.post/rkey456";
-        let result = extract_author_did(uri);
+        let result = author_did_from_at_uri(uri);
         assert_eq!(result, None);
     }
 
     #[test]
-    fn test_extract_author_did_empty_string() {
-        let result = extract_author_did("");
+    fn test_author_did_from_at_uri_empty_string() {
+        let result = author_did_from_at_uri("");
         assert_eq!(result, None);
     }
 
     #[test]
-    fn test_extract_author_did_no_did() {
+    fn test_author_did_from_at_uri_no_did() {
         let uri = "at://notadid/app.bsky.feed.post/rkey456";
-        let result = extract_author_did(uri);
+        let result = author_did_from_at_uri(uri);
         assert_eq!(result, None);
     }
 

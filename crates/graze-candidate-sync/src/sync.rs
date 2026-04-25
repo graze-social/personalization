@@ -18,7 +18,9 @@ use deadpool_redis::redis;
 
 use crate::config::Config;
 use graze_common::services::UriInterner;
-use graze_common::{CandidateSource, Keys, RedisClient, Result, DEFAULT_RETENTION_DAYS};
+use graze_common::{
+    is_excluded_post_uri, CandidateSource, Keys, RedisClient, Result, DEFAULT_RETENTION_DAYS,
+};
 
 /// Syncs algorithm candidates from a configurable source to Redis.
 pub struct CandidateSync {
@@ -257,13 +259,17 @@ impl CandidateSync {
         info!(algo_id = algo_id, "Sync starting");
 
         // Fetch candidates from configured source (ClickHouse, HTTP, or admin-only)
-        let posts = match self.source.fetch_candidates(algo_id).await {
+        let mut posts = match self.source.fetch_candidates(algo_id).await {
             Ok(p) => p,
             Err(e) => {
                 error!(algo_id = algo_id, error = %e, "Sync failed");
                 return Err(e);
             }
         };
+
+        if !self.config.exclusion_dids.is_empty() {
+            posts.retain(|uri| !is_excluded_post_uri(uri, self.config.exclusion_dids.as_ref()));
+        }
 
         if posts.is_empty() {
             warn!(algo_id = algo_id, "No posts found");

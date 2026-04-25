@@ -31,7 +31,7 @@ use graze_common::models::{
     ProvenanceParams, SkeletonFeedPost, ThompsonSearchSpace,
 };
 use graze_common::services::special_posts::SpecialPostsResponse;
-use graze_common::{hash_did, Keys};
+use graze_common::{hash_did, is_excluded_post_uri, Keys};
 
 /// Placeholder posts for edge cases when feed cannot be served
 const PLACEHOLDER_ERROR: &str =
@@ -1039,12 +1039,17 @@ pub async fn get_feed_skeleton(
         .await
         .unwrap_or_else(|_| SpecialPostsResponse::empty(algo_id));
 
-    let (final_with_provenance, updated_cursor) = inject_special_posts(
+    let (mut final_with_provenance, updated_cursor) = inject_special_posts(
         base_posts_tagged.clone(),
         &special_posts,
         &feed_cursor,
         limit,
     );
+
+    if !state.config.exclusion_dids.is_empty() {
+        final_with_provenance
+            .retain(|(uri, _)| !is_excluded_post_uri(uri, state.config.exclusion_dids.as_ref()));
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // Build response cursor

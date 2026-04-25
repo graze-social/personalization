@@ -8,6 +8,7 @@
 
 pub mod clickhouse;
 pub mod error;
+pub mod exclusion;
 pub mod metrics_server;
 pub mod models;
 pub mod redis;
@@ -19,6 +20,10 @@ pub use clickhouse::{
     NoOpInteractionWriter,
 };
 pub use error::{GrazeError, Result};
+pub use exclusion::{
+    author_did_from_at_uri, exclusion_set_from_env_opt, is_excluded_did, is_excluded_post_uri,
+    parse_exclusion_list, should_log_interaction, should_process_like_event,
+};
 pub use redis::{
     // New date-based functions
     date_from_timestamp,

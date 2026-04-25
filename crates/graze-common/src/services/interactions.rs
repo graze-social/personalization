@@ -6,10 +6,12 @@
 use base64::{engine::general_purpose::URL_SAFE, Engine};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::clickhouse::traits::InteractionWriter;
+use crate::exclusion::should_log_interaction;
 use crate::models::{FeedInteractionRow, Interaction, UserActionLogRow};
 use crate::redis::{Keys, RedisClient};
 
@@ -39,6 +41,7 @@ pub struct InteractionsClient {
     config: Arc<InteractionsConfig>,
     redis: Arc<RedisClient>,
     writer: Arc<dyn InteractionWriter>,
+    exclusion_dids: Arc<HashSet<String>>,
 }
 
 impl InteractionsClient {
@@ -47,11 +50,13 @@ impl InteractionsClient {
         config: Arc<InteractionsConfig>,
         redis: Arc<RedisClient>,
         writer: Arc<dyn InteractionWriter>,
+        exclusion_dids: Arc<HashSet<String>>,
     ) -> Self {
         Self {
             config,
             redis,
             writer,
+            exclusion_dids,
         }
     }
 
@@ -141,6 +146,10 @@ impl InteractionsClient {
         let mut action_log_rows = Vec::new();
 
         for interaction in interactions {
+            if !should_log_interaction(user_did, &interaction.item, self.exclusion_dids.as_ref()) {
+                continue;
+            }
+
             // Decode feedContext
             let (feed_uri, attribution) = match &interaction.feed_context {
                 Some(ctx) => {

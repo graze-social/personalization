@@ -276,11 +276,15 @@ impl CandidateSync {
             return Ok(());
         }
 
-        // Intern all URIs
-        let uri_to_id = self.interner.get_or_create_ids_batch(&posts).await?;
+        // Intern all URIs (shard = today; candidate-sync refreshes ap from URIs each run)
+        let intern_date = graze_common::today_date();
+        let uri_to_id = self
+            .interner
+            .get_or_create_ids_batch(&posts, &intern_date)
+            .await?;
 
         // Store posts in Redis (atomic swap)
-        let post_ids: Vec<i64> = uri_to_id.values().copied().collect();
+        let post_ids: Vec<String> = uri_to_id.values().cloned().collect();
         self.store_posts(algo_id, &post_ids).await?;
 
         let duration = start_time.elapsed();
@@ -309,7 +313,7 @@ impl CandidateSync {
     ///
     /// Also fetches and stores liker counts for each post to avoid
     /// ZCARD calls during scoring (major performance optimization).
-    async fn store_posts(&self, algo_id: i32, post_ids: &[i64]) -> Result<()> {
+    async fn store_posts(&self, algo_id: i32, post_ids: &[String]) -> Result<()> {
         let posts_key = Keys::algo_posts(algo_id);
         let counts_key = Keys::algo_posts_counts(algo_id);
         let meta_key = Keys::algo_meta(algo_id);
@@ -320,11 +324,8 @@ impl CandidateSync {
             return Ok(());
         }
 
-        // Convert IDs to strings for Redis
-        let str_ids: Vec<String> = post_ids.iter().map(|id| id.to_string()).collect();
-
         // Fetch liker counts using pipelined ZCARD across date-based keys
-        let post_liker_key_groups: Vec<Vec<String>> = str_ids
+        let post_liker_key_groups: Vec<Vec<String>> = post_ids
             .iter()
             .map(|id| Keys::post_likers_retention(id, DEFAULT_RETENTION_DAYS))
             .collect();
@@ -334,7 +335,7 @@ impl CandidateSync {
             .await?;
 
         let liker_counts: HashMap<String, usize> =
-            str_ids.iter().cloned().zip(counts.into_iter()).collect();
+            post_ids.iter().cloned().zip(counts.into_iter()).collect();
 
         let ttl_seconds = self.config.algo_posts_ttl_hours as i64 * 60 * 60;
         let now = std::time::SystemTime::now()
@@ -351,7 +352,7 @@ impl CandidateSync {
         pipe.del(&temp_counts_key);
 
         // Store posts in temp key (SADD)
-        pipe.cmd("SADD").arg(&temp_key).arg(&str_ids);
+        pipe.cmd("SADD").arg(&temp_key).arg(post_ids);
 
         // Store liker counts in temp hash (HSET)
         if !liker_counts.is_empty() {
@@ -761,8 +762,7 @@ impl CandidateSync {
         }
 
         // Get URIs for all posts to extract author DIDs
-        let int_ids: Vec<i64> = post_ids.iter().filter_map(|id| id.parse().ok()).collect();
-        let uri_mapping = self.interner.get_uris_batch(&int_ids).await?;
+        let uri_mapping = self.interner.get_uris_batch(&post_ids).await?;
 
         // Collect post data: {post_id: (like_count, post_time, author_did)}
         let mut post_data: HashMap<String, (usize, i64, Option<String>)> = HashMap::new();
@@ -806,15 +806,9 @@ impl CandidateSync {
                     .unwrap_or(now);
 
                 // Extract author DID from URI
-                let author_did = if let Ok(id) = post_id.parse::<i64>() {
-                    if let Some(uri) = uri_mapping.get(&id) {
-                        extract_author_did(uri)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let author_did = uri_mapping
+                    .get(post_id)
+                    .and_then(|uri| extract_author_did(uri));
 
                 post_data.insert(post_id.clone(), (*like_count, post_time, author_did));
             }

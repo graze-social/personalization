@@ -11,6 +11,7 @@ pub mod error;
 pub mod exclusion;
 pub mod metrics_server;
 pub mod models;
+pub mod post_id;
 pub mod redis;
 pub mod services;
 
@@ -23,6 +24,9 @@ pub use error::{GrazeError, Result};
 pub use exclusion::{
     author_did_from_at_uri, exclusion_set_from_env_opt, is_excluded_did, is_excluded_post_uri,
     parse_exclusion_list, should_log_interaction, should_process_like_event,
+};
+pub use post_id::{
+    format_post_id, intern_date_from_post_id, is_dated, is_legacy_numeric, DATED_ID_LEN,
 };
 pub use redis::{
     // New date-based functions

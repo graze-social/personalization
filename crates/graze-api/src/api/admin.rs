@@ -1189,11 +1189,7 @@ pub async fn get_candidates(
     };
 
     let limit = query.limit.unwrap_or(10_000).min(50_000);
-    let ids: Vec<i64> = id_strs
-        .iter()
-        .take(limit)
-        .filter_map(|s| s.parse().ok())
-        .collect();
+    let ids: Vec<String> = id_strs.iter().take(limit).cloned().collect();
 
     let id_to_uri = match state.interner.get_uris_batch(&ids).await {
         Ok(m) => m,
@@ -1210,8 +1206,8 @@ pub async fn get_candidates(
     };
 
     let uris: Vec<String> = ids
-        .into_iter()
-        .filter_map(|id| id_to_uri.get(&id).cloned())
+        .iter()
+        .filter_map(|id| id_to_uri.get(id).cloned())
         .collect();
 
     (
@@ -1253,7 +1249,12 @@ pub async fn add_candidates(
             .into_response();
     }
 
-    let uri_to_id = match state.interner.get_or_create_ids_batch(&body.uris).await {
+    let intern_date = graze_common::today_date();
+    let uri_to_id = match state
+        .interner
+        .get_or_create_ids_batch(&body.uris, &intern_date)
+        .await
+    {
         Ok(m) => m,
         Err(e) => {
             return (
@@ -1269,7 +1270,7 @@ pub async fn add_candidates(
 
     let posts_key = Keys::algo_posts(algo_id);
     let meta_key = Keys::algo_meta(algo_id);
-    let str_ids: Vec<String> = uri_to_id.values().map(|id| id.to_string()).collect();
+    let str_ids: Vec<String> = uri_to_id.values().cloned().collect();
 
     if let Err(e) = state.redis.sadd(&posts_key, &str_ids).await {
         return (
@@ -1337,7 +1338,7 @@ pub async fn remove_candidates(
         }
     };
 
-    let str_ids: Vec<String> = uri_to_id.values().map(|id| id.to_string()).collect();
+    let str_ids: Vec<String> = uri_to_id.values().cloned().collect();
     let posts_key = Keys::algo_posts(algo_id);
     let removed = match state.redis.srem(&posts_key, &str_ids).await {
         Ok(n) => n,

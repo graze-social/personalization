@@ -10,7 +10,7 @@
 pub struct Keys;
 
 /// Default number of days to retain like data.
-pub const DEFAULT_RETENTION_DAYS: u32 = 8;
+pub const DEFAULT_RETENTION_DAYS: u32 = 6;
 
 /// Convert a unix timestamp to a YYYYMMDD date string (UTC).
 #[inline]
@@ -64,7 +64,7 @@ pub fn retention_dates(retention_days: u32) -> Vec<String> {
 
 /// Calculate TTL for a key based on when it should expire.
 /// Keys should expire at the end of the retention window.
-/// For example, if retention is 8 days, a key for today should expire in 8 days.
+/// For example, if retention is 6 days, a key for today should expire in 6 days.
 #[inline]
 pub fn ttl_for_date(date: &str, retention_days: u32) -> i64 {
     // Parse the date to get the timestamp at start of that day (UTC)
@@ -295,14 +295,32 @@ impl Keys {
     // URI Interning
     // ═══════════════════════════════════════════════════════════════════════════════
 
-    /// URI to ID mapping hash.
+    /// Legacy global URI to ID mapping (pre date-sharding).
     pub const URI_TO_ID: &'static str = "uri2id";
 
-    /// ID to URI mapping hash.
+    /// Legacy global ID to URI mapping.
     pub const ID_TO_URI: &'static str = "id2uri";
 
-    /// URI counter for generating new IDs.
+    /// Legacy global URI counter.
     pub const URI_COUNTER: &'static str = "uri:counter";
+
+    /// Date-sharded URI to ID: `uri2id:{YYYYMMDD}`
+    #[inline]
+    pub fn uri_to_id_date(date: &str) -> String {
+        format!("uri2id:{}", date)
+    }
+
+    /// Date-sharded ID to URI: `id2uri:{YYYYMMDD}`
+    #[inline]
+    pub fn id_to_uri_date(date: &str) -> String {
+        format!("id2uri:{}", date)
+    }
+
+    /// Daily intern sequence: `uri:counter:{YYYYMMDD}`
+    #[inline]
+    pub fn uri_counter_date(date: &str) -> String {
+        format!("uri:counter:{}", date)
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════════
     // Operational Keys

@@ -414,17 +414,15 @@ impl ProofCollector {
         let uri_start = Instant::now();
 
         // Collect all post IDs that need URI resolution
-        let mut post_ids: Vec<i64> = Vec::new();
+        let mut post_ids: Vec<String> = Vec::new();
         for (post_id, _) in &self.user_likes {
-            if let Ok(id) = post_id.parse::<i64>() {
-                post_ids.push(id);
-            }
+            post_ids.push(post_id.clone());
         }
         for post in &self.scored_posts {
-            if let Ok(id) = post.post_id.parse::<i64>() {
-                post_ids.push(id);
-            }
+            post_ids.push(post.post_id.clone());
         }
+        post_ids.sort();
+        post_ids.dedup();
 
         // Batch resolve URIs
         let id_to_uri = self
@@ -445,8 +443,7 @@ impl ProofCollector {
             .iter()
             .take(20) // Sample first 20
             .map(|(post_id, ts)| {
-                let id = post_id.parse::<i64>().ok();
-                let uri = id.and_then(|i| id_to_uri.get(&i).cloned());
+                let uri = id_to_uri.get(post_id).cloned();
                 LikedPostProof {
                     post_id: post_id.clone(),
                     uri,
@@ -473,8 +470,7 @@ impl ProofCollector {
                             .iter()
                             .take(5)
                             .map(|(post_id, coliker_time, user_time)| {
-                                let id = post_id.parse::<i64>().ok();
-                                let uri = id.and_then(|i| id_to_uri.get(&i).cloned());
+                                let uri = id_to_uri.get(post_id).cloned();
                                 SharedPostProof {
                                     post_id: post_id.clone(),
                                     uri,
@@ -502,8 +498,7 @@ impl ProofCollector {
             .iter()
             .take(20)
             .map(|p| {
-                let id = p.post_id.parse::<i64>().ok();
-                let uri = id.and_then(|i| id_to_uri.get(&i).cloned());
+                let uri = id_to_uri.get(&p.post_id).cloned();
                 let author_did = uri.as_ref().and_then(|u| {
                     u.strip_prefix("at://")
                         .and_then(|s| s.split('/').next())

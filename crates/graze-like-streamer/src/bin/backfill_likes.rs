@@ -414,9 +414,20 @@ impl BackfillRunner {
 
         debug!(batch_size = events.len(), "Flushing backfill batch");
 
-        // Convert URIs to numeric IDs
-        let unique_uris: Vec<String> = events.iter().map(|e| e.post_uri.clone()).collect();
-        let uri_to_id = self.interner.get_or_create_ids_batch(&unique_uris).await?;
+        let uri_and_dates: Vec<(String, String)> = events
+            .iter()
+            .map(|e| {
+                let ts = e.timestamp as f64 / 1_000_000.0;
+                (
+                    e.post_uri.clone(),
+                    graze_common::date_from_timestamp(ts),
+                )
+            })
+            .collect();
+        let uri_to_id = self
+            .interner
+            .get_or_create_ids_by_event_date(&uri_and_dates)
+            .await?;
 
         // Build ZADD items
         let mut user_likes_items: HashMap<String, Vec<(f64, String)>> = HashMap::new();

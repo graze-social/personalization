@@ -405,7 +405,7 @@ impl Config {
             default_max_user_likes: parse_usize_env("DEFAULT_MAX_USER_LIKES", 750),
             default_max_sources_per_post: parse_usize_env("DEFAULT_MAX_SOURCES_PER_POST", 100),
             default_min_co_likes: parse_usize_env("DEFAULT_MIN_CO_LIKES", 1),
-            default_time_window_hours: parse_f64_env("DEFAULT_TIME_WINDOW_HOURS", 168.0),
+            default_time_window_hours: parse_f64_env("DEFAULT_TIME_WINDOW_HOURS", 144.0),
             default_recency_half_life_hours: parse_f64_env("DEFAULT_RECENCY_HALF_LIFE_HOURS", 24.0),
             default_specificity_power: parse_f64_env("DEFAULT_SPECIFICITY_POWER", 1.0),
             default_popularity_power: parse_f64_env("DEFAULT_POPULARITY_POWER", 0.6),

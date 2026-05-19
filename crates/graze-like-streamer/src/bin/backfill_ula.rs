@@ -266,13 +266,11 @@ async fn process_single_user(
         return Ok(ProcessResult::Skipped);
     }
 
-    // Convert post IDs to URIs
-    let post_ids: Vec<i64> = posts.iter().filter_map(|p| p.parse().ok()).collect();
-    if post_ids.is_empty() {
+    if posts.is_empty() {
         return Ok(ProcessResult::Skipped);
     }
 
-    let id_to_uri = interner.get_uris_batch(&post_ids).await?;
+    let id_to_uri = interner.get_uris_batch(&posts).await?;
 
     // Count likes per author
     let mut author_counts: HashMap<String, f64> = HashMap::new();

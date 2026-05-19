@@ -14,7 +14,7 @@ data:
   jetstream-url: "wss://jetstream2.us-west.bsky.network/subscribe"
 
   # Like Graph configuration
-  like-ttl-days: "8"
+  like-ttl-days: "6"
   like-batch-size: "500"
   like-batch-interval-ms: "100"
 

@@ -315,9 +315,9 @@ impl LinkLonkAlgorithm {
         }
 
         // Get URIs for all candidate posts
-        let ids_to_lookup: Vec<i64> = cursor_filtered
+        let ids_to_lookup: Vec<String> = cursor_filtered
             .iter()
-            .filter_map(|(_, post_id)| post_id.parse::<i64>().ok())
+            .map(|(_, post_id)| post_id.clone())
             .collect();
 
         let id_to_uri = self
@@ -330,8 +330,7 @@ impl LinkLonkAlgorithm {
         let post_uris: FxHashMap<String, String> = cursor_filtered
             .iter()
             .filter_map(|(_, post_id)| {
-                let id = post_id.parse::<i64>().ok()?;
-                let uri = id_to_uri.get(&id)?.clone();
+                let uri = id_to_uri.get(post_id)?.clone();
                 Some((post_id.clone(), uri))
             })
             .collect();
@@ -385,9 +384,9 @@ impl LinkLonkAlgorithm {
         }
 
         // Get URIs for all candidate posts (needed for diversity author extraction)
-        let ids_to_lookup: Vec<i64> = cursor_filtered
+        let ids_to_lookup: Vec<String> = cursor_filtered
             .iter()
-            .filter_map(|(_, post_id)| post_id.parse::<i64>().ok())
+            .map(|(_, post_id)| post_id.clone())
             .collect();
 
         let id_to_uri = self
@@ -400,8 +399,7 @@ impl LinkLonkAlgorithm {
         let post_uris: FxHashMap<String, String> = cursor_filtered
             .iter()
             .filter_map(|(_, post_id)| {
-                let id = post_id.parse::<i64>().ok()?;
-                let uri = id_to_uri.get(&id)?.clone();
+                let uri = id_to_uri.get(post_id)?.clone();
                 Some((post_id.clone(), uri))
             })
             .collect();

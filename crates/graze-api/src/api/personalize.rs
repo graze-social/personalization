@@ -27,11 +27,11 @@ async fn filter_excluded_uris_from_personalize_response(
     if state.config.exclusion_dids.is_empty() {
         return;
     }
-    let ids_needing_uri: Vec<i64> = response
+    let ids_needing_uri: Vec<String> = response
         .posts
         .iter()
         .filter(|p| p.uri.is_empty() && !p.post_id.is_empty())
-        .filter_map(|p| p.post_id.parse().ok())
+        .map(|p| p.post_id.clone())
         .collect();
     let uri_by_id = if ids_needing_uri.is_empty() {
         std::collections::HashMap::new()
@@ -45,10 +45,8 @@ async fn filter_excluded_uris_from_personalize_response(
     response.posts.retain(|p| {
         let uri_ref: Option<&str> = if !p.uri.is_empty() {
             Some(p.uri.as_str())
-        } else if let Ok(id) = p.post_id.parse::<i64>() {
-            uri_by_id.get(&id).map(|s| s.as_str())
         } else {
-            None
+            uri_by_id.get(&p.post_id).map(|s| s.as_str())
         };
         match uri_ref {
             Some(u) => !is_excluded_post_uri(u, state.config.exclusion_dids.as_ref()),
@@ -329,17 +327,14 @@ pub async fn author_affinity_diagnostic(
     {
         Ok(result) => {
             // Collect post IDs and scores
-            let scored: Vec<(f64, String, i64)> = result
+            let scored: Vec<(f64, String)> = result
                 .scored_posts
                 .into_iter()
                 .take(request.limit)
-                .filter_map(|(score, post_id)| {
-                    post_id.parse::<i64>().ok().map(|id| (score, post_id, id))
-                })
                 .collect();
 
             // Batch fetch URIs
-            let post_ids: Vec<i64> = scored.iter().map(|(_, _, id)| *id).collect();
+            let post_ids: Vec<String> = scored.iter().map(|(_, id)| id.clone()).collect();
             let uri_map = state
                 .interner
                 .get_uris_batch(&post_ids)
@@ -349,8 +344,8 @@ pub async fn author_affinity_diagnostic(
             // Convert to response format
             let posts: Vec<AuthorAffinityPost> = scored
                 .into_iter()
-                .filter_map(|(score, post_id, id)| {
-                    uri_map.get(&id).and_then(|uri| {
+                .filter_map(|(score, post_id)| {
+                    uri_map.get(&post_id).and_then(|uri| {
                         if is_excluded_post_uri(uri, state.config.exclusion_dids.as_ref()) {
                             return None;
                         }

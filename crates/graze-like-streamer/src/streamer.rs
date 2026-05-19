@@ -385,9 +385,18 @@ impl LikeStreamer {
             )
             .await?;
 
-        // Convert URIs to numeric IDs using the interner (batch operation)
-        let unique_uris: Vec<String> = events.iter().map(|e| e.post_uri.clone()).collect();
-        let uri_to_id = self.interner.get_or_create_ids_batch(&unique_uris).await?;
+        // Convert URIs to dated post IDs (shard = like event date)
+        let uri_and_dates: Vec<(String, String)> = events
+            .iter()
+            .map(|e| {
+                let ts = e.timestamp as f64 / 1_000_000.0;
+                (e.post_uri.clone(), date_from_timestamp(ts))
+            })
+            .collect();
+        let uri_to_id = self
+            .interner
+            .get_or_create_ids_by_event_date(&uri_and_dates)
+            .await?;
 
         // Track unique keys to avoid redundant commands
         let mut user_likes_keys: HashSet<String> = HashSet::new();

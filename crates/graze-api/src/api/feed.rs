@@ -778,11 +778,11 @@ pub async fn get_feed_skeleton(
                         let _scoring_time_ms = result.meta.scoring_time_ms.unwrap_or(0.0);
 
                         // Collect post IDs that need conversion to URIs
-                        let posts_to_convert: Vec<i64> = result
+                        let posts_to_convert: Vec<String> = result
                             .posts
                             .iter()
-                            .filter(|p| p.uri.is_empty())
-                            .filter_map(|p| p.post_id.parse::<i64>().ok())
+                            .filter(|p| p.uri.is_empty() && !p.post_id.is_empty())
+                            .map(|p| p.post_id.clone())
                             .collect();
 
                         // Batch lookup URIs from interner
@@ -799,10 +799,8 @@ pub async fn get_feed_skeleton(
                             .filter_map(|p| {
                                 let uri = if !p.uri.is_empty() {
                                     Some(p.uri.clone())
-                                } else if let Ok(id) = p.post_id.parse::<i64>() {
-                                    id_to_uri.get(&id).cloned()
                                 } else {
-                                    None
+                                    id_to_uri.get(&p.post_id).cloned()
                                 };
 
                                 // Track personalized posts in audit

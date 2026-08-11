@@ -215,6 +215,43 @@ impl LinkLonkAlgorithm {
             "compute_personalization_start"
         );
 
+        // Step 0: Pool-size gate. Bail out before doing ANY expensive work if the
+        // feed's candidate pool is too small to personalize from. Overlap between a
+        // user's co-liker set and the pool is linear in pool size, so below a few
+        // hundred candidates the expected number of scoreable posts is < 1 and the
+        // whole pipeline reliably returns nothing. SCARD is O(1), whereas the work
+        // it skips is the co-liker walk, author-affinity supplementation, a full
+        // SMEMBERS of the pool and an HMGET of every liker count.
+        //
+        // Disabled by default (0). See Config::min_candidate_pool_for_personalization.
+        let pool_gate = self.config.min_candidate_pool_for_personalization;
+        if pool_gate > 0 {
+            let pool_size = self
+                .redis
+                .scard(&Keys::algo_posts(algo_id))
+                .await
+                .unwrap_or(0);
+            if pool_size < pool_gate {
+                info!(
+                    user_hash = %&user_hash[..8.min(user_hash.len())],
+                    algo_id,
+                    pool_size,
+                    pool_gate,
+                    "early_exit: candidate pool below personalization gate"
+                );
+                return Ok(ScoringResult {
+                    scored_posts: Vec::new(),
+                    scored_count: 0,
+                    posts_checked: pool_size,
+                    posts_skipped_no_likers: 0,
+                    posts_skipped_few_likers: 0,
+                    scoring_time_ms: 0.0,
+                    cache_hits: 0,
+                    cache_misses: 0,
+                });
+            }
+        }
+
         // Step 1: Get or compute co-likers (post-level or author-level)
         let coliker_weights = if params.use_author_affinity {
             debug!("step1_author_coliker_start");

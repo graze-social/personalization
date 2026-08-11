@@ -28,6 +28,20 @@ pub struct Config {
     pub inverted_min_post_likes: usize,
     pub inverted_max_likers_per_post: usize,
     pub inverted_max_posts_to_score: usize,
+    /// Skip personalization entirely when the feed's candidate pool
+    /// (`SCARD ap:{algo_id}`) is below this size. 0 disables the gate.
+    ///
+    /// Rationale (measured in prod, 25-min window, 359 scorer runs): candidate
+    /// pool size is the dominant predictor of how many posts get personalized —
+    /// r=0.604 (0.777 log-log) vs r=0.141 for co-liker source count. Requests
+    /// against a pool under 500 posts returned a MEDIAN OF ZERO scored posts
+    /// with a 74% zero rate, and accounted for 41% of all personalization
+    /// attempts. Those runs still paid for co-liker computation (27-106ms),
+    /// author-affinity supplementation (~106ms), a full SMEMBERS of the pool and
+    /// an HMGET of every liker count — to produce nothing. The 500-2k band, by
+    /// contrast, returned a median of 18, so the useful cut is at ~500, not
+    /// higher.
+    pub min_candidate_pool_for_personalization: usize,
     pub min_overlapping_colikers: usize,
 
     // ═══════════════════════════════════════════════════════════════════════════════
@@ -269,6 +283,12 @@ impl Config {
             inverted_min_post_likes: parse_usize_env("INVERTED_MIN_POST_LIKES", 10),
             inverted_max_likers_per_post: parse_usize_env("INVERTED_MAX_LIKERS_PER_POST", 30),
             inverted_max_posts_to_score: parse_usize_env("INVERTED_MAX_POSTS_TO_SCORE", 0),
+            // Defaults to 0 (gate disabled) so merging cannot silently change what
+            // users are served. Recommended rollout value: 500.
+            min_candidate_pool_for_personalization: parse_usize_env(
+                "MIN_CANDIDATE_POOL_FOR_PERSONALIZATION",
+                0,
+            ),
             min_overlapping_colikers: parse_usize_env("MIN_OVERLAPPING_COLIKERS", 1),
 
             // Liker Cache

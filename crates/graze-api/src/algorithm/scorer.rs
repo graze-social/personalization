@@ -472,6 +472,14 @@ impl Scorer {
             algo_id,
             scored_count,
             posts_checked = candidates.len(),
+            // Where candidates die before scoring. Both were already computed for
+            // ScoringResult but never logged, which made the "why is the feed mostly
+            // fallback?" question un-answerable without offline reconstruction:
+            //   no_likers  = candidate has zero recorded likers in apc:{algo_id}
+            //   few_likers = has likers but fewer than min_post_likes
+            posts_skipped_no_likers,
+            posts_skipped_few_likers,
+            min_post_likes = self.min_post_likes,
             cache_hits,
             cache_misses,
             scoring_time_ms = format!("{:.2}", scoring_time_ms),

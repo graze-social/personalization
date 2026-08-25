@@ -1,0 +1,30 @@
+# The harness's own negative control, run on real traffic.
+#
+# Both arms are the SAME ranker, so every drafted item is shared and untagged and no user's feed
+# changes. A clean run reports NO PREFERENCE. Any measured preference here is an artifact of the
+# harness rather than of a ranker, and must be fixed before a real comparison is trusted.
+id: interleave_self_check
+design: interleaving
+start: "2026-08-13T00:00:00Z"
+unit: user
+primary_metric: preference
+
+arms:
+  control:
+    field: ranker
+    value: post_first
+  treatment:
+    field: ranker
+    value: post_first
+
+negative_controls:
+  - name: tagged_item_count
+    reason: "identical rankers can never form a competitive pair, so no item may carry a ranker tag"
+    where: "source = 'fallback'"
+
+min_observations: 100
+
+notes: >
+  Expected outcome: zero tagged impressions and zero users with a preference. This validates
+  enrolment, drafting, the fsc: cache round-trip and the provenance field without exposing any
+  user to a different feed.

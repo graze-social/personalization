@@ -1,0 +1,48 @@
+# The randomized experiment already running in production (AB_EXPERIMENT_* on personalization-api).
+#
+# History worth knowing before reading any result from this: a *retrospective* analysis of the same
+# parameter showed 250 winning 4.30% vs 2.80%, which the randomized version then reversed. That
+# retrospective signal was an artifact of adaptive Thompson assignment. Hence `start`, which
+# excludes every row from before the randomized assignment began.
+id: max_sources_250_vs_10000
+design: ab
+start: "2026-08-12T09:11:56Z"
+# ENDED 2026-08-25T23:21:13Z, when AB_EXPERIMENT_ENABLED was set to 0 on personalization-api.
+#
+# This clause is REQUIRED, not cosmetic. With the hash experiment off, `params.max_total_sources`
+# reverts to *adaptive* Thompson selection, which still picks 250 and 10000 among its arms — so
+# without an end the readout would silently pool randomized rows with adaptively-assigned ones and
+# reintroduce the exact confound `start` exists to exclude. Set to the rollout START rather than its
+# completion: during the ~90s rollout the old pods were still enrolling, so the earlier timestamp is
+# the last moment every serving pod was provably still randomizing.
+#
+# FINAL RESULT (obs=74,651, units=2,497): diff=-0.0075 (-25.4%) 95% CI [-0.0194, +0.0043] p=0.2128;
+# permutation -0.0073 p=0.2300; negative control clean (+0.0009, p=0.7935). Capping co-likers at 250
+# is not an improvement and the point estimate leans negative across 13 days of randomized traffic.
+# Together with T21 this closes the co-liker-cap question: the retrospective +33% never reproduced.
+end: "2026-08-25T23:21:13Z"
+unit: user
+primary_metric: like_rate
+
+arms:
+  control:
+    field: params.max_total_sources
+    value: 10000
+  treatment:
+    field: params.max_total_sources
+    value: 250
+
+# Fallback posts are chosen by popularity/velocity; the co-liker cap has no causal path to them.
+# When this moved in the retrospective analysis, it exposed the whole effect as confounded.
+negative_controls:
+  - name: fallback_like_rate
+    reason: "fallback posts are selected by popularity, not by co-likers, so the cap cannot affect them"
+    where: "source = 'fallback'"
+
+cuped_covariate: pre_period_like_rate
+min_observations: 2000
+
+notes: >
+  Analyse intention-to-treat. Do NOT split by source: the cap causally changes the
+  personalized/fallback mix (measured 869 vs 1068 personalized, 1017 vs 587 fallback), so
+  conditioning on source conditions on the outcome.

@@ -1,0 +1,49 @@
+# Stage 3 (B): does faceting the co-liker seed at step 1 beat faceting the output at step 3?
+#
+# LinkLonk restricts step 1 of its walk to a channel. We have only ever restricted step 3 to the feed
+# pool. Measured cost of scoping late: 34-56% of a user's top-128 co-likers contribute zero coverage
+# on a given feed, and none of those were inactive accounts — they are active people who like
+# different things. `per_feed_seeded` spends the same co-liker budget on people whose likes overlap
+# what this feed actually carries.
+#
+# This is the first *real* comparison to run through the harness. The self-check
+# (interleave_self_check.yaml) established a 0.05% disagreement floor, so an effect of ~1% or more is
+# distinguishable from harness noise.
+id: interleave_per_feed_vs_post_first
+design: interleaving
+start: "2026-08-13T00:00:00Z"
+unit: user
+primary_metric: preference
+
+arms:
+  control:
+    field: ranker
+    value: post_first
+  treatment:
+    field: ranker
+    value: per_feed_seeded
+
+negative_controls:
+  - name: fallback_like_rate
+    reason: >
+      Fallback tranches are selected by popularity and recency from ap:{algo} without consulting
+      co-liker weights at all, so restricting the co-liker *seed* has no causal path to them. If
+      fallback engagement moves with the arms, something other than the ranking changed — most
+      likely overall feed composition — and the preference reading cannot be attributed to the seed.
+    where: "source = 'fallback'"
+
+min_observations: 200
+
+notes: >
+  READ THE SEED KEEP RATE BEFORE THE PREFERENCE. The treatment shrinks the seed by construction, and
+  there are two very different ways it can win or lose. If keep_rate is healthy (say >0.3) the result
+  is about seed *composition*, which is the hypothesis. If keep_rate collapses toward zero the
+  treatment is effectively "little or no personalization" wearing a ranker's name, and a win would be
+  a finding about fallback quality rather than about co-liker seeding. The keep rate is logged as
+  `per_feed_seed_filtered` and carried on ScoringResult.seed_keep_rate for exactly this reason.
+
+  Prior expectation, stated before looking: three independent measurements say coverage is not
+  seed-limited here (23x seed -> 1.1x coverage; 13,623 co-likers -> 44 covered versus 455 -> 95;
+  117 seed -> 4 versus 9 seed -> 55). That predicts the smaller seed costs little, so the
+  composition effect should dominate. Every prior offline prediction in this project has been wrong,
+  five for five, so this is recorded to be scored against rather than believed.

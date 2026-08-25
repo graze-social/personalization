@@ -1,0 +1,85 @@
+# Experiment readout, run on a schedule.
+#
+# Pattern copied from feed-processor/kube/analytics-freshness-cronjob.yml (the established CronJob
+# shape on this cluster): Forbid concurrency, a hard deadline, envFrom a secret, and an image pull
+# secret. Scheduled hourly because the runner uses anytime-valid intervals — repeated inspection
+# does not inflate the error rate, which is precisely why it is safe to run it this often.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: personalization-analysis
+  namespace: default
+spec:
+  schedule: "17 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 1800
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: dockerhub-secret
+          # Experiment specs are baked into the image, but an ENDED experiment must be able to gain
+          # an `end:` clause without a rebuild — otherwise the readout keeps pooling post-experiment
+          # traffic. Overlaying just the changed spec from a ConfigMap keeps the image immutable and
+          # the correction immediate.
+          volumes:
+            - name: specs
+              configMap:
+                name: personalization-analysis-specs
+          containers:
+            - name: analysis
+              image: dgaff/graze-analysis@sha256:55f6f9812b7fcc530f5c00f8e7c0a9aae57fe11dbf21166afa01094a1106bbbd
+              # Override the entrypoint so one job runs both the experiment readouts and the
+              # density-drift guard. The guard exits non-zero only on a *detection* (a feed that has
+              # already stopped being personalized), so a real regression shows up as a failed Job
+              # while a mere proximity warning does not.
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -o pipefail
+                  python -m graze_analysis.runner \
+                    experiments/max_sources_250_vs_10000.yaml \
+                    experiments/interleave_self_check.yaml \
+                    experiments/personalization_holdout.yaml
+                  readout=$?
+                  python -m graze_analysis.drift
+                  drift=$?
+                  # Surface either failure, preferring the drift detection since it is actionable.
+                  [ $drift -ne 0 ] && exit $drift
+                  exit $readout
+              # Same wiring the personalization-api deployment uses. CLICKHOUSE_HOST/PORT/USER/
+              # PASSWORD live in app-secrets; DATABASE and SECURE come from the configmap. Reusing
+              # them means no new credential to provision and no chance of the analysis reading a
+              # different cluster than the service it is analysing.
+              # subPath so this replaces the single spec file rather than shadowing the whole
+              # experiments/ directory, which would hide the other three specs.
+              volumeMounts:
+                - name: specs
+                  mountPath: /app/experiments/max_sources_250_vs_10000.yaml
+                  subPath: max_sources_250_vs_10000.yaml
+              envFrom:
+                - configMapRef:
+                    name: personalization-env
+                - secretRef:
+                    name: app-secrets
+                # Must come last, exactly as in the personalization-api deployment: both secrets define
+                # REDIS_URL and the later entry wins, so this is what makes the drift guard read the same
+                # Valkey the service reads rather than a different one.
+                - secretRef:
+                    name: personalization-secrets
+              resources:
+                requests:
+                  cpu: 200m
+                  memory: 512Mi
+                limits:
+                  cpu: "1"
+                  memory: 2Gi
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                allowPrivilegeEscalation: false

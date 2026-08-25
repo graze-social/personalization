@@ -1,0 +1,65 @@
+# Does personalization help *at all*? The randomized version of the question.
+#
+# Everything we know about personalization's value so far is observational: personalized items show a
+# 4.90% like rate against fallback's 2.23% over 7 days. That comparison is badly confounded by
+# **position** — personalized items are ranked higher, so they are more visible, and a higher like
+# rate would follow even if the selection were worthless. The retrospective co-liker-cap analysis made
+# exactly this class of mistake and reversed under randomization.
+#
+# `is_personalization_holdout` is assigned by a random draw per user (PERSONALIZATION_HOLDOUT_RATE,
+# now 0.05), so it is a genuine randomized arm. Comparing overall like rate between holdout and
+# treated users measures the whole engine's causal contribution, position effects included, with no
+# post-treatment conditioning.
+#
+# This is the number that should gate all further ranking work: if the engine's total lift is small,
+# improving the ranking of the 30% of impressions it touches cannot matter much, and coverage or
+# reach is the lever instead.
+id: personalization_holdout
+design: ab
+# START RESET, deliberately. Before this timestamp the holdout was an independent coin flip PER
+# REQUEST, so the same user was in both arms at once and any real effect was attenuated toward zero —
+# the first readout's +5.4% (p=0.91) was that artifact, not a null. Assignment is now a stable
+# per-user salted hash. Pooling across the change would mix two different randomization schemes, so
+# everything before it is discarded rather than reused.
+#
+# The rate also changed here (0.05 -> 0.20). A rate change moves the hash boundary, which reassigns
+# some users, so it starts a new experiment for the same reason.
+start: "2026-08-14T18:47:00Z"
+unit: user
+primary_metric: like_rate
+
+arms:
+  # NOTE the direction: `control` is the HOLDOUT (personalization suppressed) and treatment is the
+  # normal path. Stated explicitly because reading the sign backwards would invert the conclusion.
+  control:
+    field: is_personalization_holdout
+    value: true
+  treatment:
+    field: is_personalization_holdout
+    value: false
+
+negative_controls:
+  - name: pinned_and_rotating
+    reason: >
+      Pinned and rotating posts are injected by inject_special_posts from a per-feed configuration
+      that never consults the personalization engine, the co-liker graph, or the user's likes. The
+      holdout cannot change which ones are chosen or where they sit, so their like rate must not
+      differ between arms. If it does, the arms differ by something other than personalization —
+      most likely a traffic or client mix imbalance — and the primary reading is not attributable.
+    where: "source IN ('pinned', 'rotating')"
+
+cuped_covariate: pre_period_like_rate
+
+population: "JSONHas(tryBase64Decode(interaction_feed_context), 'algo_id')"
+
+min_observations: 2000
+
+notes: >
+  Expect this to be slow. The holdout is deliberately only 5% of users, so the control arm accrues
+  roughly 20x slower than treatment; that asymmetry costs power but was the right trade when the
+  holdout was cut from 0.5 to 0.05 to buy experiment throughput everywhere else. The anytime-valid
+  interval means this can be watched daily without penalty rather than waiting for a fixed horizon.
+
+  Read the *absolute* difference, not only the relative one. A large relative lift on a 2% base rate
+  is a small absolute change in what users do, and the decision this gates — whether to invest in
+  ranking quality or in personalized coverage — depends on the absolute size.

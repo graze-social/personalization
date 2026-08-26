@@ -89,7 +89,7 @@ fn create_test_config(redis_url: String) -> Config {
         jetstream_stale_timeout_seconds: 60,
 
         // Like Graph
-        like_ttl_days: 8,
+        like_ttl_days: 6,
         like_batch_size: 5000,
         like_batch_interval_ms: 5000,
         like_ttl_refresh_interval_seconds: 3600,
@@ -226,7 +226,7 @@ fn create_test_config(redis_url: String) -> Config {
         default_max_sources_per_post: 100,
         default_max_total_sources: 2000,
         default_min_co_likes: 1,
-        default_time_window_hours: 168.0,
+        default_time_window_hours: 144.0,
         default_recency_half_life_hours: 24.0,
         default_specificity_power: 1.0,
         default_popularity_power: 0.6,

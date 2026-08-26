@@ -24,6 +24,22 @@ from .spec import ExperimentSpec
 
 SEEN = "app.bsky.feed.defs#interactionSeen"
 LIKE = "app.bsky.feed.defs#interactionLike"
+REQUEST_LESS = "app.bsky.feed.defs#requestLess"
+REQUEST_MORE = "app.bsky.feed.defs#requestMore"
+
+#: Numerator event for each supported metric name. The denominator is always `interactionSeen`,
+#: so every metric here is "events of this kind per impression".
+#:
+#: `request_less_rate` is the only *relevance* signal the client actually sends — a stated "show me
+#: less of this" rather than an engagement proxy. It matters because optimising `like_rate` alone
+#: selects for engagement-bait, which is how a recommender gets worse while its headline metric
+#: improves. Measured 2026-08-25: clickthrough events do not exist in this dataset at all (n=0), so
+#: widening the engagement metric is not available to us; requestLess/requestMore are what there is.
+METRIC_EVENTS: dict[str, str] = {
+    "like_rate": LIKE,
+    "request_less_rate": REQUEST_LESS,
+    "request_more_rate": REQUEST_MORE,
+}
 
 
 def _sql_literal(value: Any) -> str:
@@ -99,12 +115,18 @@ class ClickHouseReader:
             client.close()
 
 
-def ab_rows_sql(spec: ExperimentSpec, where_extra: str = "") -> str:
-    """SQL for an A/B design: one row per (unit, impression) with a like flag.
+def ab_rows_sql(
+    spec: ExperimentSpec, where_extra: str = "", numerator_event: str = LIKE
+) -> str:
+    """SQL for an A/B design: one row per (unit, impression) with an event flag.
 
     Note the deliberate absence of any ``source`` filter — this is intention-to-treat. Restricting
     to personalized impressions would condition on a post-treatment variable, which biases the
     estimate no matter how much data is collected.
+
+    ``numerator_event`` selects what counts as a "success". It defaults to a like, which is the
+    primary metric; guardrails pass a different event (see :data:`METRIC_EVENTS`) so the same
+    randomization can be read against a second outcome without a second query path.
     """
     control = spec.arms["control"]
     treatment = next(a for n, a in spec.arms.items() if n != "control")
@@ -136,10 +158,10 @@ WITH d AS (
     {end_clause}
     AND interaction_feed_context != ''
     {population}
-    AND interaction_event IN ('{SEEN}', '{LIKE}')
+    AND interaction_event IN ('{SEEN}', '{numerator_event}')
 )
 SELECT unit_id, arm_value,
-       countIf(ev = '{LIKE}') AS likes,
+       countIf(ev = '{numerator_event}') AS likes,
        countIf(ev = '{SEEN}') AS seen
 FROM d
 WHERE arm_value IN ({_sql_literal(control.value)}, {_sql_literal(treatment.value)}) {extra}

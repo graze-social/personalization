@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from .data import (
+    METRIC_EVENTS,
     ClickHouseReader,
     ab_rows_sql,
     cuped_covariate_sql,
@@ -109,6 +110,8 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
         _, reduction = cuped_adjust(per_unit_rate, cov)
         lines.append(f"  CUPED variance reduction: {reduction:.1%}")
 
+    lines.extend(_guardrail_lines(spec, reader))
+
     agree = primary.significant == (perm.p_value < 0.05)
     verdict = (
         "SIGNIFICANT" if primary.significant and agree else
@@ -116,6 +119,61 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
         "NOT SIGNIFICANT"
     )
     return Readout(spec.id, verdict, lines)
+
+
+def _guardrail_lines(spec: ExperimentSpec, reader: ClickHouseReader) -> list[str]:
+    """Evaluate each guardrail against the same randomization as the primary metric.
+
+    A guardrail is *not* a negative control and is deliberately handled differently. A negative
+    control that moves means the experiment is broken, so it withholds the result. A guardrail that
+    moves means the change had a cost that is real and worth seeing — the result stands, and the
+    reader decides. Withholding here would hide the very thing the guardrail exists to surface.
+
+    Breach reporting mirrors the density drift guard's discipline: BREACH only when the confidence
+    interval clears the bound (a detection), WATCH when the point estimate clears it but the
+    interval does not (a prediction). The bound's sign is in the spec's own arm direction — for the
+    holdout spec, `control` is the holdout, so a positive diff means the treatment produced *more*
+    of the event.
+    """
+    if not spec.guardrails:
+        return []
+
+    out = []
+    for g in spec.guardrails:
+        event = METRIC_EVENTS.get(g.metric)
+        if event is None:
+            out.append(
+                f"  guardrail {g.metric}: SKIPPED — unknown metric "
+                f"(known: {', '.join(sorted(METRIC_EVENTS))})"
+            )
+            continue
+
+        rows = rows_from_ab_result(
+            reader.query(ab_rows_sql(spec, numerator_event=event)), spec
+        )
+        events = int(rows.numerator.sum())
+        est = cluster_robust_rate_diff(
+            rows.unit_ids, rows.arm, rows.numerator, rows.denominator
+        )
+
+        status = "ok"
+        if g.max is not None:
+            if est.ci_low > g.max:
+                status = f"BREACH (CI low {est.ci_low:+.4f} > max {g.max:+.4f})"
+            elif est.diff > g.max:
+                status = f"watch (point {est.diff:+.4f} > max {g.max:+.4f}, CI does not clear it)"
+        if status == "ok" and g.min is not None:
+            if est.ci_high < g.min:
+                status = f"BREACH (CI high {est.ci_high:+.4f} < min {g.min:+.4f})"
+            elif est.diff < g.min:
+                status = f"watch (point {est.diff:+.4f} < min {g.min:+.4f}, CI does not clear it)"
+
+        out.append(f"  guardrail {g.metric}: {est.describe()} [{status}]")
+        # State the raw event count unconditionally. These signals are rare — measured at 221
+        # requestLess events across 11 days — and an underpowered "ok" must never be mistaken for
+        # evidence of safety.
+        out.append(f"    (n={events} {g.metric} events; a quiet guardrail here is weak evidence)")
+    return out
 
 
 def analyse_interleaving(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:

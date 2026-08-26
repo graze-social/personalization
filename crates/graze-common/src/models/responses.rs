@@ -19,6 +19,13 @@ pub struct ScoredPost {
     /// Reasons why this post was recommended.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<String>,
+
+    /// Which ranker contributed this post, when an interleaving experiment is running.
+    ///
+    /// `None` outside experiments, and also for items both rankers offered (which carry no
+    /// preference information and must not be credited to either side).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ranker: Option<String>,
 }
 
 impl ScoredPost {
@@ -29,6 +36,7 @@ impl ScoredPost {
             post_id,
             score,
             reasons: Vec::new(),
+            ranker: None,
         }
     }
 
@@ -39,6 +47,7 @@ impl ScoredPost {
             post_id: String::new(),
             score,
             reasons: Vec::new(),
+            ranker: None,
         }
     }
 }

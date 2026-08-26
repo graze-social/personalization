@@ -6,6 +6,7 @@ members = [
     "crates/graze-like-streamer",
     "crates/graze-candidate-sync",
     "crates/graze-frontdoor",
+    "crates/graze-feed-stats",
 ]
 
 [workspace.package]

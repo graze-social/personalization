@@ -1,46 +1,51 @@
 [package]
-name = "graze-candidate-sync"
+name = "graze-feed-stats"
 version = "0.2.0"
 edition = "2021"
-description = "Graze ClickHouse to Redis candidate synchronization"
+description = "Graze feed-serve telemetry -> ClickHouse analytics + ad-billing worker (Rust port of feed_stats_runner.py)"
 license = "MIT"
 
 [[bin]]
-name = "graze-candidate-sync"
+name = "graze-feed-stats"
 path = "src/main.rs"
 
-# Phase A of the durable co-liker profile design: offline profile builder.
-[[bin]]
-name = "graze-build-coliker-profiles"
-path = "src/bin/build_coliker_profiles.rs"
-
 [lib]
-name = "graze_candidate_sync"
+name = "graze_feed_stats"
 path = "src/lib.rs"
 
 [dependencies]
-# Internal dependencies
+# Internal
 graze-common = { path = "../graze-common" }
 
 # Async runtime
 tokio = { version = "1.43", features = ["full", "signal"] }
 
-# HTTP client (for ClickHouse)
+# HTTP client (for ClickHouse inserts)
 reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"], default-features = false }
 
 # Redis
 deadpool-redis = "0.22"
 
+# Postgres (billing mutations + reads) — NOT provided by graze-common
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+    "chrono",
+    "json",
+] }
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Utilities
-rayon = "1.10"
-parking_lot = "0.12"
+# JWT payload decode (unverified — read `iss`)
+base64 = "0.22"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+
+# UUID (reqId fallback)
+uuid = { version = "1", features = ["v4"] }
 
 # Error handling
 thiserror = "2.0"
@@ -50,8 +55,8 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# AT Protocol
-atproto-record = { version = "0.14", default-features = false }
-
 # Metrics
 prometheus-client = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["full", "test-util"] }

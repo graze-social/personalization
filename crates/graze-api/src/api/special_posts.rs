@@ -44,7 +44,7 @@ pub fn inject_special_posts(
     base_posts: Vec<(String, BlendedSource)>,
     special_posts: &SpecialPostsResponse,
     feed_cursor: &FeedCursor,
-    _limit: usize,
+    limit: usize,
 ) -> (Vec<(String, ItemProvenance)>, FeedCursor) {
     // Make a copy of the cursor to update
     let mut new_cursor = FeedCursor {
@@ -225,6 +225,14 @@ pub fn inject_special_posts(
         }
     }
 
+    // Honour the caller's limit. This argument was previously ignored and nothing truncated
+    // afterwards, so responses could exceed the requested `limit` by the number of injected
+    // special posts — which also made tail positions (and therefore positional attribution)
+    // unstable. Specials are injected at low positions, so truncating the tail keeps them.
+    if limit > 0 && final_posts.len() > limit {
+        final_posts.truncate(limit);
+    }
+
     (final_posts, new_cursor)
 }
 
@@ -389,5 +397,43 @@ mod tests {
         assert_eq!(pinned, 2);
         assert_eq!(rotating, 1);
         assert_eq!(sponsored, 3);
+    }
+
+    /// `limit` was previously ignored and nothing truncated afterwards, so responses could
+    /// exceed the client's requested size by the number of injected specials — which also made
+    /// tail positions unstable, and positional attribution depends on them.
+    #[test]
+    fn injection_honours_the_requested_limit() {
+        let base: Vec<(String, BlendedSource)> = (0..10)
+            .map(|i| {
+                (
+                    format!("at://did:plc:base{}/app.bsky.feed.post/{}", i, i),
+                    BlendedSource::PostLevelPersonalization,
+                )
+            })
+            .collect();
+        let specials = SpecialPostsResponse {
+            algorithm_id: 1,
+            sponsorship_saturation_rate: 20,
+            pinned: vec![make_special_post(
+                "pin1",
+                "at://did:plc:pin/app.bsky.feed.post/1",
+            )],
+            sticky: vec![make_special_post(
+                "st1",
+                "at://did:plc:st/app.bsky.feed.post/1",
+            )],
+            sponsored: vec![],
+        };
+        let cursor = FeedCursor::new();
+        let (out, _) = inject_special_posts(base.clone(), &specials, &cursor, 10);
+        assert!(
+            out.len() <= 10,
+            "returned {} items for limit 10 (specials must not inflate the response)",
+            out.len()
+        );
+        // limit = 0 means "no limit" and must not truncate to nothing.
+        let (unbounded, _) = inject_special_posts(base, &specials, &cursor, 0);
+        assert!(unbounded.len() >= 10);
     }
 }

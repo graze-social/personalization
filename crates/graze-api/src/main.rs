@@ -35,6 +35,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = Config::from_env();
+    info!(
+        exclusion_did_count = config.exclusion_dids.len(),
+        "api_exclusion_config"
+    );
     let bind_addr = format!("{}:{}", config.http_host, config.http_port);
 
     // Capture metrics port before wrapping config in Arc
@@ -105,6 +109,46 @@ async fn main() -> anyhow::Result<()> {
 
     // Create Thompson learner for adaptive parameter optimization
     let thompson = Arc::new(ThompsonLearner::new());
+
+    // Persist and merge Thompson bandit evidence across replicas.
+    //
+    // Arms were in-memory only, so every pod restart discarded all learning across three
+    // replicas — the search never converged, and arm selection ended up correlated with time
+    // (which is what confounded the retrospective analysis in THEORIES-personalization.md T19).
+    // Evidence is pushed as HINCRBYFLOAT deltas and re-read merged, so replicas accumulate
+    // instead of overwriting each other.
+    if config.thompson_persist_enabled {
+        let t = thompson.clone();
+        let r = redis.clone();
+        let interval = config.thompson_persist_interval_seconds.max(5);
+        tokio::spawn(async move {
+            // Load once before serving so a fresh pod starts from accumulated evidence.
+            match t.flush_and_reload(&r).await {
+                Ok((_, loaded)) => {
+                    tracing::info!(arms_loaded = loaded, "thompson_persist_initial_load")
+                }
+                Err(e) => tracing::warn!(error = %e, "thompson_persist_initial_load_failed"),
+            }
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match t.flush_and_reload(&r).await {
+                    Ok((flushed, loaded)) => {
+                        if flushed > 0 || loaded > 0 {
+                            tracing::debug!(
+                                fields_flushed = flushed,
+                                arms_loaded = loaded,
+                                "thompson_persist_cycle"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "thompson_persist_cycle_failed"),
+                }
+            }
+        });
+        tracing::info!(interval_seconds = interval, "thompson_persistence_enabled");
+    }
     info!(
         holdout_rate = 0.10,
         exploration_prob = 0.05,
@@ -139,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
         interactions_config,
         redis.clone(),
         interaction_writer,
+        config.exclusion_dids.clone(),
     ));
     info!(
         interactions_logging_enabled = config.interactions_logging_enabled,

@@ -108,6 +108,48 @@ pub struct SelectedParams {
     pub is_exploration: bool,
     /// True = fixed params from feed treatment_params override (don't record for learning).
     pub is_treatment_override: bool,
+    /// True = one dimension was forced by a user-hash randomized experiment. Excluded from
+    /// bandit learning, since the value was not chosen by the bandit.
+    pub is_hash_experiment: bool,
+}
+
+/// A randomized A/B assignment keyed on the user DID, deliberately independent of the bandit.
+///
+/// Thompson assignment is *adaptive*, so comparing arms retrospectively is confounded: arm choice
+/// correlates with time (bandit state moves), and like rates vary strongly by time of day. That is
+/// what invalidated the `max_total_sources` analysis in THEORIES-personalization.md T19 — the
+/// apparent effect showed up just as strongly on fallback posts, which the parameter cannot touch.
+///
+/// Hashing the DID gives assignment that is orthogonal to time and to bandit state, and stable per
+/// user across requests and deploys — a real randomized experiment.
+#[derive(Debug, Clone)]
+pub struct HashExperiment {
+    /// Bandit dimension name, e.g. `max_sources`.
+    pub dimension: String,
+    /// Values to randomize between.
+    pub values: Vec<usize>,
+    /// Percentage of users enrolled (0-100). The remainder keep normal Thompson selection.
+    pub traffic_pct: u32,
+    /// Bump to re-randomize the assignment.
+    pub salt: String,
+}
+
+impl HashExperiment {
+    /// Which arm this user is assigned, or `None` if not enrolled.
+    ///
+    /// Membership and arm are drawn from different parts of one salted hash so that enrolling a
+    /// larger share of traffic does not reshuffle who is in which arm.
+    pub fn assign(&self, user_did: &str) -> Option<usize> {
+        if self.values.is_empty() || self.traffic_pct == 0 {
+            return None;
+        }
+        let h = graze_common::hash_did(&format!("{}|{}", self.salt, user_did));
+        let v = u64::from_str_radix(&h, 16).unwrap_or(0);
+        if (v % 100) >= self.traffic_pct as u64 {
+            return None;
+        }
+        Some(self.values[((v / 100) % self.values.len() as u64) as usize])
+    }
 }
 
 /// Beta distribution parameters for a single arm.
@@ -220,6 +262,30 @@ pub struct ThompsonLearner {
     bandits: RwLock<HashMap<(i32, &'static str), ParameterBandit>>,
     /// Statistics tracking.
     stats: RwLock<ThompsonStats>,
+    /// Un-flushed evidence, as (alpha_delta, beta_delta) per arm.
+    ///
+    /// Bandit state was previously in-memory only, so every pod restart discarded all learning —
+    /// across three replicas, with frequent deploys, the search never converged. Worse, it made
+    /// arm selection correlate with *time*, which is what confounded the retrospective analysis of
+    /// `max_total_sources` (see THEORIES-personalization.md T19).
+    ///
+    /// Deltas rather than absolute alpha/beta so replicas merge instead of clobbering.
+    pending: RwLock<HashMap<ArmKey, ArmDelta>>,
+}
+
+/// Identifies one bandit arm: (algo_id, dimension name, parameter value).
+type ArmKey = (i32, &'static str, usize);
+/// Un-flushed (alpha_delta, beta_delta) for an arm.
+type ArmDelta = (f64, f64);
+
+/// Redis hash holding merged bandit evidence for one algorithm.
+fn arms_key(algo_id: i32) -> String {
+    format!("thompson:arms:{}", algo_id)
+}
+
+/// Field name for one arm's alpha or beta counter.
+fn arm_field(dimension: &str, value: usize, which: char) -> String {
+    format!("{}:{}:{}", dimension, value, which)
 }
 
 #[derive(Debug, Default)]
@@ -243,6 +309,7 @@ impl ThompsonLearner {
             config,
             bandits: RwLock::new(HashMap::new()),
             stats: RwLock::new(ThompsonStats::default()),
+            pending: RwLock::new(HashMap::new()),
         }
     }
 
@@ -377,6 +444,7 @@ impl ThompsonLearner {
                     is_holdout: true,
                     is_exploration: false,
                     is_treatment_override: false,
+                    is_hash_experiment: false,
                 }
             } else {
                 SelectedParams {
@@ -392,6 +460,7 @@ impl ThompsonLearner {
                     is_holdout: true,
                     is_exploration: false,
                     is_treatment_override: false,
+                    is_hash_experiment: false,
                 }
             };
         }
@@ -412,6 +481,7 @@ impl ThompsonLearner {
                 is_holdout: false,
                 is_exploration: false,
                 is_treatment_override: true,
+                is_hash_experiment: false,
             };
         }
 
@@ -474,6 +544,7 @@ impl ThompsonLearner {
             is_holdout: false,
             is_exploration,
             is_treatment_override: false,
+            is_hash_experiment: false,
         }
     }
 
@@ -513,13 +584,14 @@ impl ThompsonLearner {
             is_holdout: false,
             is_exploration: false,
             is_treatment_override: false,
+            is_hash_experiment: false,
         }
     }
 
     /// Record an observation (success/failure) for selected parameters.
     pub fn record_observation(&self, algo_id: i32, params: &SelectedParams, success: bool) {
-        if params.is_holdout || params.is_treatment_override {
-            return; // Don't learn from holdout or fixed treatment override
+        if params.is_holdout || params.is_treatment_override || params.is_hash_experiment {
+            return; // Don't learn from holdout, fixed treatment, or a forced experiment arm
         }
 
         let mut bandits = self.bandits.write();
@@ -543,6 +615,181 @@ impl ThompsonLearner {
                 bandit.update(value, success);
             }
         }
+
+        // Stage the same evidence for cross-replica persistence.
+        {
+            let mut pending = self.pending.write();
+            for (name, value) in param_values {
+                let e = pending.entry((algo_id, name, value)).or_insert((0.0, 0.0));
+                if success {
+                    e.0 += 1.0;
+                } else {
+                    e.1 += 1.0;
+                }
+            }
+        }
+    }
+
+    /// Push this replica's un-flushed evidence to Redis, then reload the merged totals.
+    ///
+    /// Deltas go out via `HINCRBYFLOAT` so replicas accumulate rather than overwrite; the reload
+    /// then gives every pod the benefit of the others' observations. Priors are re-added locally,
+    /// so Redis stores only *observed* counts and the prior is never double-counted.
+    ///
+    /// Failures are non-fatal: the pending map is only cleared once the write succeeds, so a Redis
+    /// blip defers evidence rather than losing it.
+    pub async fn flush_and_reload(
+        &self,
+        redis: &graze_common::RedisClient,
+    ) -> std::result::Result<(usize, usize), graze_common::GrazeError> {
+        // Snapshot and clear-on-success, grouped per algo.
+        let snapshot: Vec<(ArmKey, ArmDelta)> =
+            self.pending.read().iter().map(|(k, v)| (*k, *v)).collect();
+
+        let mut by_algo: HashMap<i32, Vec<(String, f64)>> = HashMap::new();
+        for ((algo_id, dim, value), (da, db)) in &snapshot {
+            let entry = by_algo.entry(*algo_id).or_default();
+            if *da != 0.0 {
+                entry.push((arm_field(dim, *value, 'a'), *da));
+            }
+            if *db != 0.0 {
+                entry.push((arm_field(dim, *value, 'b'), *db));
+            }
+        }
+
+        let mut flushed = 0usize;
+        for (algo_id, items) in &by_algo {
+            redis.hincrbyfloat_multi(&arms_key(*algo_id), items).await?;
+            flushed += items.len();
+        }
+
+        // Only drop what we actually wrote; anything recorded meanwhile survives.
+        if !snapshot.is_empty() {
+            let mut pending = self.pending.write();
+            for (k, (da, db)) in &snapshot {
+                if let Some(cur) = pending.get_mut(k) {
+                    cur.0 -= da;
+                    cur.1 -= db;
+                }
+            }
+            pending.retain(|_, v| v.0 != 0.0 || v.1 != 0.0);
+        }
+
+        // Reload merged state for every algo we know about locally, plus any we just wrote.
+        let mut algos: HashSet<i32> = self.bandits.read().keys().map(|(a, _)| *a).collect();
+        algos.extend(by_algo.keys().copied());
+
+        let mut loaded = 0usize;
+        for algo_id in algos {
+            let fields = redis.hgetall(&arms_key(algo_id)).await?;
+            if fields.is_empty() {
+                continue;
+            }
+            let mut merged: HashMap<(String, usize), (f64, f64)> = HashMap::new();
+            for (field, raw) in fields {
+                let mut parts = field.rsplitn(2, ':');
+                let which = parts.next().unwrap_or("");
+                let rest = parts.next().unwrap_or("");
+                let mut rp = rest.rsplitn(2, ':');
+                let value: usize = match rp.next().and_then(|v| v.parse().ok()) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let dim = match rp.next() {
+                    Some(d) => d.to_string(),
+                    None => continue,
+                };
+                let amount: f64 = raw.parse().unwrap_or(0.0);
+                let e = merged.entry((dim, value)).or_insert((0.0, 0.0));
+                match which {
+                    "a" => e.0 += amount,
+                    "b" => e.1 += amount,
+                    _ => {}
+                }
+            }
+
+            let mut bandits = self.bandits.write();
+            for ((dim, value), (a, b)) in merged {
+                if let Some(bandit) = bandits
+                    .iter_mut()
+                    .find(|((aid, name), _)| *aid == algo_id && *name == dim.as_str())
+                    .map(|(_, v)| v)
+                {
+                    for (v, arm) in bandit.arms.iter_mut() {
+                        if *v == value {
+                            arm.alpha = self.config.prior_alpha + a.max(0.0);
+                            arm.beta = self.config.prior_beta + b.max(0.0);
+                            loaded += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((flushed, loaded))
+    }
+
+    /// Force one dimension from a user-hash randomized experiment, if the user is enrolled.
+    ///
+    /// Returns the forced value so the caller can log it. The selected value also flows into the
+    /// `feedContext` provenance through the normal params path, so engagement analysis needs no
+    /// extra plumbing — but unlike a Thompson-chosen value, this one is randomized.
+    pub fn apply_hash_experiment(
+        &self,
+        params: &mut SelectedParams,
+        user_did: &str,
+        exp: &HashExperiment,
+    ) -> Option<usize> {
+        // Holdout is the existing control surface; leave it untouched so it stays interpretable.
+        if params.is_holdout || params.is_treatment_override {
+            return None;
+        }
+        let value = exp.assign(user_did)?;
+        let applied = match exp.dimension.as_str() {
+            "min_likes" => {
+                params.min_post_likes = value;
+                true
+            }
+            "max_likers" => {
+                params.max_likers_per_post = value;
+                true
+            }
+            "max_sources" => {
+                params.max_total_sources = value;
+                true
+            }
+            "max_checks" => {
+                params.max_algo_checks = value;
+                true
+            }
+            "min_colikes" => {
+                params.min_co_likes = value;
+                true
+            }
+            "max_user_likes" => {
+                params.max_user_likes = value;
+                true
+            }
+            "max_src_per_post" => {
+                params.max_sources_per_post = value;
+                true
+            }
+            "seed_pool" => {
+                params.seed_sample_pool = value;
+                true
+            }
+            "corater_decay" => {
+                params.corater_decay_pct = value;
+                true
+            }
+            _ => false,
+        };
+        if !applied {
+            return None;
+        }
+        params.is_hash_experiment = true;
+        Some(value)
     }
 
     /// Get statistics.
@@ -949,6 +1196,7 @@ mod tests {
             is_holdout: false,
             is_exploration: false,
             is_treatment_override: false,
+            is_hash_experiment: false,
         };
 
         assert_eq!(params.min_post_likes, 5);
@@ -956,5 +1204,130 @@ mod tests {
         assert_eq!(params.corater_decay_pct, 0);
         assert!(!params.is_holdout);
         assert!(!params.is_exploration);
+    }
+}
+
+#[cfg(test)]
+mod hash_experiment_tests {
+    use super::*;
+
+    fn exp(values: Vec<usize>, pct: u32) -> HashExperiment {
+        HashExperiment {
+            dimension: "max_sources".to_string(),
+            values,
+            traffic_pct: pct,
+            salt: "t".to_string(),
+        }
+    }
+
+    /// Assignment must be stable per user — otherwise a user flips arms between requests and the
+    /// experiment measures nothing.
+    #[test]
+    fn assignment_is_deterministic_per_user() {
+        let e = exp(vec![250, 10000], 100);
+        for did in ["did:plc:aaa", "did:plc:bbb", "did:plc:ccc"] {
+            let first = e.assign(did);
+            for _ in 0..20 {
+                assert_eq!(e.assign(did), first, "unstable assignment for {}", did);
+            }
+        }
+    }
+
+    /// Both arms must actually get traffic, roughly evenly.
+    #[test]
+    fn arms_are_balanced_across_many_users() {
+        let e = exp(vec![250, 10000], 100);
+        let mut a = 0;
+        let mut b = 0;
+        for i in 0..4000 {
+            match e.assign(&format!("did:plc:user{}", i)) {
+                Some(250) => a += 1,
+                Some(10000) => b += 1,
+                other => panic!("unexpected assignment {:?}", other),
+            }
+        }
+        let skew = (a as f64 - b as f64).abs() / 4000.0;
+        assert!(skew < 0.08, "arms too skewed: {} vs {}", a, b);
+    }
+
+    /// Traffic percentage must gate enrollment, and — critically — shrinking it must not reshuffle
+    /// which arm the still-enrolled users are in, or a ramp-up would invalidate earlier data.
+    #[test]
+    fn traffic_pct_gates_enrollment_without_reshuffling_arms() {
+        let full = exp(vec![250, 10000], 100);
+        let half = exp(vec![250, 10000], 50);
+        let mut enrolled_half = 0;
+        for i in 0..4000 {
+            let did = format!("did:plc:user{}", i);
+            if let Some(v) = half.assign(&did) {
+                enrolled_half += 1;
+                assert_eq!(
+                    v,
+                    full.assign(&did).unwrap(),
+                    "arm changed with traffic_pct"
+                );
+            }
+        }
+        let frac = enrolled_half as f64 / 4000.0;
+        assert!(
+            (0.42..0.58).contains(&frac),
+            "expected ~50% enrolled, got {:.2}",
+            frac
+        );
+    }
+
+    #[test]
+    fn disabled_or_empty_experiment_assigns_nobody() {
+        assert!(exp(vec![250, 10000], 0).assign("did:plc:x").is_none());
+        assert!(exp(vec![], 100).assign("did:plc:x").is_none());
+    }
+
+    /// A forced arm must be excluded from bandit learning — the bandit did not choose it, so
+    /// crediting it would corrupt the very arms we are trying to evaluate.
+    #[test]
+    fn forced_arms_are_excluded_from_learning() {
+        let learner = ThompsonLearner::new();
+        let mut p = learner.select_params(1);
+        p.is_holdout = false;
+        p.is_treatment_override = false;
+        let applied = learner.apply_hash_experiment(&mut p, "did:plc:zzz", &exp(vec![250], 100));
+        assert_eq!(applied, Some(250));
+        assert!(p.is_hash_experiment);
+        assert_eq!(p.max_total_sources, 250);
+
+        // record_observation must be a no-op for this request.
+        let before = learner.get_stats().get("observations_recorded").copied();
+        learner.record_observation(1, &p, true);
+        let after = learner.get_stats().get("observations_recorded").copied();
+        assert_eq!(before, after, "forced arm leaked into bandit learning");
+    }
+
+    /// Holdout is the pre-existing control surface; the experiment must leave it alone so it stays
+    /// interpretable as a baseline.
+    #[test]
+    fn holdout_requests_are_never_enrolled() {
+        let learner = ThompsonLearner::new();
+        let mut p = learner.select_params(1);
+        p.is_holdout = true;
+        let before = p.max_total_sources;
+        assert_eq!(
+            learner.apply_hash_experiment(&mut p, "did:plc:zzz", &exp(vec![250], 100)),
+            None
+        );
+        assert_eq!(p.max_total_sources, before);
+        assert!(!p.is_hash_experiment);
+    }
+
+    #[test]
+    fn unknown_dimension_is_a_no_op() {
+        let learner = ThompsonLearner::new();
+        let mut p = learner.select_params(1);
+        let mut e = exp(vec![250], 100);
+        e.dimension = "not_a_dimension".to_string();
+        assert_eq!(
+            learner.apply_hash_experiment(&mut p, "did:plc:zzz", &e),
+            None
+        );
+        assert!(!p.is_hash_experiment);
     }
 }

@@ -17,7 +17,43 @@ use crate::api::RequestId;
 use crate::audit::{emit_skip_log, should_audit, AuditCollector};
 use crate::AppState;
 use graze_common::hash_did;
-use graze_common::models::PersonalizeRequest;
+use graze_common::is_excluded_post_uri;
+use graze_common::models::{PersonalizeRequest, PersonalizeResponse};
+
+async fn filter_excluded_uris_from_personalize_response(
+    state: &AppState,
+    response: &mut PersonalizeResponse,
+) {
+    if state.config.exclusion_dids.is_empty() {
+        return;
+    }
+    let ids_needing_uri: Vec<String> = response
+        .posts
+        .iter()
+        .filter(|p| p.uri.is_empty() && !p.post_id.is_empty())
+        .map(|p| p.post_id.clone())
+        .collect();
+    let uri_by_id = if ids_needing_uri.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .interner
+            .get_uris_batch(&ids_needing_uri)
+            .await
+            .unwrap_or_default()
+    };
+    response.posts.retain(|p| {
+        let uri_ref: Option<&str> = if !p.uri.is_empty() {
+            Some(p.uri.as_str())
+        } else {
+            uri_by_id.get(&p.post_id).map(|s| s.as_str())
+        };
+        match uri_ref {
+            Some(u) => !is_excluded_post_uri(u, state.config.exclusion_dids.as_ref()),
+            None => true,
+        }
+    });
+}
 
 /// POST /v1/personalize
 ///
@@ -81,7 +117,8 @@ pub async fn personalize(
         )
         .await
     {
-        Ok(response) => {
+        Ok(mut response) => {
+            filter_excluded_uris_from_personalize_response(&state, &mut response).await;
             // Emit audit log if enabled
             if let Some(mut a) = audit {
                 let response_time_ms = request_start.elapsed().as_millis() as f64;
@@ -290,17 +327,14 @@ pub async fn author_affinity_diagnostic(
     {
         Ok(result) => {
             // Collect post IDs and scores
-            let scored: Vec<(f64, String, i64)> = result
+            let scored: Vec<(f64, String)> = result
                 .scored_posts
                 .into_iter()
                 .take(request.limit)
-                .filter_map(|(score, post_id)| {
-                    post_id.parse::<i64>().ok().map(|id| (score, post_id, id))
-                })
                 .collect();
 
             // Batch fetch URIs
-            let post_ids: Vec<i64> = scored.iter().map(|(_, _, id)| *id).collect();
+            let post_ids: Vec<String> = scored.iter().map(|(_, id)| id.clone()).collect();
             let uri_map = state
                 .interner
                 .get_uris_batch(&post_ids)
@@ -310,11 +344,16 @@ pub async fn author_affinity_diagnostic(
             // Convert to response format
             let posts: Vec<AuthorAffinityPost> = scored
                 .into_iter()
-                .filter_map(|(score, post_id, id)| {
-                    uri_map.get(&id).map(|uri| AuthorAffinityPost {
-                        uri: uri.clone(),
-                        score,
-                        post_id,
+                .filter_map(|(score, post_id)| {
+                    uri_map.get(&post_id).and_then(|uri| {
+                        if is_excluded_post_uri(uri, state.config.exclusion_dids.as_ref()) {
+                            return None;
+                        }
+                        Some(AuthorAffinityPost {
+                            uri: uri.clone(),
+                            score,
+                            post_id,
+                        })
                     })
                 })
                 .collect();

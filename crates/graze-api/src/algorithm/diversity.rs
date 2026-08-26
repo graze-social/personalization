@@ -19,6 +19,13 @@ pub struct DiversityConfig {
     pub diminishing_factor: f64,
     /// MMR lambda: balance between relevance (0.0) and diversity (1.0).
     pub mmr_lambda: f64,
+    /// Preserve the input order instead of re-sorting by diversity-adjusted score.
+    ///
+    /// Required by interleaving: a team-draft order encodes which ranker contributed each
+    /// position, and re-sorting by adjusted score destroys that assignment. In this mode the
+    /// per-author cap still applies, but surviving items keep their incoming order and their
+    /// original scores.
+    pub preserve_order: bool,
 }
 
 impl Default for DiversityConfig {
@@ -28,6 +35,7 @@ impl Default for DiversityConfig {
             max_posts_per_author: 3,
             diminishing_factor: 0.5,
             mmr_lambda: 0.3,
+            preserve_order: false,
         }
     }
 }
@@ -91,6 +99,48 @@ pub fn diversify_posts(
             posts,
             posts_demoted: 0,
             posts_removed_by_cap: 0,
+        };
+    }
+
+    if config.preserve_order {
+        // Cap-only pass: keep the incoming order (and original scores) so an interleaved draft
+        // survives, while still preventing one author from flooding the feed.
+        let mut author_counts: FxHashMap<String, usize> = FxHashMap::default();
+        let mut selected: Vec<(f64, String, String)> = Vec::with_capacity(limit);
+        let mut posts_removed_by_cap = 0;
+
+        for (score, post_id) in scored_posts {
+            if selected.len() >= limit {
+                break;
+            }
+            let Some(uri) = post_uris.get(post_id) else {
+                continue;
+            };
+            let Some(author) = extract_author_did(uri) else {
+                continue;
+            };
+            let count = author_counts.entry(author.to_string()).or_insert(0);
+            if *count >= config.max_posts_per_author {
+                posts_removed_by_cap += 1;
+                continue;
+            }
+            *count += 1;
+            selected.push((*score, post_id.clone(), uri.clone()));
+        }
+
+        let unique_authors = author_counts.len();
+        debug!(
+            total_candidates = scored_posts.len(),
+            selected_count = selected.len(),
+            unique_authors,
+            posts_removed_by_cap,
+            "diversity_preserve_order"
+        );
+        return DiversityResult {
+            posts: selected,
+            unique_authors,
+            posts_demoted: 0,
+            posts_removed_by_cap,
         };
     }
 
@@ -245,6 +295,7 @@ mod tests {
             max_posts_per_author: 3,
             diminishing_factor: 0.5,
             mmr_lambda: 0.0, // Disable MMR for this test
+            preserve_order: false,
         };
 
         let result = diversify_posts(&posts, &uris, &config, 10);
@@ -279,6 +330,7 @@ mod tests {
             max_posts_per_author: 2,
             diminishing_factor: 0.5,
             mmr_lambda: 0.0,
+            preserve_order: false,
         };
 
         let result = diversify_posts(&posts, &uris, &config, 10);
@@ -319,6 +371,7 @@ mod tests {
             max_posts_per_author: 3,
             diminishing_factor: 0.5,
             mmr_lambda: 0.3,
+            preserve_order: false,
         };
 
         let result = diversify_posts(&posts, &uris, &config, 4);
@@ -327,5 +380,89 @@ mod tests {
         assert_eq!(result.unique_authors, 2);
         // First post should still be post1 (highest score)
         assert_eq!(result.posts[0].1, "post1");
+    }
+
+    /// Interleaving encodes the ranker assignment in the *order* of the list, so diversity must
+    /// be able to cap authors without re-sorting. Without this, a team-draft order is destroyed
+    /// and per-item attribution becomes meaningless.
+    #[test]
+    fn preserve_order_keeps_input_order_and_scores() {
+        let scored = vec![
+            (0.10, "p1".to_string()),
+            (0.90, "p2".to_string()),
+            (0.50, "p3".to_string()),
+        ];
+        let mut uris = FxHashMap::default();
+        uris.insert(
+            "p1".to_string(),
+            "at://did:a/app.bsky.feed.post/1".to_string(),
+        );
+        uris.insert(
+            "p2".to_string(),
+            "at://did:b/app.bsky.feed.post/2".to_string(),
+        );
+        uris.insert(
+            "p3".to_string(),
+            "at://did:c/app.bsky.feed.post/3".to_string(),
+        );
+
+        let config = DiversityConfig {
+            enabled: true,
+            max_posts_per_author: 3,
+            diminishing_factor: 0.5,
+            mmr_lambda: 0.3,
+            preserve_order: true,
+        };
+        let out = diversify_posts(&scored, &uris, &config, 10);
+        let ids: Vec<&str> = out.posts.iter().map(|(_, id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["p1", "p2", "p3"], "input order must survive");
+        // Scores must be untouched (the default path rewrites them with adjusted scores).
+        assert_eq!(out.posts[0].0, 0.10);
+        assert_eq!(out.posts[1].0, 0.90);
+        assert_eq!(out.posts_demoted, 0);
+    }
+
+    /// Order preservation must not cost us the author cap, or one author could flood a feed.
+    #[test]
+    fn preserve_order_still_applies_the_author_cap() {
+        let scored: Vec<(f64, String)> = (0..5).map(|i| (1.0, format!("p{}", i))).collect();
+        let mut uris = FxHashMap::default();
+        for i in 0..5 {
+            uris.insert(
+                format!("p{}", i),
+                format!("at://did:same/app.bsky.feed.post/{}", i),
+            );
+        }
+        let config = DiversityConfig {
+            enabled: true,
+            max_posts_per_author: 2,
+            diminishing_factor: 0.5,
+            mmr_lambda: 0.3,
+            preserve_order: true,
+        };
+        let out = diversify_posts(&scored, &uris, &config, 10);
+        assert_eq!(out.posts.len(), 2, "cap must hold");
+        assert_eq!(out.posts_removed_by_cap, 3);
+        // And the survivors are the FIRST two, not an arbitrary pair.
+        let ids: Vec<&str> = out.posts.iter().map(|(_, id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["p0", "p1"]);
+    }
+
+    /// The ordinary path must be unchanged by the new flag.
+    #[test]
+    fn default_path_still_resorts_by_adjusted_score() {
+        let scored = vec![(0.10, "p1".to_string()), (0.90, "p2".to_string())];
+        let mut uris = FxHashMap::default();
+        uris.insert(
+            "p1".to_string(),
+            "at://did:a/app.bsky.feed.post/1".to_string(),
+        );
+        uris.insert(
+            "p2".to_string(),
+            "at://did:b/app.bsky.feed.post/2".to_string(),
+        );
+        let out = diversify_posts(&scored, &uris, &DiversityConfig::default(), 10);
+        let ids: Vec<&str> = out.posts.iter().map(|(_, id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["p2", "p1"], "highest score first");
     }
 }

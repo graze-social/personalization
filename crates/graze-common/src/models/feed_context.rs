@@ -72,6 +72,19 @@ pub struct FeedContextProvenance {
         skip_serializing_if = "Option::is_none"
     )]
     pub is_personalization_holdout: Option<bool>,
+
+    /// Which ranker produced this item, when an interleaving experiment is running.
+    ///
+    /// Set only for interleaved items; `None` otherwise. Required for per-item attribution in
+    /// team-draft interleaving, where the whole point is that both rankers contribute to one
+    /// response and engagement must be credited to the right one.
+    ///
+    /// Safe to add without a ClickHouse migration: the blob is stored verbatim in
+    /// `interaction_feed_context String`, `decode` uses plain `serde_json::from_str` (which
+    /// ignores unknown keys), and the lenient consumer decoder reads only two fields.
+    #[serde(rename = "ranker", skip_serializing_if = "Option::is_none")]
+    pub ranker: Option<String>,
+
 }
 
 /// Compact personalization params for provenance.
@@ -172,6 +185,7 @@ mod tests {
             response_time_ms: Some(150.0),
             is_holdout: Some(false),
             is_personalization_holdout: None,
+            ranker: None,
         };
         let encoded = ctx.encode().expect("encode");
         let decoded = FeedContextProvenance::decode(&encoded).expect("decode");
@@ -194,4 +208,50 @@ mod tests {
     fn test_decode_feed_context_invalid_base64() {
         assert!(FeedContextProvenance::decode("!!!invalid!!!").is_none());
     }
+
+    /// The `ranker` field must be invisible when unset, so existing consumers and stored blobs
+    /// are unaffected, and must survive a round-trip when set.
+    #[test]
+    fn ranker_is_omitted_when_unset_and_roundtrips_when_set() {
+        let mut ctx = FeedContextProvenance {
+            feed_uri: "at://did:plc:abc/app.bsky.feed.generator/feed".to_string(),
+            algo_id: 1,
+            depth: 0,
+            personalized: true,
+            source: "personalized".to_string(),
+            personalization_type: None,
+            fallback_tranche: None,
+            total: 10,
+            personalized_count: 5,
+            attribution: None,
+            params: None,
+            response_time_ms: None,
+            is_holdout: None,
+            is_personalization_holdout: None,
+            ranker: None,
+        };
+        let json_absent = serde_json::to_string(&ctx).expect("serialize");
+        assert!(
+            !json_absent.contains("ranker"),
+            "unset ranker must not appear on the wire: {}",
+            json_absent
+        );
+
+        ctx.ranker = Some("sampled_walk".to_string());
+        let decoded =
+            FeedContextProvenance::decode(&ctx.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded.ranker.as_deref(), Some("sampled_walk"));
+    }
+
+    /// A blob produced by an older build (no `ranker` key) must still decode — this is what
+    /// makes the field safe to add without a ClickHouse migration.
+    #[test]
+    fn blob_without_ranker_key_still_decodes() {
+        let legacy = r#"{"feed_uri":"at://x","algo_id":1,"depth":0,"personalized":false,"source":"fallback","total":1,"personalized_count":0}"#;
+        let ctx: FeedContextProvenance = serde_json::from_str(legacy).expect("legacy decode");
+        assert_eq!(ctx.ranker, None);
+        assert_eq!(ctx.source, "fallback");
+    }
+
+
 }

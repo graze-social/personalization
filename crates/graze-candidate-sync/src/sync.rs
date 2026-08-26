@@ -18,7 +18,10 @@ use deadpool_redis::redis;
 
 use crate::config::Config;
 use graze_common::services::UriInterner;
-use graze_common::{CandidateSource, Keys, RedisClient, Result, DEFAULT_RETENTION_DAYS};
+use graze_common::{
+    hash_did, is_excluded_post_uri, CandidateSource, Keys, RedisClient, Result,
+    DEFAULT_RETENTION_DAYS,
+};
 
 /// Syncs algorithm candidates from a configurable source to Redis.
 pub struct CandidateSync {
@@ -257,7 +260,7 @@ impl CandidateSync {
         info!(algo_id = algo_id, "Sync starting");
 
         // Fetch candidates from configured source (ClickHouse, HTTP, or admin-only)
-        let posts = match self.source.fetch_candidates(algo_id).await {
+        let mut posts = match self.source.fetch_candidates(algo_id).await {
             Ok(p) => p,
             Err(e) => {
                 error!(algo_id = algo_id, error = %e, "Sync failed");
@@ -265,16 +268,24 @@ impl CandidateSync {
             }
         };
 
+        if !self.config.exclusion_dids.is_empty() {
+            posts.retain(|uri| !is_excluded_post_uri(uri, self.config.exclusion_dids.as_ref()));
+        }
+
         if posts.is_empty() {
             warn!(algo_id = algo_id, "No posts found");
             return Ok(());
         }
 
-        // Intern all URIs
-        let uri_to_id = self.interner.get_or_create_ids_batch(&posts).await?;
+        // Intern all URIs (shard = today; candidate-sync refreshes ap from URIs each run)
+        let intern_date = graze_common::today_date();
+        let uri_to_id = self
+            .interner
+            .get_or_create_ids_batch(&posts, &intern_date)
+            .await?;
 
         // Store posts in Redis (atomic swap)
-        let post_ids: Vec<i64> = uri_to_id.values().copied().collect();
+        let post_ids: Vec<String> = uri_to_id.values().cloned().collect();
         self.store_posts(algo_id, &post_ids).await?;
 
         let duration = start_time.elapsed();
@@ -303,7 +314,7 @@ impl CandidateSync {
     ///
     /// Also fetches and stores liker counts for each post to avoid
     /// ZCARD calls during scoring (major performance optimization).
-    async fn store_posts(&self, algo_id: i32, post_ids: &[i64]) -> Result<()> {
+    async fn store_posts(&self, algo_id: i32, post_ids: &[String]) -> Result<()> {
         let posts_key = Keys::algo_posts(algo_id);
         let counts_key = Keys::algo_posts_counts(algo_id);
         let meta_key = Keys::algo_meta(algo_id);
@@ -314,21 +325,17 @@ impl CandidateSync {
             return Ok(());
         }
 
-        // Convert IDs to strings for Redis
-        let str_ids: Vec<String> = post_ids.iter().map(|id| id.to_string()).collect();
-
         // Fetch liker counts using pipelined ZCARD across date-based keys
-        let post_liker_key_groups: Vec<Vec<String>> = str_ids
+        let post_liker_key_groups: Vec<Vec<String>> = post_ids
             .iter()
-            .map(|id| Keys::post_likers_retention(id, DEFAULT_RETENTION_DAYS))
+            .map(|id| Keys::post_likers_retention_bounded(id, DEFAULT_RETENTION_DAYS))
             .collect();
         let counts = self
             .redis
             .zcard_summed_multi(&post_liker_key_groups)
             .await?;
 
-        let liker_counts: HashMap<String, usize> =
-            str_ids.iter().cloned().zip(counts.into_iter()).collect();
+        let liker_counts: HashMap<String, usize> = post_ids.iter().cloned().zip(counts).collect();
 
         let ttl_seconds = self.config.algo_posts_ttl_hours as i64 * 60 * 60;
         let now = std::time::SystemTime::now()
@@ -345,7 +352,7 @@ impl CandidateSync {
         pipe.del(&temp_counts_key);
 
         // Store posts in temp key (SADD)
-        pipe.cmd("SADD").arg(&temp_key).arg(&str_ids);
+        pipe.cmd("SADD").arg(&temp_key).arg(post_ids);
 
         // Store liker counts in temp hash (HSET)
         if !liker_counts.is_empty() {
@@ -363,10 +370,33 @@ impl CandidateSync {
         pipe.cmd("RENAME").arg(&temp_counts_key).arg(&counts_key);
         pipe.expire(&counts_key, ttl_seconds);
 
+        // Like-density histogram for the pool, written alongside the pool itself.
+        //
+        // The serving path needs to know whether a feed can be personalized *at all* before spending
+        // the co-liker walk on it. Measured: algo 5395 is ~83% of all scoring traffic and only 2% of
+        // its candidates clear `min_post_likes = 10`, so nearly all the engine's compute goes to a feed
+        // that cannot produce a ranking. Pool *size* does not predict this — algo 8352 has 596 posts
+        // and 22% scoreable, while 5395's 1,000 posts are 2% — so density is the measure to publish.
+        //
+        // Free to compute: `liker_counts` is already in hand for every post. Stored as counts at
+        // several thresholds rather than one share, so the serving side can change its threshold
+        // without waiting on a candidate-sync redeploy.
+        let mut scoreable: Vec<(u32, usize)> = Vec::with_capacity(5);
+        for threshold in [1u32, 2, 3, 5, 10] {
+            let n = liker_counts
+                .values()
+                .filter(|c| **c >= threshold as usize)
+                .count();
+            scoreable.push((threshold, n));
+        }
+
         // Update metadata
-        pipe.cmd("HSET")
-            .arg(&meta_key)
-            .arg("last_sync")
+        let hset = pipe.cmd("HSET").arg(&meta_key);
+        for (threshold, n) in &scoreable {
+            hset.arg(format!("scoreable_{}", threshold))
+                .arg(n.to_string());
+        }
+        hset.arg("last_sync")
             .arg(now.to_string())
             .arg("post_count")
             .arg(post_ids.len().to_string());
@@ -441,7 +471,7 @@ impl CandidateSync {
             // Build date-based key groups for this batch
             let pl_key_groups: Vec<Vec<String>> = batch
                 .iter()
-                .map(|id| Keys::post_likers_retention(id, DEFAULT_RETENTION_DAYS))
+                .map(|id| Keys::post_likers_retention_bounded(id, DEFAULT_RETENTION_DAYS))
                 .collect();
 
             // Pipelined ZCARD summed across date-based keys
@@ -545,7 +575,7 @@ impl CandidateSync {
             // Build date-based key groups for this batch
             let pl_key_groups: Vec<Vec<String>> = batch
                 .iter()
-                .map(|id| Keys::post_likers_retention(id, DEFAULT_RETENTION_DAYS))
+                .map(|id| Keys::post_likers_retention_bounded(id, DEFAULT_RETENTION_DAYS))
                 .collect();
 
             // Pipelined ZCARD summed across date-based keys
@@ -647,7 +677,7 @@ impl CandidateSync {
             // Build date-based key groups for ZCOUNT (sum across all dates)
             let pl_key_groups: Vec<Vec<String>> = batch
                 .iter()
-                .map(|id| Keys::post_likers_retention(id, DEFAULT_RETENTION_DAYS))
+                .map(|id| Keys::post_likers_retention_bounded(id, DEFAULT_RETENTION_DAYS))
                 .collect();
 
             // Flatten keys for ZCOUNT
@@ -733,6 +763,46 @@ impl CandidateSync {
         Ok(())
     }
 
+    /// Store the set of author DID hashes present in an algorithm's candidate pool.
+    ///
+    /// Written to a temp key and renamed, matching `store_posts`, so readers never observe a
+    /// partially-built set — a half-written author set would silently shrink every seed derived from
+    /// it, which is exactly the kind of quiet degradation that is hard to attribute later.
+    async fn store_pool_authors(
+        &self,
+        algo_id: i32,
+        author_posts: &HashMap<String, Vec<(String, usize, i64)>>,
+    ) -> Result<()> {
+        let key = Keys::algo_pool_authors(algo_id);
+        if author_posts.is_empty() {
+            // Leave any existing set alone rather than replacing it with an empty one: an empty
+            // `apa:` key is indistinguishable at read time from "this feed has no authors", which
+            // would filter every seed to nothing.
+            return Ok(());
+        }
+
+        let hashes: Vec<String> = author_posts.keys().map(|did| hash_did(did)).collect();
+        let temp_key = format!("{}:temp", key);
+        let ttl_seconds = self.config.algo_posts_ttl_hours as i64 * 60 * 60;
+
+        let mut conn = self.redis.get().await?;
+        let mut pipe = redis::pipe();
+        pipe.del(&temp_key);
+        for chunk in hashes.chunks(1000) {
+            pipe.cmd("SADD").arg(&temp_key).arg(chunk);
+        }
+        pipe.cmd("RENAME").arg(&temp_key).arg(&key);
+        pipe.expire(&key, ttl_seconds);
+        let _: Vec<redis::Value> = pipe.query_async(&mut conn).await?;
+
+        debug!(
+            algo_id = algo_id,
+            author_count = hashes.len(),
+            "Pool author set stored"
+        );
+        Ok(())
+    }
+
     /// Sync author success scores and discovery posts.
     ///
     /// 1. Calculate author success = avg engagement across their posts in feed
@@ -755,8 +825,7 @@ impl CandidateSync {
         }
 
         // Get URIs for all posts to extract author DIDs
-        let int_ids: Vec<i64> = post_ids.iter().filter_map(|id| id.parse().ok()).collect();
-        let uri_mapping = self.interner.get_uris_batch(&int_ids).await?;
+        let uri_mapping = self.interner.get_uris_batch(&post_ids).await?;
 
         // Collect post data: {post_id: (like_count, post_time, author_did)}
         let mut post_data: HashMap<String, (usize, i64, Option<String>)> = HashMap::new();
@@ -768,7 +837,7 @@ impl CandidateSync {
             // Build date-based key groups for this batch
             let pl_key_groups: Vec<Vec<String>> = batch
                 .iter()
-                .map(|id| Keys::post_likers_retention(id, DEFAULT_RETENTION_DAYS))
+                .map(|id| Keys::post_likers_retention_bounded(id, DEFAULT_RETENTION_DAYS))
                 .collect();
 
             // Pipelined ZCARD summed across date-based keys
@@ -800,15 +869,9 @@ impl CandidateSync {
                     .unwrap_or(now);
 
                 // Extract author DID from URI
-                let author_did = if let Ok(id) = post_id.parse::<i64>() {
-                    if let Some(uri) = uri_mapping.get(&id) {
-                        extract_author_did(uri)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let author_did = uri_mapping
+                    .get(post_id)
+                    .and_then(|uri| extract_author_did(uri));
 
                 post_data.insert(post_id.clone(), (*like_count, post_time, author_did));
             }
@@ -826,6 +889,26 @@ impl CandidateSync {
                     *post_time,
                 ));
             }
+        }
+
+        // Publish the pool's author set (`apa:{algo}`) while the author map is already in hand.
+        //
+        // This piggybacks deliberately rather than living in `store_posts`: that function has only
+        // post IDs, so building this there would mean a second interner round trip over the whole
+        // pool. Here `author_posts` is already keyed by author over the same `ap:{algo}` membership,
+        // so the set costs one pipeline.
+        //
+        // Note this includes *every* author with a post in the pool, not only "successful" ones —
+        // the set answers "does this feed carry this author at all", which is a membership question
+        // and must not inherit the `min_posts` threshold applied to success scoring below.
+        if let Err(e) = self.store_pool_authors(algo_id, &author_posts).await {
+            // Non-fatal: a missing `apa:` key makes per-feed seeding fall back to the unfaceted
+            // seed, which is the current behaviour. Failing the whole sync would be worse.
+            warn!(
+                algo_id = algo_id,
+                error = %e,
+                "Failed to store pool authors; per-feed seeding will fall back to the global seed"
+            );
         }
 
         // Calculate author success scores
@@ -963,7 +1046,7 @@ impl CandidateSync {
             // Build date-based key groups for this batch
             let key_groups: Vec<Vec<String>> = batch
                 .iter()
-                .map(|post_id| Keys::post_likers_retention(post_id, DEFAULT_RETENTION_DAYS))
+                .map(|post_id| Keys::post_likers_retention_bounded(post_id, DEFAULT_RETENTION_DAYS))
                 .collect();
 
             // Flatten all keys and fetch in parallel

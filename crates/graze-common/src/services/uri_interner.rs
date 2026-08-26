@@ -1,79 +1,64 @@
-//! URI Interning for memory-efficient storage.
+//! URI interning with date-sharded Redis storage.
 //!
-//! This module provides bidirectional mapping between URIs and integer IDs,
-//! reducing memory usage by ~80% compared to storing full URIs.
+//! New mappings live in per-day hashes with TTL aligned to like-graph retention:
+//! - `uri2id:{YYYYMMDD}` / `id2uri:{YYYYMMDD}` / `uri:counter:{YYYYMMDD}`
+//! - Post IDs: `{YYYYMMDD}{seq:010}` (see [`crate::post_id`])
 //!
-//! Redis Keys:
-//! - uri2id: HASH mapping URI -> ID
-//! - id2uri: HASH mapping ID -> URI
-//! - uri:counter: STRING for auto-incrementing IDs
+//! Legacy global `uri2id` / `id2uri` are read for lookups only; new writes use shards.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lru::LruCache;
 use parking_lot::Mutex;
 
 use crate::error::Result;
-use crate::redis::{Keys, RedisClient};
+use crate::post_id::{intern_date_from_post_id, is_legacy_numeric};
+use crate::redis::{retention_dates, ttl_for_date, Keys, RedisClient, DEFAULT_RETENTION_DAYS};
 
 /// Default size for each LRU cache.
 const DEFAULT_CACHE_SIZE: usize = 50_000;
 
-/// Lua script for atomic get-or-create ID operation.
-const GET_OR_CREATE_SCRIPT: &str = r#"
-local uri = ARGV[1]
-local existing = redis.call('HGET', KEYS[1], uri)
-if existing then
-    return existing
-end
-local new_id = redis.call('INCR', KEYS[3])
-redis.call('HSET', KEYS[1], uri, new_id)
-redis.call('HSET', KEYS[2], new_id, uri)
-return new_id
-"#;
-
-/// Lua script for atomic batch get-or-create IDs operation.
-const BATCH_GET_OR_CREATE_SCRIPT: &str = r#"
+/// Batch get-or-create within one intern date shard.
+const SHARD_BATCH_GET_OR_CREATE_SCRIPT: &str = r#"
 local uri_to_id_key = KEYS[1]
 local id_to_uri_key = KEYS[2]
 local counter_key = KEYS[3]
+local date = ARGV[1]
 local results = {}
-
-for i, uri in ipairs(ARGV) do
+for i = 2, #ARGV do
+    local uri = ARGV[i]
     local existing = redis.call('HGET', uri_to_id_key, uri)
     if existing then
-        results[i] = existing
+        results[i - 1] = existing
     else
-        local new_id = redis.call('INCR', counter_key)
-        redis.call('HSET', uri_to_id_key, uri, new_id)
-        redis.call('HSET', id_to_uri_key, new_id, uri)
-        results[i] = new_id
+        local seq = redis.call('INCR', counter_key)
+        local id = date .. string.format('%010d', seq)
+        redis.call('HSET', uri_to_id_key, uri, id)
+        redis.call('HSET', id_to_uri_key, id, uri)
+        results[i - 1] = id
     end
 end
 return results
 "#;
 
-/// Manages URI <-> ID mapping for memory efficiency.
-///
-/// Includes an in-process LRU cache layer to reduce Redis calls.
+/// Manages URI <-> post ID mapping.
 pub struct UriInterner {
     redis: Arc<RedisClient>,
-    /// Cache: URI -> ID
-    id_cache: Mutex<LruCache<String, i64>>,
-    /// Cache: ID -> URI
-    uri_cache: Mutex<LruCache<i64, String>>,
+    retention_days: u32,
+    id_cache: Mutex<LruCache<String, String>>,
+    uri_cache: Mutex<LruCache<String, String>>,
 }
 
 impl UriInterner {
-    /// Create a new URI interner with the default cache size.
     pub fn new(redis: Arc<RedisClient>) -> Self {
-        Self::with_cache_size(redis, DEFAULT_CACHE_SIZE)
+        Self::with_retention(redis, DEFAULT_RETENTION_DAYS)
     }
 
-    /// Create a new URI interner with a custom cache size.
     pub fn with_cache_size(redis: Arc<RedisClient>, cache_size: usize) -> Self {
         Self {
             redis,
+            retention_days: DEFAULT_RETENTION_DAYS,
             id_cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(cache_size).unwrap(),
             )),
@@ -83,200 +68,253 @@ impl UriInterner {
         }
     }
 
-    /// Get the integer ID for a URI, creating one if it doesn't exist.
-    ///
-    /// This is an atomic operation that ensures no duplicate IDs are assigned.
-    /// Checks in-process LRU cache first before going to Redis.
-    pub async fn get_or_create_id(&self, uri: &str) -> Result<i64> {
-        // Check in-process cache first
-        {
-            let mut cache = self.id_cache.lock();
-            if let Some(&id) = cache.get(uri) {
-                return Ok(id);
-            }
+    pub fn with_retention(redis: Arc<RedisClient>, retention_days: u32) -> Self {
+        Self {
+            redis,
+            retention_days,
+            id_cache: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
+            )),
+            uri_cache: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap(),
+            )),
         }
-
-        // Execute atomic get-or-create in Redis
-        let id: i64 = self
-            .redis
-            .eval(
-                GET_OR_CREATE_SCRIPT,
-                &[Keys::URI_TO_ID, Keys::ID_TO_URI, Keys::URI_COUNTER],
-                &[uri],
-            )
-            .await?;
-
-        // Populate both caches
-        {
-            let mut id_cache = self.id_cache.lock();
-            let mut uri_cache = self.uri_cache.lock();
-            id_cache.put(uri.to_string(), id);
-            uri_cache.put(id, uri.to_string());
-        }
-
-        Ok(id)
     }
 
-    /// Get or create IDs for multiple URIs efficiently.
-    ///
-    /// Returns a mapping of URI -> ID.
-    /// Checks in-process LRU cache first before going to Redis.
+    /// Get or create a post ID for `uri` on intern date `YYYYMMDD`.
+    pub async fn get_or_create_id(&self, uri: &str, intern_date: &str) -> Result<String> {
+        let map = self
+            .get_or_create_ids_batch(&[uri.to_string()], intern_date)
+            .await?;
+        map.get(uri)
+            .cloned()
+            .ok_or_else(|| crate::error::GrazeError::Internal("interner missing id".into()))
+    }
+
+    /// Batch intern URIs under `intern_date` (`YYYYMMDD`).
     pub async fn get_or_create_ids_batch(
         &self,
         uris: &[String],
-    ) -> Result<std::collections::HashMap<String, i64>> {
-        use std::collections::HashMap;
-
+        intern_date: &str,
+    ) -> Result<HashMap<String, String>> {
         if uris.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let mut result: HashMap<String, i64> = HashMap::with_capacity(uris.len());
-        let mut uris_to_fetch: Vec<&str> = Vec::new();
+        let mut result = HashMap::with_capacity(uris.len());
+        let mut uris_to_fetch: Vec<String> = Vec::new();
 
-        // First, check in-process cache
         {
             let mut cache = self.id_cache.lock();
             for uri in uris {
-                if let Some(&id) = cache.get(uri) {
-                    result.insert(uri.clone(), id);
+                if let Some(id) = cache.get(uri) {
+                    result.insert(uri.clone(), id.clone());
                 } else {
-                    uris_to_fetch.push(uri.as_str());
+                    uris_to_fetch.push(uri.clone());
                 }
             }
         }
 
-        if uris_to_fetch.is_empty() {
-            return Ok(result);
-        }
+        if !uris_to_fetch.is_empty() {
+            // Reuse legacy or any retention shard ID so ap:* stays aligned with ul:/pl:
+            let existing = self.get_ids_batch(&uris_to_fetch).await?;
+            let mut still_missing: Vec<String> = Vec::new();
+            {
+                let mut id_cache = self.id_cache.lock();
+                let mut uri_cache = self.uri_cache.lock();
+                for uri in uris_to_fetch {
+                    if let Some(id) = existing.get(&uri) {
+                        result.insert(uri.clone(), id.clone());
+                        id_cache.put(uri.clone(), id.clone());
+                        uri_cache.put(id.clone(), uri.clone());
+                    } else {
+                        still_missing.push(uri);
+                    }
+                }
+            }
 
-        // Execute batch get-or-create in Redis
-        let ids: Vec<i64> = self
-            .redis
-            .eval(
-                BATCH_GET_OR_CREATE_SCRIPT,
-                &[Keys::URI_TO_ID, Keys::ID_TO_URI, Keys::URI_COUNTER],
-                &uris_to_fetch,
-            )
-            .await?;
+            if still_missing.is_empty() {
+                return Ok(result);
+            }
 
-        // Populate caches and result
-        {
+            let mut eval_args: Vec<&str> = Vec::with_capacity(1 + still_missing.len());
+            eval_args.push(intern_date);
+            for u in &still_missing {
+                eval_args.push(u);
+            }
+            let uri2id_key = Keys::uri_to_id_date(intern_date);
+            let id2uri_key = Keys::id_to_uri_date(intern_date);
+            let counter_key = Keys::uri_counter_date(intern_date);
+            let ids: Vec<String> = self
+                .redis
+                .eval(
+                    SHARD_BATCH_GET_OR_CREATE_SCRIPT,
+                    &[&uri2id_key, &id2uri_key, &counter_key],
+                    &eval_args,
+                )
+                .await?;
+
+            let ttl = ttl_for_date(intern_date, self.retention_days);
+            if ttl > 0 {
+                self.redis.expire(&uri2id_key, ttl).await?;
+                self.redis.expire(&id2uri_key, ttl).await?;
+                self.redis.expire(&counter_key, ttl).await?;
+            }
+
             let mut id_cache = self.id_cache.lock();
             let mut uri_cache = self.uri_cache.lock();
-
-            for (uri, id) in uris_to_fetch.iter().zip(ids.iter()) {
-                result.insert((*uri).to_string(), *id);
-                id_cache.put((*uri).to_string(), *id);
-                uri_cache.put(*id, (*uri).to_string());
+            for (uri, id) in still_missing.iter().zip(ids.iter()) {
+                result.insert(uri.clone(), id.clone());
+                id_cache.put(uri.clone(), id.clone());
+                uri_cache.put(id.clone(), uri.clone());
             }
         }
 
         Ok(result)
     }
 
-    /// Get the ID for a URI, or None if not interned.
-    ///
-    /// Checks in-process LRU cache first before going to Redis.
-    pub async fn get_id(&self, uri: &str) -> Result<Option<i64>> {
-        // Check in-process cache first
-        {
-            let mut cache = self.id_cache.lock();
-            if let Some(&id) = cache.get(uri) {
-                return Ok(Some(id));
-            }
+    /// Intern URIs using each entry's event date (`YYYYMMDD`).
+    pub async fn get_or_create_ids_by_event_date(
+        &self,
+        uri_and_dates: &[(String, String)],
+    ) -> Result<HashMap<String, String>> {
+        if uri_and_dates.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        // Check Redis
-        let id_str = self.redis.hget(Keys::URI_TO_ID, uri).await?;
-        if let Some(s) = id_str {
-            let id: i64 = s.parse().unwrap_or(0);
-            // Populate both caches
-            {
-                let mut id_cache = self.id_cache.lock();
-                let mut uri_cache = self.uri_cache.lock();
-                id_cache.put(uri.to_string(), id);
-                uri_cache.put(id, uri.to_string());
-            }
-            Ok(Some(id))
-        } else {
-            Ok(None)
+        let mut by_date: HashMap<String, Vec<String>> = HashMap::new();
+        for (uri, date) in uri_and_dates {
+            by_date.entry(date.clone()).or_default().push(uri.clone());
         }
+
+        let mut result = HashMap::with_capacity(uri_and_dates.len());
+        for (date, mut uris) in by_date {
+            uris.sort();
+            uris.dedup();
+            let chunk = self.get_or_create_ids_batch(&uris, &date).await?;
+            result.extend(chunk);
+        }
+        Ok(result)
     }
 
-    /// Get the URI for an ID, or None if not found.
-    ///
-    /// Checks in-process LRU cache first before going to Redis.
-    pub async fn get_uri(&self, id: i64) -> Result<Option<String>> {
-        // Check in-process cache first
+    /// Look up an existing post ID for `uri` (legacy global hash, then retention shards).
+    pub async fn get_id(&self, uri: &str) -> Result<Option<String>> {
+        {
+            let mut cache = self.id_cache.lock();
+            if let Some(id) = cache.get(uri) {
+                return Ok(Some(id.clone()));
+            }
+        }
+
+        if let Some(s) = self.redis.hget(Keys::URI_TO_ID, uri).await? {
+            self.cache_pair(uri, &s);
+            return Ok(Some(s));
+        }
+
+        for date in retention_dates(self.retention_days) {
+            let key = Keys::uri_to_id_date(&date);
+            if let Some(s) = self.redis.hget(&key, uri).await? {
+                self.cache_pair(uri, &s);
+                return Ok(Some(s));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Resolve post ID to AT-URI (dated shard, then legacy global).
+    pub async fn get_uri(&self, post_id: &str) -> Result<Option<String>> {
         {
             let mut cache = self.uri_cache.lock();
-            if let Some(uri) = cache.get(&id) {
+            if let Some(uri) = cache.get(post_id) {
                 return Ok(Some(uri.clone()));
             }
         }
 
-        // Check Redis
-        let uri = self.redis.hget(Keys::ID_TO_URI, &id.to_string()).await?;
-        if let Some(ref u) = uri {
-            // Populate both caches
+        if let Some(date) = intern_date_from_post_id(post_id) {
+            if let Some(uri) = self
+                .redis
+                .hget(&Keys::id_to_uri_date(date), post_id)
+                .await?
             {
-                let mut id_cache = self.id_cache.lock();
-                let mut uri_cache = self.uri_cache.lock();
-                uri_cache.put(id, u.clone());
-                id_cache.put(u.clone(), id);
+                self.cache_pair(&uri, post_id);
+                return Ok(Some(uri));
             }
         }
-        Ok(uri)
+
+        if is_legacy_numeric(post_id) {
+            if let Some(uri) = self.redis.hget(Keys::ID_TO_URI, post_id).await? {
+                self.cache_pair(&uri, post_id);
+                return Ok(Some(uri));
+            }
+        }
+
+        Ok(None)
     }
 
-    /// Get URIs for multiple IDs efficiently.
-    ///
-    /// Returns a mapping of ID -> URI (only for found IDs).
-    pub async fn get_uris_batch(
-        &self,
-        ids: &[i64],
-    ) -> Result<std::collections::HashMap<i64, String>> {
-        use std::collections::HashMap;
-
-        if ids.is_empty() {
+    /// Batch resolve post IDs to URIs.
+    pub async fn get_uris_batch(&self, post_ids: &[String]) -> Result<HashMap<String, String>> {
+        if post_ids.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let mut result: HashMap<i64, String> = HashMap::with_capacity(ids.len());
-        let mut ids_to_fetch: Vec<i64> = Vec::new();
+        let mut result = HashMap::with_capacity(post_ids.len());
+        let mut to_fetch: Vec<String> = Vec::new();
 
-        // First, check in-process cache
         {
             let mut cache = self.uri_cache.lock();
-            for &id in ids {
-                if let Some(uri) = cache.get(&id) {
-                    result.insert(id, uri.clone());
+            for id in post_ids {
+                if let Some(uri) = cache.get(id) {
+                    result.insert(id.clone(), uri.clone());
                 } else {
-                    ids_to_fetch.push(id);
+                    to_fetch.push(id.clone());
                 }
             }
         }
 
-        if ids_to_fetch.is_empty() {
+        if to_fetch.is_empty() {
             return Ok(result);
         }
 
-        // Fetch from Redis
-        let str_ids: Vec<String> = ids_to_fetch.iter().map(|id| id.to_string()).collect();
-        let str_refs: Vec<&str> = str_ids.iter().map(|s| s.as_str()).collect();
-        let uris = self.redis.hmget(Keys::ID_TO_URI, &str_refs).await?;
+        let mut legacy_ids: Vec<&str> = Vec::new();
+        let mut by_date: HashMap<String, Vec<String>> = HashMap::new();
 
-        // Populate caches and result
-        {
+        for id in &to_fetch {
+            if let Some(date) = intern_date_from_post_id(id) {
+                by_date
+                    .entry(date.to_string())
+                    .or_default()
+                    .push(id.clone());
+            } else if is_legacy_numeric(id) {
+                legacy_ids.push(id.as_str());
+            }
+        }
+
+        if !legacy_ids.is_empty() {
+            let refs: Vec<&str> = legacy_ids.to_vec();
+            let uris = self.redis.hmget(Keys::ID_TO_URI, &refs).await?;
             let mut id_cache = self.id_cache.lock();
             let mut uri_cache = self.uri_cache.lock();
-
-            for (id, uri_opt) in ids_to_fetch.iter().zip(uris.iter()) {
+            for (id, uri_opt) in legacy_ids.iter().zip(uris.iter()) {
                 if let Some(uri) = uri_opt {
-                    result.insert(*id, uri.clone());
-                    uri_cache.put(*id, uri.clone());
-                    id_cache.put(uri.clone(), *id);
+                    result.insert((*id).to_string(), uri.clone());
+                    uri_cache.put((*id).to_string(), uri.clone());
+                    id_cache.put(uri.clone(), (*id).to_string());
+                }
+            }
+        }
+
+        for (date, ids) in by_date {
+            let key = Keys::id_to_uri_date(&date);
+            let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+            let uris = self.redis.hmget(&key, &refs).await?;
+            let mut id_cache = self.id_cache.lock();
+            let mut uri_cache = self.uri_cache.lock();
+            for (id, uri_opt) in ids.iter().zip(uris.iter()) {
+                if let Some(uri) = uri_opt {
+                    result.insert(id.clone(), uri.clone());
+                    uri_cache.put(id.clone(), uri.clone());
+                    id_cache.put(uri.clone(), id.clone());
                 }
             }
         }
@@ -284,108 +322,73 @@ impl UriInterner {
         Ok(result)
     }
 
-    /// Get IDs for multiple URIs (only existing ones).
-    ///
-    /// Returns a mapping of URI -> ID (only for found URIs).
-    pub async fn get_ids_batch(
-        &self,
-        uris: &[String],
-    ) -> Result<std::collections::HashMap<String, i64>> {
-        use std::collections::HashMap;
-
+    /// Batch lookup URI -> post ID without creating entries.
+    pub async fn get_ids_batch(&self, uris: &[String]) -> Result<HashMap<String, String>> {
         if uris.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let mut result: HashMap<String, i64> = HashMap::with_capacity(uris.len());
-        let mut uris_to_fetch: Vec<&str> = Vec::new();
+        let mut result = HashMap::with_capacity(uris.len());
+        let mut to_fetch: Vec<String> = Vec::new();
 
-        // First, check in-process cache
         {
             let mut cache = self.id_cache.lock();
             for uri in uris {
-                if let Some(&id) = cache.get(uri) {
-                    result.insert(uri.clone(), id);
+                if let Some(id) = cache.get(uri) {
+                    result.insert(uri.clone(), id.clone());
                 } else {
-                    uris_to_fetch.push(uri.as_str());
+                    to_fetch.push(uri.clone());
                 }
             }
         }
 
-        if uris_to_fetch.is_empty() {
-            return Ok(result);
-        }
-
-        // Fetch from Redis
-        let ids = self.redis.hmget(Keys::URI_TO_ID, &uris_to_fetch).await?;
-
-        // Populate caches and result
-        {
-            let mut id_cache = self.id_cache.lock();
-            let mut uri_cache = self.uri_cache.lock();
-
-            for (uri, id_opt) in uris_to_fetch.iter().zip(ids.iter()) {
-                if let Some(id_str) = id_opt {
-                    let id: i64 = id_str.parse().unwrap_or(0);
-                    result.insert((*uri).to_string(), id);
-                    id_cache.put((*uri).to_string(), id);
-                    uri_cache.put(id, (*uri).to_string());
-                }
+        for uri in to_fetch {
+            if let Some(id) = self.get_id(&uri).await? {
+                result.insert(uri, id);
             }
         }
 
         Ok(result)
     }
 
-    /// Get the number of URIs in the interning table.
+    /// Total entries in legacy + visible date shards (approximate; for metrics).
     pub async fn get_table_size(&self) -> Result<usize> {
-        self.redis.hlen(Keys::URI_TO_ID).await
+        let mut total = self.redis.hlen(Keys::URI_TO_ID).await?;
+        for date in retention_dates(self.retention_days) {
+            total += self.redis.hlen(&Keys::uri_to_id_date(&date)).await?;
+        }
+        Ok(total)
     }
 
-    /// Get current cache sizes for monitoring.
     pub fn cache_sizes(&self) -> (usize, usize) {
         let id_cache = self.id_cache.lock();
         let uri_cache = self.uri_cache.lock();
         (id_cache.len(), uri_cache.len())
+    }
+
+    fn cache_pair(&self, uri: &str, post_id: &str) {
+        let mut id_cache = self.id_cache.lock();
+        let mut uri_cache = self.uri_cache.lock();
+        id_cache.put(uri.to_string(), post_id.to_string());
+        uri_cache.put(post_id.to_string(), uri.to_string());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::post_id::{format_post_id, is_dated};
 
     #[test]
-    fn test_script_syntax() {
-        // Basic syntax check - ensure scripts compile
-        assert!(GET_OR_CREATE_SCRIPT.contains("HGET"));
-        assert!(BATCH_GET_OR_CREATE_SCRIPT.contains("INCR"));
+    fn shard_script_references_keys() {
+        assert!(SHARD_BATCH_GET_OR_CREATE_SCRIPT.contains("uri_to_id_key"));
+        assert!(SHARD_BATCH_GET_OR_CREATE_SCRIPT.contains("%010d"));
     }
 
     #[test]
-    fn test_get_or_create_script_content() {
-        // Verify script structure
-        assert!(GET_OR_CREATE_SCRIPT.contains("KEYS[1]")); // uri_to_id
-        assert!(GET_OR_CREATE_SCRIPT.contains("KEYS[2]")); // id_to_uri
-        assert!(GET_OR_CREATE_SCRIPT.contains("KEYS[3]")); // counter
-        assert!(GET_OR_CREATE_SCRIPT.contains("ARGV[1]")); // uri
-    }
-
-    #[test]
-    fn test_batch_script_content() {
-        // Verify batch script structure
-        assert!(BATCH_GET_OR_CREATE_SCRIPT.contains("for i, uri in ipairs(ARGV)"));
-        assert!(BATCH_GET_OR_CREATE_SCRIPT.contains("results[i]"));
-    }
-
-    #[test]
-    fn test_default_cache_size() {
-        assert_eq!(DEFAULT_CACHE_SIZE, 50_000);
-    }
-
-    #[test]
-    fn test_keys_constants() {
-        assert_eq!(Keys::URI_TO_ID, "uri2id");
-        assert_eq!(Keys::ID_TO_URI, "id2uri");
-        assert_eq!(Keys::URI_COUNTER, "uri:counter");
+    fn dated_id_format_in_script_matches_rust() {
+        let id = format_post_id("20260513", 7);
+        assert_eq!(id.len(), crate::post_id::DATED_ID_LEN);
+        assert!(is_dated(&id));
     }
 }

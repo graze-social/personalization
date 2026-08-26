@@ -118,6 +118,23 @@ impl RedisClient {
         Ok(exists)
     }
 
+    /// Return true if **any** of the given keys exists, in a single pipeline.
+    ///
+    /// Used to decide whether a user has usable like-seed anywhere in the retention window.
+    /// One round trip regardless of window size, so widening the window is nearly free.
+    pub async fn exists_any(&self, keys: &[String]) -> Result<bool> {
+        if keys.is_empty() {
+            return Ok(false);
+        }
+        let mut conn = self.get().await?;
+        let mut pipe = redis::pipe();
+        for key in keys {
+            pipe.exists(key.as_str());
+        }
+        let flags: Vec<bool> = pipe.query_async(&mut conn).await?;
+        Ok(flags.into_iter().any(|f| f))
+    }
+
     /// Delete a key.
     pub async fn del(&self, key: &str) -> Result<()> {
         let mut conn = self.get().await?;
@@ -144,6 +161,55 @@ impl RedisClient {
         let mut conn = self.get().await?;
         let _: () = conn.set_ex(key, value, seconds).await?;
         Ok(())
+    }
+
+    /// Set multiple keys to binary values with a TTL, in a single pipeline.
+    ///
+    /// Used for durable co-liker profiles (`ucl:`), whose packed wire format is not valid
+    /// UTF-8 and so cannot go through [`Self::set_ex`].
+    pub async fn set_ex_bytes_multi(
+        &self,
+        items: &[(String, Vec<u8>)],
+        seconds: u64,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.get().await?;
+        let mut pipe = redis::pipe();
+        for (key, value) in items {
+            pipe.set_ex(key.as_str(), value.as_slice(), seconds);
+        }
+        let _: Vec<()> = pipe.query_async(&mut conn).await?;
+        Ok(())
+    }
+
+    /// Apply float increments to hash fields in one pipeline.
+    ///
+    /// Used to merge Thompson bandit evidence across replicas: each pod pushes only its own
+    /// *deltas*, so concurrent writers accumulate instead of clobbering each other the way a
+    /// read-modify-write of absolute alpha/beta would.
+    pub async fn hincrbyfloat_multi(&self, key: &str, items: &[(String, f64)]) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.get().await?;
+        let mut pipe = redis::pipe();
+        for (field, delta) in items {
+            pipe.cmd("HINCRBYFLOAT")
+                .arg(key)
+                .arg(field.as_str())
+                .arg(*delta);
+        }
+        let _: Vec<f64> = pipe.query_async(&mut conn).await?;
+        Ok(())
+    }
+
+    /// Get a binary value.
+    pub async fn get_bytes(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        let mut conn = self.get().await?;
+        let value: Option<Vec<u8>> = conn.get(key).await?;
+        Ok(value)
     }
 
     /// Get a string value.
@@ -642,6 +708,29 @@ impl RedisClient {
         let mut conn = self.get().await?;
         let is_member: bool = conn.sismember(key, member).await?;
         Ok(is_member)
+    }
+
+    /// Check many members of one set in a single round trip.
+    ///
+    /// Uses `SMISMEMBER` (Redis 6.2+, and Valkey throughout), which answers the whole batch in one
+    /// command. The alternative — one `SISMEMBER` per member — would put a round trip on the serving
+    /// path for every seed post, which is precisely the cost that made the inverted-lookup
+    /// experiment 5x slower than the path it replaced.
+    ///
+    /// Returns a vector parallel to `members`. An empty `members` yields an empty vector without
+    /// touching Redis.
+    pub async fn sismember_multi(&self, key: &str, members: &[String]) -> Result<Vec<bool>> {
+        if members.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.get().await?;
+        let mut cmd = redis::cmd("SMISMEMBER");
+        cmd.arg(key);
+        for m in members {
+            cmd.arg(m);
+        }
+        let flags: Vec<i64> = cmd.query_async(&mut conn).await?;
+        Ok(flags.into_iter().map(|f| f == 1).collect())
     }
 
     /// Get all members of a set.

@@ -2,7 +2,10 @@
 //!
 //! All configuration is loaded from environment variables.
 
-use graze_common::RedisConfig;
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use graze_common::{exclusion_set_from_env_opt, RedisConfig};
 
 /// Application settings loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -61,6 +64,11 @@ pub struct Config {
     // Metrics Configuration
     // ═══════════════════════════════════════════════════════════════════════════════
     pub metrics_port: u16,
+
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Privacy / opt-out (EXCLUSION_LIST)
+    // ═══════════════════════════════════════════════════════════════════════════════
+    pub exclusion_dids: Arc<HashSet<String>>,
 }
 
 impl Config {
@@ -82,7 +90,7 @@ impl Config {
             jetstream_stale_timeout_seconds: parse_u64_env("JETSTREAM_STALE_TIMEOUT_SECONDS", 60),
 
             // Like Graph
-            like_ttl_days: parse_u32_env("LIKE_TTL_DAYS", 8),
+            like_ttl_days: parse_u32_env("LIKE_TTL_DAYS", 6),
             like_batch_size: parse_usize_env("LIKE_BATCH_SIZE", 5000),
             like_batch_interval_ms: parse_u64_env("LIKE_BATCH_INTERVAL_MS", 5000),
             like_ttl_refresh_interval_seconds: parse_u64_env(
@@ -111,6 +119,9 @@ impl Config {
 
             // Metrics
             metrics_port: parse_u16_env("METRICS_PORT", 0),
+
+            // Privacy: comma/newline-separated DIDs to skip for like ingestion
+            exclusion_dids: exclusion_set_from_env_opt(std::env::var("EXCLUSION_LIST").ok()),
         }
     }
 

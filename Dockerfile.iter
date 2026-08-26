@@ -1,0 +1,58 @@
+# syntax=docker/dockerfile:1.4
+#
+# Iteration Dockerfile — builds ONLY the crates needed by `personalization-api` and
+# `personalization-candidate-sync`.
+#
+# Why this exists: the main Dockerfile builds five crates with full LTO
+# (`lto = true`, `codegen-units = 1`). Under QEMU on an arm64 host that takes ~76 minutes and
+# filled the Docker VM's 40 GB disk mid-build ("No space left on device" while compiling
+# `sqlx-postgres`, pulled in by `graze-feed-stats` — unrelated in-progress work).
+#
+# This variant drops `graze-like-streamer`, `graze-frontdoor`, and `graze-feed-stats`, so the
+# resulting image is ONLY valid for the api and candidate-sync deployments. The like-streamer
+# deployment must keep using an image built from the main Dockerfile.
+#
+# Use the main Dockerfile for anything shipping to all three deployments.
+
+FROM --platform=linux/amd64 rust:1.93-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    git \
+    openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock* ./
+COPY crates ./crates
+COPY docs ./docs
+
+ARG GIT_HASH=0
+ENV GIT_HASH=$GIT_HASH
+
+RUN --mount=type=ssh \
+    mkdir -p /root/.ssh && \
+    ssh-keyscan github.com >> /root/.ssh/known_hosts && \
+    cargo build --release \
+    -p graze-api \
+    -p graze-candidate-sync
+
+FROM --platform=linux/amd64 gcr.io/distroless/cc-debian12
+
+WORKDIR /app
+
+COPY --from=builder /app/target/release/graze-api /app/graze-api
+COPY --from=builder /app/target/release/graze-candidate-sync /app/graze-candidate-sync
+COPY --from=builder /app/target/release/graze-build-coliker-profiles /app/graze-build-coliker-profiles
+
+COPY lua ./lua
+
+ENV HTTP_HOST=0.0.0.0
+ENV HTTP_PORT=8080
+ENV RUST_LOG=info
+ENV RUST_BACKTRACE=full
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/graze-api"]

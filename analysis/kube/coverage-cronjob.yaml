@@ -1,0 +1,197 @@
+# Coverage decomposition — why personalization did not happen, per cause, daily.
+#
+# Exists because `fallback_reason` was only ever a log line until 2026-08-26, so the question "why
+# is this user not being personalized" could only be answered by scraping a few hours of pod logs.
+# A 6-hour scrape put `no_user_data` at 73% of non-personalized responses; this repo has been burned
+# more than once by single-window traffic mix (the density histogram predicted a 53% skip rate and
+# measured 45%, and the dominant low-density feed changed identity between windows), so the figure
+# needs a full diurnal cycle. Hence: a rolling 24-hour window, run daily.
+#
+# Deliberately a CronJob rather than a one-shot. The number is worth watching, not sampling once —
+# it is the denominator of every experiment's noise, since a user the engine cannot serve sits in
+# the treatment arm contributing variance and no signal. Measured 2026-08-25: 52% of the holdout's
+# treatment arm received zero personalized impressions.
+#
+# Runs at 01:15 UTC so it lands after a full cycle has closed, and off the :00 mark.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: personalization-coverage-src
+  namespace: default
+data:
+  coverage.py: |
+    """Decompose non-personalization by cause over a rolling 24h window.
+
+    Reads `fallback_reason` out of the base64 provenance blob. The field is absent when a response
+    WAS personalized, which is what makes "personalized" and "not personalized, because X" a clean
+    partition rather than two overlapping filters.
+    """
+    import os
+    import clickhouse_connect
+
+    DEC = "tryBase64Decode(interaction_feed_context)"
+    # Classify POSITIVELY. The first version of this script inferred "personalized" from the ABSENCE
+    # of fallback_reason, which silently counted every row written before the 2026-08-26 build -- all
+    # of which lack the field -- as personalized. It reported 11.6% of users unserved against 52%
+    # measured directly the day before, and its hourly series showed the deploy boundary while
+    # claiming to show diurnal drift. Same trap as "an absent JSON field extracts as false", one
+    # level up, and the reason the UNLABELLED bucket below is printed rather than absorbed.
+    #
+    # `personalized_count` is per-response and has been present since long before this change, so it
+    # is a positive signal: >0 means the response really was personalized.
+    CAUSE = (
+        f"multiIf("
+        f"JSONExtractInt({DEC},'personalized_count') > 0, 'PERSONALIZED', "
+        f"JSONHas({DEC},'fallback_reason'), JSONExtractString({DEC},'fallback_reason'), "
+        f"'UNLABELLED (pre-instrumentation)')"
+    )
+    # Restrict to our own traffic. feed_interactions is shared with other Graze services whose
+    # provenance is only {"feed_uri": ...} -- 457k rows in 6 hours against ~4.5k of ours -- and an
+    # absent JSON field extracts as false, so without this they land in whichever bucket tests false.
+    POP = f"JSONHas({DEC}, 'algo_id')"
+    WINDOW = "occurred >= now() - INTERVAL 24 HOUR"
+    SEEN = "app.bsky.feed.defs#interactionSeen"
+
+    c = clickhouse_connect.get_client(
+        host=os.environ["CLICKHOUSE_HOST"],
+        port=int(os.environ.get("CLICKHOUSE_PORT", "8443")),
+        username=os.environ.get("CLICKHOUSE_USER", "default"),
+        password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
+        database="default",
+        secure=True,
+    )
+
+    def q(sql):
+        return c.query(sql).result_rows
+
+    print("=== personalization coverage, rolling 24h ===\n")
+
+    rows = q(f"""
+      SELECT {CAUSE} AS cause,
+        count() AS impressions, uniqExact(did) AS users
+      FROM default.feed_interactions
+      WHERE {WINDOW} AND interaction_feed_context != '' AND ({POP})
+        AND interaction_event = '{SEEN}'
+      GROUP BY cause ORDER BY impressions DESC
+    """)
+    total = sum(r[1] for r in rows) or 1
+    print(f"  {'cause':<26}{'impressions':>13}{'share':>9}{'users':>9}")
+    for cause, imp, users in rows:
+        print(f"  {cause:<26}{imp:>13,}{imp/total*100:>8.1f}%{users:>9,}")
+
+    # Share of the ADDRESSABLE failures. The holdout is suppressed on purpose and no_auth cannot be
+    # personalized at all, so leaving them in understates every real cause.
+    UNLABELLED = 'UNLABELLED (pre-instrumentation)'
+    unlabelled = sum(r[1] for r in rows if r[0] == UNLABELLED)
+    if unlabelled:
+        print(f"\n  !! {unlabelled:,} impressions ({unlabelled/total*100:.1f}%) are UNLABELLED --")
+        print("     served by a build predating fallback_reason (2026-08-26). Until this reaches ~0")
+        print("     the shares below understate every cause. Do not quote them as final.")
+    addressable = [r for r in rows
+                   if r[0] not in ('PERSONALIZED', 'personalization_holdout', 'no_auth', UNLABELLED)]
+    addr_total = sum(r[1] for r in addressable) or 1
+    print("\n  --- share of ADDRESSABLE non-personalization ---")
+    print("      (excludes PERSONALIZED, the intentional holdout, and no_auth)")
+    for cause, imp, _ in addressable:
+        print(f"  {cause:<26}{imp/addr_total*100:>8.1f}%")
+
+    # Per-USER, because per-impression is biased: zero-seed users paginate at a ~1s cadence against
+    # ~60s for seeded users, so they are ~23% of people but ~50% of requests.
+    print("\n=== per-user view (per-impression is pagination-biased) ===")
+    rows = q(f"""
+      WITH u AS (
+        SELECT did,
+               countIf(JSONExtractInt({DEC},'personalized_count') > 0) AS pers,
+               countIf({CAUSE} != 'UNLABELLED (pre-instrumentation)') AS tot
+        FROM default.feed_interactions
+        WHERE {WINDOW} AND interaction_feed_context != '' AND ({POP})
+          AND interaction_event = '{SEEN}'
+        GROUP BY did
+        HAVING tot > 0)
+      SELECT countIf(pers=0) AS zero_pers, countIf(pers>0) AS some_pers,
+             round(avg(pers/tot)*100,2) AS mean_pct
+      FROM u
+    """)
+    z, s, m = rows[0]
+    print(f"  users with ZERO personalized impressions : {z:,}")
+    print(f"  users with >0                            : {s:,}")
+    if z + s:
+        print(f"  => {z/(z+s)*100:.1f}% of users the engine did not serve at all")
+    print(f"  mean share of a user's impressions personalized: {m}%")
+
+    # Diurnal stability. This is the whole reason the window is 24h: if a cause's share swings by
+    # hour, any single-window figure (including the 73% from a 6-hour log scrape) is a sample of the
+    # traffic mix, not a property of the system.
+    print("\n=== hourly share of the top addressable cause (drift check) ===")
+    if addressable:
+        top = addressable[0][0]
+        rows = q(f"""
+          SELECT toStartOfHour(occurred) AS h,
+                 countIf(JSONExtractString({DEC},'fallback_reason') = '{top}') AS c,
+                 countIf({CAUSE} != 'UNLABELLED (pre-instrumentation)') AS n,
+                 count() AS n_all
+          FROM default.feed_interactions
+          WHERE {WINDOW} AND interaction_feed_context != '' AND ({POP})
+            AND interaction_event = '{SEEN}'
+          GROUP BY h HAVING n > 0 ORDER BY h
+        """)
+        # An hour is only comparable if nearly all of it carries the field. A partly-instrumented
+        # hour puts old PERSONALIZED rows in the denominator while its non-personalized rows are
+        # unlabelled, which pins it near 0% and would read as a real diurnal trough.
+        shares, skipped = [], 0
+        for h, cc, n, n_all in rows:
+            if n_all == 0 or n / n_all < 0.9:
+                skipped += 1
+                continue
+            pct = cc / n * 100
+            shares.append(pct)
+            print(f"  {h}  {top}: {pct:5.1f}%  (n={n:,})")
+        if skipped:
+            print(f"  [{skipped} hour(s) skipped: under 90% instrumented, not comparable]")
+        if len(shares) >= 2:
+            lo, hi = min(shares), max(shares)
+            print(f"\n  range across the cycle: {lo:.1f}% .. {hi:.1f}%  (spread {hi-lo:.1f}pp)")
+            print("  A wide spread means single-window figures are not comparable to each other.")
+    else:
+        print("  no addressable causes in window")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: personalization-coverage
+  namespace: default
+spec:
+  schedule: "15 1 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: dockerhub-secret
+          volumes:
+            - name: src
+              configMap:
+                name: personalization-coverage-src
+          containers:
+            - name: coverage
+              image: dgaff/graze-analysis@sha256:eae619d9a5917f394e41a77415a5b1285164b9fe1bc9d7089aa3041c738e9c54
+              command: ["python", "/src/coverage.py"]
+              volumeMounts:
+                - name: src
+                  mountPath: /src
+              # Same ordering as personalization-api and the analysis CronJob: both app-secrets and
+              # personalization-secrets define REDIS_URL and the later entry wins, so this reads the
+              # same backing stores the service does.
+              envFrom:
+                - configMapRef:
+                    name: personalization-env
+                - secretRef:
+                    name: app-secrets
+                - secretRef:
+                    name: personalization-secrets

@@ -112,3 +112,88 @@ def test_interleaving_detects_a_real_preference():
 
     readout = run(spec, R())
     assert "TREATMENT WINS" in readout.verdict, readout.render()
+
+
+class GuardrailReader:
+    """Routes by numerator event: the guardrail query asks for a different one.
+
+    Mirrors FakeReader but distinguishes a third query shape, so a test can give the guardrail
+    metric a different effect from the primary one.
+    """
+
+    def __init__(self, primary, control, guardrail):
+        self._primary = primary
+        self._control = control
+        self._guardrail = guardrail
+
+    def query(self, sql):
+        if "requestLess" in sql:
+            return self._guardrail
+        if "source = 'fallback'" not in sql:
+            return self._primary
+        return self._control
+
+
+def _guardrail_spec(**over):
+    return _spec(guardrails=[{"metric": "request_less_rate", "max": 0.0}], **over)
+
+
+def test_guardrail_breach_is_reported_but_does_not_withhold_the_result():
+    """A guardrail is not a negative control.
+
+    A negative control that moves means the experiment is broken, so the result is withheld. A
+    guardrail that moves means the change had a real cost — the result must still be shown, or the
+    reader cannot weigh the trade the guardrail exists to expose.
+    """
+    primary = _rows(150, 1, 20, 10000) + _rows(150, 6, 20, 250)
+    control = _rows(150, 1, 20, 10000) + _rows(150, 1, 20, 250)
+    # Treatment produces far more "show me less" — a genuine regression.
+    guardrail = _rows(150, 0, 20, 10000) + _rows(150, 5, 20, 250)
+
+    readout = analyse_ab(_guardrail_spec(), GuardrailReader(primary, control, guardrail))
+    joined = "\n".join(readout.lines)
+
+    assert "WITHHELD" not in readout.verdict, readout.render()
+    assert "guardrail request_less_rate" in joined, joined
+    assert "BREACH" in joined, joined
+    # The primary effect is still reported alongside it.
+    assert any("primary" in line for line in readout.lines), joined
+
+
+def test_quiet_guardrail_reports_its_event_count_so_it_is_not_read_as_safety():
+    """An underpowered guardrail must not read as evidence of safety.
+
+    requestLess is rare — 221 events across the holdout's first 11 days — so "ok" here usually
+    means "no power", exactly the trap the negative-control write-up hit when p=0.0555 on 3 likes
+    was described as 'nearly moved'.
+    """
+    primary = _rows(150, 1, 20, 10000) + _rows(150, 3, 20, 250)
+    control = _rows(150, 1, 20, 10000) + _rows(150, 1, 20, 250)
+    guardrail = _rows(150, 0, 20, 10000) + _rows(150, 0, 20, 250)
+
+    readout = analyse_ab(_guardrail_spec(), GuardrailReader(primary, control, guardrail))
+    joined = "\n".join(readout.lines)
+
+    assert "BREACH" not in joined, joined
+    assert "n=0 request_less_rate events" in joined, joined
+    assert "weak evidence" in joined, joined
+
+
+def test_unknown_guardrail_metric_is_skipped_loudly_not_silently():
+    """A typo'd metric name must not look like a passing guardrail."""
+    primary = _rows(150, 1, 20, 10000) + _rows(150, 3, 20, 250)
+    control = _rows(150, 1, 20, 10000) + _rows(150, 1, 20, 250)
+    spec = _spec(guardrails=[{"metric": "clickthrough_rate", "max": 0.0}])
+
+    readout = analyse_ab(spec, GuardrailReader(primary, control, []))
+    joined = "\n".join(readout.lines)
+
+    assert "SKIPPED" in joined, joined
+    assert "unknown metric" in joined, joined
+
+
+def test_spec_without_guardrails_prints_none():
+    primary = _rows(150, 1, 20, 10000) + _rows(150, 3, 20, 250)
+    control = _rows(150, 1, 20, 10000) + _rows(150, 1, 20, 250)
+    readout = analyse_ab(_spec(), FakeReader(primary, control))
+    assert "guardrail" not in "\n".join(readout.lines)

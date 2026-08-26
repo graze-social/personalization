@@ -48,6 +48,25 @@ negative_controls:
       most likely a traffic or client mix imbalance — and the primary reading is not attributable.
     where: "source IN ('pinned', 'rotating')"
 
+# Relevance guardrail, distinct from the negative control above.
+#
+# The primary metric is like_rate, which is pure engagement. Optimising engagement alone selects for
+# engagement-bait — the standard way a recommender gets worse while its headline number improves —
+# and the remit is content that is relevant, not merely clickable. `requestLess` is the only direct
+# relevance signal the client sends: an explicit "show me less of this" rather than a proxy. If
+# personalization raises it, the engine is producing content people actively do not want, and that
+# is worth seeing next to any like-rate win rather than discovered later.
+#
+# Direction: `control` is the HOLDOUT, so diff = personalized - suppressed. A positive diff means
+# personalization produced MORE "show me less", hence max: 0.0.
+#
+# This guardrail is underpowered and is expected to stay quiet — 221 requestLess events across the
+# first 11 days. The readout prints its event count for exactly that reason. A quiet guardrail here
+# is not evidence of safety.
+guardrails:
+  - metric: request_less_rate
+    max: 0.0
+
 cuped_covariate: pre_period_like_rate
 
 population: "JSONHas(tryBase64Decode(interaction_feed_context), 'algo_id')"

@@ -21,7 +21,7 @@ pub struct LinkLonkParams {
     pub min_co_likes: usize,         // Minimum shared likes to be considered a source
 
     // Time windowing
-    pub time_window_hours: f64, // 7 days default: sample user likes from this window (up to max_user_likes)
+    pub time_window_hours: f64, // 6 days default: sample user likes from this window (up to max_user_likes)
     pub recency_half_life_hours: f64, // 1 day default (aggressive decay for fresh content)
 
     // Scoring adjustments
@@ -61,7 +61,7 @@ impl Default for LinkLonkParams {
             max_sources_per_post: 500, // Increased from 100 to capture more co-likers
             max_total_sources: 10000,  // Curator search space: at least 10k (main For You–style)
             min_co_likes: 1,
-            time_window_hours: 168.0, // 7 days
+            time_window_hours: 144.0, // 6 days
             recency_half_life_hours: 24.0,
             specificity_power: 1.0,
             popularity_power: 1.0,
@@ -225,7 +225,7 @@ mod tests {
     fn test_default_params() {
         let params = LinkLonkParams::default();
         assert_eq!(params.max_user_likes, 500);
-        assert_eq!(params.time_window_hours, 168.0);
+        assert_eq!(params.time_window_hours, 144.0);
         assert_eq!(params.result_ttl_seconds, 300);
     }
 
@@ -256,7 +256,7 @@ mod tests {
         let args = params.to_lua_args(1000000.0, true, false);
         assert_eq!(args.len(), 17);
         assert_eq!(args[0], "500"); // max_user_likes
-        assert_eq!(args[4], "604800"); // time_window_seconds (7 * 24 * 3600)
+        assert_eq!(args[4], "518400"); // time_window_seconds (6 * 24 * 3600)
         assert_eq!(args[11], "1"); // use_precomputed_colikes
         assert_eq!(args[13], "0"); // use_algo_likers
         assert_eq!(args[14], "0.3"); // num_paths_power

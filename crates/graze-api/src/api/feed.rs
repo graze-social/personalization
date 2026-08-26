@@ -31,7 +31,7 @@ use graze_common::models::{
     ProvenanceParams, SkeletonFeedPost, ThompsonSearchSpace,
 };
 use graze_common::services::special_posts::SpecialPostsResponse;
-use graze_common::{hash_did, Keys};
+use graze_common::{hash_did, is_excluded_post_uri, Keys};
 
 /// Placeholder posts for edge cases when feed cannot be served
 const PLACEHOLDER_ERROR: &str =
@@ -97,6 +97,16 @@ struct ResponseThompsonMeta {
     is_holdout: bool,
 }
 
+/// Build the randomized-experiment descriptor from config.
+fn graze_api_hash_experiment(config: &crate::config::Config) -> crate::algorithm::HashExperiment {
+    crate::algorithm::HashExperiment {
+        dimension: config.ab_experiment_dimension.clone(),
+        values: config.ab_experiment_values.clone(),
+        traffic_pct: config.ab_experiment_traffic_pct,
+        salt: config.ab_experiment_salt.clone(),
+    }
+}
+
 /// Build feedContext provenance for one item and encode to base64 string.
 /// feed_uri must always be provided—the client echoes this back with interactions
 /// and we rely on it for ClickHouse storage.
@@ -110,6 +120,11 @@ fn encode_feed_context(
     prov: &ItemProvenance,
     thompson_meta: Option<&ResponseThompsonMeta>,
     is_personalization_holdout: Option<bool>,
+    // Which ranker produced this item, when interleaving is active.
+    ranker: Option<String>,
+    // Why this response was not personalized, when it was not. Carried into provenance so coverage
+    // failures are decomposable in ClickHouse instead of only in log lines.
+    fallback_reason: Option<String>,
 ) -> Option<String> {
     let (source, personalization_type, fallback_tranche, attribution, personalized) = match prov {
         ItemProvenance::Base(BlendedSource::PostLevelPersonalization) => (
@@ -177,6 +192,8 @@ fn encode_feed_context(
         response_time_ms,
         is_holdout,
         is_personalization_holdout,
+        ranker,
+        fallback_reason,
     };
     ctx.encode()
 }
@@ -241,6 +258,94 @@ fn compact_to_uri(compact: &str) -> String {
         format!("at://{}/app.bsky.feed.post/{}", did, rkey)
     } else {
         compact.to_string()
+    }
+}
+
+/// Encode a `BlendedSource` as a short tag for the `fsc:` cache.
+///
+/// The cache previously stored bare URIs, so every item read back from it was relabelled
+/// `PostLevelPersonalization` — meaning pages 2+ have always mis-attributed fallback and
+/// author-affinity items. Storing the source alongside the URI fixes that, and is a
+/// prerequisite for any per-item experiment attribution (which would otherwise be silently
+/// wrong on every page after the first).
+///
+/// Deliberately extensible: the tag is an opaque string, so an experiment arm can later be
+/// appended (e.g. `p/walk`) without another cache format change.
+fn source_to_tag(source: &BlendedSource) -> String {
+    match source {
+        BlendedSource::PostLevelPersonalization => "p".to_string(),
+        BlendedSource::AuthorAffinity => "a".to_string(),
+        BlendedSource::Fallback { tranche } => format!("f:{}", tranche),
+    }
+}
+
+/// Inverse of [`source_to_tag`].
+fn tag_to_source(tag: &str) -> BlendedSource {
+    match tag {
+        "a" => BlendedSource::AuthorAffinity,
+        t if t.starts_with("f:") => BlendedSource::Fallback {
+            tranche: t[2..].to_string(),
+        },
+        // "p", plus anything unrecognised (e.g. a tag written by a newer build).
+        _ => BlendedSource::PostLevelPersonalization,
+    }
+}
+
+/// Separator between the source tag and the compact URI. Cannot occur in a DID or an rkey,
+/// which is what makes the legacy (untagged) format unambiguously detectable.
+const CACHE_TAG_SEP: char = '|';
+
+/// Encode `(uri, source)` for the `fsc:` cache.
+/// Whether this user is in the personalization holdout.
+///
+/// Stable per user: the same DID always lands in the same arm for a given rate and salt, which is what
+/// makes a user-level readout meaningful. Changing the *rate* does move the boundary, so a rate change
+/// mid-experiment starts a new experiment — record a fresh `start` in the spec when you change it.
+fn is_personalization_holdout_user(user_did: &str, salt: &str, rate: f64) -> bool {
+    if rate <= 0.0 {
+        return false;
+    }
+    if rate >= 1.0 {
+        return true;
+    }
+    let h = graze_common::hash_did(&format!("{}|{}", salt, user_did));
+    // 16 hex chars of SHA-256. Take a wide slice and map to [0,1) so the comparison is against the
+    // configured rate directly rather than a coarse bucket count.
+    let v = u64::from_str_radix(&h[..15], 16).unwrap_or(0);
+    (v as f64 / 0xFFF_FFFF_FFFF_FFFF_u64 as f64) < rate
+}
+
+fn tagged_to_compact(uri: &str, source: &BlendedSource, ranker: Option<&str>) -> String {
+    let tag = match ranker {
+        Some(r) => format!("{}/{}", source_to_tag(source), r),
+        None => source_to_tag(source),
+    };
+    format!("{}{}{}", tag, CACHE_TAG_SEP, uri_to_compact(uri))
+}
+
+/// Decode a `fsc:` cache entry into `(uri, source)`.
+///
+/// Entries written before this format existed have no separator; they are treated as
+/// `PostLevelPersonalization`, which preserves the previous behaviour exactly rather than
+/// dropping in-flight caches on deploy.
+fn compact_to_tagged(entry: &str) -> (String, BlendedSource, Option<String>) {
+    // Split from the RIGHT: the compact URI half (DID + rkey, both base32) can never contain
+    // the separator, whereas a tranche name theoretically could. Splitting from the left would
+    // let a stray separator in the tag corrupt the URI.
+    match entry.rsplit_once(CACHE_TAG_SEP) {
+        Some((tag, compact)) => {
+            // A `/` in the tag separates the source from the interleaving ranker.
+            let (src_tag, ranker) = match tag.split_once('/') {
+                Some((s, r)) if !r.is_empty() => (s, Some(r.to_string())),
+                _ => (tag, None),
+            };
+            (compact_to_uri(compact), tag_to_source(src_tag), ranker)
+        }
+        None => (
+            compact_to_uri(entry),
+            BlendedSource::PostLevelPersonalization,
+            None,
+        ),
     }
 }
 
@@ -484,6 +589,10 @@ pub async fn get_feed_skeleton(
                         &prov,
                         None,
                         None,
+                        None,
+                        // This whole branch is the empty-candidate-pool path; `emit_skip_log`
+                        // above records the same reason.
+                        Some("no_algo_posts".to_string()),
                     );
                     SkeletonFeedPost {
                         post: uri,
@@ -544,6 +653,9 @@ pub async fn get_feed_skeleton(
             response_time_ms: None,
             is_holdout: None,
             is_personalization_holdout: None,
+            ranker: None,
+            // Same reason the debug! above records: no candidate pool and no fallback either.
+            fallback_reason: Some("no_algo_posts".to_string()),
         }
         .encode();
         let response = FeedSkeletonResponse {
@@ -558,23 +670,56 @@ pub async fn get_feed_skeleton(
     }
 
     let mut base_posts_tagged: Vec<(String, BlendedSource)> = Vec::new();
+    // URI -> ranker for interleaving attribution. Populated on a fresh compute, and recovered
+    // from the `fsc:` cache tag on paginated requests.
+    let mut ranker_by_uri: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut was_personalized = false;
     let mut fallback_reason: Option<&str> = None;
     let mut feed_cache_hit = false;
     let mut response_thompson_meta: Option<ResponseThompsonMeta> = None;
-    let mut is_personalization_holdout_for_provenance = false;
-    let is_fallback_only = feed_cursor.fallback_only;
+    // The arm is a pure function of the DID, so compute it once for EVERY request — first page or
+    // not, cursor or no cursor.
+    //
+    // Measured leak this replaces: 5 users appeared under both arms across three days. Their
+    // mislabelled rows were all at depth 3-6 (never page 1) and some carried `source: personalized`.
+    // Cause: the holdout branch was gated on `is_first_page`, so a paginated request whose cursor did
+    // not happen to carry `fallback_only` skipped the holdout entirely, read `fsc:`, and served
+    // personalized content *labelled as treated*. Two-way contamination — a holdout user both
+    // receiving treatment and being counted as treated.
+    //
+    // Deriving the arm from the DID on every request makes the invariant hold by construction rather
+    // than by every caller remembering to thread a flag: a holdout user can neither be served
+    // personalized content nor be labelled treated, on any page, with or without a cursor.
+    let holdout_user = user_did
+        .as_ref()
+        .map(|did| {
+            is_personalization_holdout_user(
+                did,
+                &state.config.personalization_holdout_salt,
+                state.config.personalization_holdout_rate,
+            )
+        })
+        .unwrap_or(false);
+    let mut is_personalization_holdout_for_provenance = holdout_user;
+    // Holdout users take the fallback-only path on every page. That path already handles pagination
+    // offsets and exclusions correctly, so routing through it removes the duplicate first-page-only
+    // branch rather than adding a second one to keep in sync.
+    let is_fallback_only = feed_cursor.fallback_only || holdout_user;
 
     // ═══════════════════════════════════════════════════════════════════
     // Handle fallback-only mode (personalization exhausted or holdout)
     // ═══════════════════════════════════════════════════════════════════
     if is_fallback_only {
-        fallback_reason = Some(if feed_cursor.is_personalization_holdout {
+        fallback_reason = Some(if holdout_user || feed_cursor.is_personalization_holdout {
             "personalization_holdout"
         } else {
             "personalization_exhausted"
         });
-        is_personalization_holdout_for_provenance = feed_cursor.is_personalization_holdout;
+        // `holdout_user` is authoritative; the cursor's copy is only a hint that can be absent on a
+        // fresh or truncated cursor, which is exactly how the old leak arose.
+        is_personalization_holdout_for_provenance =
+            holdout_user || feed_cursor.is_personalization_holdout;
         let exclude_set: HashSet<String> = feed_cursor.shown_fallback.clone();
 
         let fallback_raw = get_fallback_blend(
@@ -606,31 +751,10 @@ pub async fn get_feed_skeleton(
         let feed_cache_key = Keys::feed_cache(algo_id, &user_hash);
         let is_first_page = feed_cursor.is_first_page();
 
-        // Personalization holdout: 5% of first-page requests get non-personalized blend for A/B test
-        if is_first_page
-            && state.config.personalization_holdout_rate > 0.0
-            && rand::random::<f64>() < state.config.personalization_holdout_rate
-        {
-            fallback_reason = Some("personalization_holdout");
-            is_personalization_holdout_for_provenance = true;
-            let fallback_raw = get_fallback_blend(
-                &state.redis,
-                &state.interner,
-                &state.config,
-                algo_id,
-                limit * 2,
-                0,
-                &HashSet::new(),
-            )
-            .await
-            .unwrap_or_default();
-            for (uri, tranche) in fallback_raw {
-                if base_posts_tagged.len() >= limit {
-                    break;
-                }
-                base_posts_tagged.push((uri, BlendedSource::Fallback { tranche }));
-            }
-        } else if state.config.feed_cache_enabled {
+        // No holdout branch here: holdout users were routed to the fallback-only path above, before
+        // this block, so reaching here already implies the user is in the treated arm. Keeping a
+        // second first-page-only check would recreate the leak this removed.
+        if state.config.feed_cache_enabled {
             let cache_offset = feed_cursor.offset.max(0) as isize;
 
             // Check if cache exists by getting its length
@@ -651,9 +775,24 @@ pub async fn get_feed_skeleton(
                         feed_cache_hit = true;
                         base_posts_tagged = cached
                             .into_iter()
-                            .map(|c| (compact_to_uri(&c), BlendedSource::PostLevelPersonalization))
+                            .map(|c| {
+                                let (uri, src, ranker) = compact_to_tagged(&c);
+                                if let Some(r) = ranker {
+                                    ranker_by_uri.insert(uri.clone(), r);
+                                }
+                                (uri, src)
+                            })
                             .collect();
-                        was_personalized = true;
+                        // Only claim personalization if the cached page actually contains a
+                        // personalized item. Previously this was unconditionally true, which
+                        // inflated `was_personalized` on fallback-only cached pages.
+                        was_personalized = base_posts_tagged.iter().any(|(_, s)| {
+                            matches!(
+                                s,
+                                BlendedSource::PostLevelPersonalization
+                                    | BlendedSource::AuthorAffinity
+                            )
+                        });
                     } else if !is_first_page {
                         // Cache exists but offset is beyond cached posts - return EOF
                         // This means the user has scrolled past all cached content
@@ -678,22 +817,31 @@ pub async fn get_feed_skeleton(
         // If cache miss and NOT holdout, run personalization (only on first page when cache enabled)
         // When holdout, we already set base_posts_tagged from fallback above - do not overwrite.
         if !feed_cache_hit && !is_personalization_holdout_for_provenance {
-            // Check if user has any likes in date-based keys.
-            // Check today and yesterday so users who liked before UTC midnight still
-            // get the personalization path rather than falling to unfiltered fallback.
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-            let today = graze_common::today_date();
-            let yesterday = graze_common::date_from_timestamp(now_secs - 86400.0);
-            let user_likes_key_today = Keys::user_likes_date(&user_hash, &today);
-            let user_likes_key_yesterday = Keys::user_likes_date(&user_hash, &yesterday);
-            let (exists_today, exists_yesterday) = tokio::join!(
-                state.redis.exists(&user_likes_key_today),
-                state.redis.exists(&user_likes_key_yesterday),
-            );
-            let user_has_data = exists_today.unwrap_or(false) || exists_yesterday.unwrap_or(false);
+            // Check if the user has any like-seed the scorer could actually use.
+            //
+            // This previously checked only today and yesterday, to cover users who liked just
+            // before UTC midnight. But the scorer reads the FULL retention window
+            // (`user_likes_retention`, 6 days), so a 2-day gate turned away users whose seed
+            // the scorer would have found — reporting `no_user_data` and serving unfiltered
+            // fallback instead.
+            //
+            // Measured on 2,500 sampled daily-active users: the 2-day gate passed 49.2%, while
+            // 63.2% had seed somewhere in the 6-day window. **14.0% of all DAU — 22.1% of every
+            // seeded user — were being turned away despite usable seed.** That matched the
+            // observed `fallback_reason=no_user_data` rate of ~50% exactly.
+            //
+            // Their seed is thin (median 2 likes), so quality is modest, but the alternative
+            // for them is 100% fallback. Cost is one pipelined EXISTS batch — a single round
+            // trip regardless of window width — plus a scoring run for the newly admitted
+            // users. Window is configurable via USER_DATA_CHECK_DAYS to allow rollback without
+            // a rebuild.
+            let check_days = state.config.user_data_check_days;
+            let user_likes_keys = Keys::user_likes_retention(&user_hash, check_days);
+            let user_has_data = state
+                .redis
+                .exists_any(&user_likes_keys)
+                .await
+                .unwrap_or(false);
 
             if user_has_data {
                 // Load feed-specific Thompson config (holdout override, etc.)
@@ -731,13 +879,37 @@ pub async fn get_feed_skeleton(
                     .or(global_search_space.as_ref());
 
                 // Select Thompson Sampling parameters for this request
-                let thompson_params: SelectedParams =
+                let mut thompson_params: SelectedParams =
                     state.thompson.select_params_with_holdout_and_search_space(
                         algo_id,
                         holdout_override,
                         treatment_override,
                         search_space,
                     );
+
+                // Optionally override one dimension with a user-hash randomized assignment.
+                //
+                // Thompson picks adaptively, so its arms cannot be compared retrospectively:
+                // arm choice tracks bandit state, which tracks time, and engagement varies by
+                // time of day. Hash assignment is orthogonal to both and stable per user, giving
+                // a genuine randomized experiment. Enrolled requests are excluded from bandit
+                // learning (`is_hash_experiment`), and the forced value still flows into the
+                // feedContext provenance, so engagement analysis needs no extra plumbing.
+                if state.config.ab_experiment_enabled {
+                    let exp = graze_api_hash_experiment(&state.config);
+                    if let Some(v) = state.thompson.apply_hash_experiment(
+                        &mut thompson_params,
+                        user_did.as_deref().unwrap_or(""),
+                        &exp,
+                    ) {
+                        debug!(
+                            algo_id,
+                            dimension = %exp.dimension,
+                            value = v,
+                            "ab_experiment_assigned"
+                        );
+                    }
+                }
 
                 // Convert Thompson params to PersonalizationParams override
                 let params_override = PersonalizationParams {
@@ -778,11 +950,11 @@ pub async fn get_feed_skeleton(
                         let _scoring_time_ms = result.meta.scoring_time_ms.unwrap_or(0.0);
 
                         // Collect post IDs that need conversion to URIs
-                        let posts_to_convert: Vec<i64> = result
+                        let posts_to_convert: Vec<String> = result
                             .posts
                             .iter()
-                            .filter(|p| p.uri.is_empty())
-                            .filter_map(|p| p.post_id.parse::<i64>().ok())
+                            .filter(|p| p.uri.is_empty() && !p.post_id.is_empty())
+                            .map(|p| p.post_id.clone())
                             .collect();
 
                         // Batch lookup URIs from interner
@@ -799,16 +971,19 @@ pub async fn get_feed_skeleton(
                             .filter_map(|p| {
                                 let uri = if !p.uri.is_empty() {
                                     Some(p.uri.clone())
-                                } else if let Ok(id) = p.post_id.parse::<i64>() {
-                                    id_to_uri.get(&id).cloned()
                                 } else {
-                                    None
+                                    id_to_uri.get(&p.post_id).cloned()
                                 };
 
                                 // Track personalized posts in audit
                                 if let Some(ref uri) = uri {
                                     if let Some(ref mut a) = audit {
                                         a.add_personalized_post(&p.post_id, uri, p.score);
+                                    }
+                                    // Keep the interleaving attribution keyed by URI, which is
+                                    // what the rest of this handler works in.
+                                    if let Some(ref r) = p.ranker {
+                                        ranker_by_uri.insert(uri.clone(), r.clone());
                                     }
                                 }
 
@@ -839,10 +1014,17 @@ pub async fn get_feed_skeleton(
 
                         // Store full batch in feed cache for subsequent pages
                         if state.config.feed_cache_enabled && !blend_result.posts.is_empty() {
+                            // Store the per-item source so pagination can attribute correctly.
                             let compact_posts: Vec<String> = blend_result
-                                .posts
+                                .posts_with_source
                                 .iter()
-                                .map(|u| uri_to_compact(u))
+                                .map(|(u, src)| {
+                                    tagged_to_compact(
+                                        u,
+                                        src,
+                                        ranker_by_uri.get(u).map(|r| r.as_str()),
+                                    )
+                                })
                                 .collect();
                             let _ = state
                                 .redis
@@ -1039,12 +1221,17 @@ pub async fn get_feed_skeleton(
         .await
         .unwrap_or_else(|_| SpecialPostsResponse::empty(algo_id));
 
-    let (final_with_provenance, updated_cursor) = inject_special_posts(
+    let (mut final_with_provenance, updated_cursor) = inject_special_posts(
         base_posts_tagged.clone(),
         &special_posts,
         &feed_cursor,
         limit,
     );
+
+    if !state.config.exclusion_dids.is_empty() {
+        final_with_provenance
+            .retain(|(uri, _)| !is_excluded_post_uri(uri, state.config.exclusion_dids.as_ref()));
+    }
 
     // ═══════════════════════════════════════════════════════════════════
     // Build response cursor
@@ -1119,6 +1306,8 @@ pub async fn get_feed_skeleton(
                 } else {
                     None
                 },
+                ranker_by_uri.get(uri).cloned(),
+                fallback_reason.map(str::to_string),
             );
             SkeletonFeedPost {
                 post: uri.clone(),
@@ -1426,6 +1615,97 @@ pub async fn send_interactions(
 mod tests {
     use super::*;
 
+    /// The cache previously stored bare URIs, so every item read back was relabelled
+    /// `PostLevelPersonalization` — silently mis-attributing fallback and author-affinity
+    /// items on every page after the first.
+    #[test]
+    fn cache_tag_roundtrips_every_source() {
+        let uri = "at://did:plc:abc123/app.bsky.feed.post/3ldefgh456";
+        for src in [
+            BlendedSource::PostLevelPersonalization,
+            BlendedSource::AuthorAffinity,
+            BlendedSource::Fallback {
+                tranche: "trending".to_string(),
+            },
+            BlendedSource::Fallback {
+                tranche: "discovery".to_string(),
+            },
+        ] {
+            let encoded = tagged_to_compact(uri, &src, None);
+            let (got_uri, got_src, got_ranker) = compact_to_tagged(&encoded);
+            assert_eq!(got_ranker, None);
+            assert_eq!(got_uri, uri);
+            assert_eq!(source_to_tag(&got_src), source_to_tag(&src));
+        }
+    }
+
+    /// Entries written before the tagged format existed must still decode, so deploying does
+    /// not garble in-flight caches.
+    #[test]
+    fn legacy_untagged_cache_entries_still_decode() {
+        let legacy = uri_to_compact("at://did:plc:abc123/app.bsky.feed.post/3ldefgh456");
+        assert!(!legacy.contains(CACHE_TAG_SEP));
+        let (uri, src, ranker) = compact_to_tagged(&legacy);
+        assert_eq!(ranker, None);
+        assert_eq!(uri, "at://did:plc:abc123/app.bsky.feed.post/3ldefgh456");
+        assert!(matches!(src, BlendedSource::PostLevelPersonalization));
+    }
+
+    /// A tag written by a newer build must not panic or lose the URI.
+    #[test]
+    fn unknown_tag_degrades_to_personalized_without_losing_the_uri() {
+        let entry = format!(
+            "p/somefutureranker{}{}",
+            CACHE_TAG_SEP,
+            uri_to_compact("at://did:plc:abc123/app.bsky.feed.post/3ldefgh456")
+        );
+        let (uri, src, _) = compact_to_tagged(&entry);
+        assert_eq!(uri, "at://did:plc:abc123/app.bsky.feed.post/3ldefgh456");
+        assert!(matches!(src, BlendedSource::PostLevelPersonalization));
+    }
+
+    /// A fallback tranche containing the separator must not corrupt the URI half.
+    #[test]
+    fn tranche_with_separator_does_not_corrupt_the_uri() {
+        let uri = "at://did:plc:abc123/app.bsky.feed.post/3ldefgh456";
+        let src = BlendedSource::Fallback {
+            tranche: format!("odd{}name", CACHE_TAG_SEP),
+        };
+        let (got_uri, _, _) = compact_to_tagged(&tagged_to_compact(uri, &src, None));
+        assert_eq!(got_uri, uri, "uri must survive a separator in the tranche");
+    }
+
+    /// Interleaving attribution must survive pagination, which is served from the `fsc:` cache.
+    /// Without this the ranker credit silently vanishes after page 1 and the experiment reads as
+    /// having no effect.
+    #[test]
+    fn cache_tag_roundtrips_the_interleaving_ranker() {
+        let uri = "at://did:plc:abc123/app.bsky.feed.post/3ldefgh456";
+        let src = BlendedSource::PostLevelPersonalization;
+        let encoded = tagged_to_compact(uri, &src, Some("sampled_walk"));
+        let (got_uri, got_src, got_ranker) = compact_to_tagged(&encoded);
+        assert_eq!(got_uri, uri);
+        assert!(matches!(got_src, BlendedSource::PostLevelPersonalization));
+        assert_eq!(got_ranker.as_deref(), Some("sampled_walk"));
+    }
+
+    /// A fallback item can also be attributed, and the tranche must survive alongside the ranker.
+    #[test]
+    fn cache_tag_keeps_tranche_and_ranker_together() {
+        let uri = "at://did:plc:abc123/app.bsky.feed.post/3ldefgh456";
+        let src = BlendedSource::Fallback {
+            tranche: "trending".to_string(),
+        };
+        let (got_uri, got_src, got_ranker) =
+            compact_to_tagged(&tagged_to_compact(uri, &src, Some("item_item")));
+        assert_eq!(got_uri, uri);
+        match got_src {
+            BlendedSource::Fallback { tranche } => assert_eq!(tranche, "trending"),
+            other => panic!("expected fallback, got {:?}", other),
+        }
+        assert_eq!(got_ranker.as_deref(), Some("item_item"));
+    }
+
     #[test]
     fn test_uri_to_compact() {
         let uri = "at://did:plc:abc123/app.bsky.feed.post/3ldefgh456";
@@ -1445,5 +1725,145 @@ mod tests {
     fn test_uri_roundtrip() {
         let uri = "at://did:plc:xyz789/app.bsky.feed.post/abc123";
         assert_eq!(compact_to_uri(&uri_to_compact(uri)), uri);
+    }
+}
+
+#[cfg(test)]
+mod holdout_assignment_tests {
+    use super::*;
+
+    fn dids(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("did:plc:testuser{:06}", i))
+            .collect()
+    }
+
+    #[test]
+    fn assignment_is_stable_for_a_user_across_calls() {
+        // The property the whole readout rests on. A per-request coin flip put active users in BOTH
+        // arms simultaneously, which attenuates any real effect toward zero — the first readout's
+        // +5.4% (p=0.91) is what that looks like whether or not personalization works.
+        for did in dids(50) {
+            let first = is_personalization_holdout_user(&did, "pholdout-v1", 0.2);
+            for _ in 0..20 {
+                assert_eq!(
+                    is_personalization_holdout_user(&did, "pholdout-v1", 0.2),
+                    first,
+                    "assignment must not vary between requests for {did}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn observed_rate_tracks_the_configured_rate() {
+        for rate in [0.05_f64, 0.2, 0.5] {
+            let n = 4000;
+            let held = dids(n)
+                .iter()
+                .filter(|d| is_personalization_holdout_user(d, "pholdout-v1", rate))
+                .count();
+            let observed = held as f64 / n as f64;
+            assert!(
+                (observed - rate).abs() < 0.03,
+                "rate {rate} produced {observed:.4} over {n} users"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_rate_holds_nobody_and_full_rate_holds_everybody() {
+        for did in dids(200) {
+            assert!(!is_personalization_holdout_user(&did, "s", 0.0));
+            assert!(is_personalization_holdout_user(&did, "s", 1.0));
+        }
+    }
+
+    #[test]
+    fn holdout_arm_does_not_depend_on_page_or_cursor() {
+        // The leak this replaces: the arm was decided only on first pages, so a paginated request
+        // whose cursor lacked `fallback_only` skipped the holdout, read `fsc:`, and served
+        // personalized content *labelled treated*. Measured: 5 users under both arms over three days,
+        // all mislabelled rows at depth 3-6, some with `source: personalized`.
+        //
+        // The arm is now derived from the DID alone. This test states that contract directly: nothing
+        // about the request — page number, cursor contents, request ordering — may enter the decision.
+        for did in dids(200) {
+            let arm = is_personalization_holdout_user(&did, "pholdout-v1", 0.2);
+            // Whatever a caller does between requests, the same inputs must give the same arm.
+            for _ in 0..5 {
+                assert_eq!(
+                    is_personalization_holdout_user(&did, "pholdout-v1", 0.2),
+                    arm,
+                    "arm for {did} must be a function of the DID, salt and rate only"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn holdout_membership_is_monotone_in_the_rate() {
+        // Raising the rate must only ever ADD users to the holdout, never swap them out. Otherwise a
+        // rate change would reassign existing members and silently invalidate accrued data beyond the
+        // documented "a rate change starts a new experiment" caveat.
+        let users = dids(1000);
+        for did in &users {
+            if is_personalization_holdout_user(did, "pholdout-v1", 0.05) {
+                assert!(
+                    is_personalization_holdout_user(did, "pholdout-v1", 0.20),
+                    "{did} was held out at 5% but not at 20%; membership is not monotone"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changing_the_salt_reshuffles_membership() {
+        // Documented consequence: a salt change starts a new experiment rather than continuing one.
+        let users = dids(500);
+        let moved = users
+            .iter()
+            .filter(|d| {
+                is_personalization_holdout_user(d, "pholdout-v1", 0.2)
+                    != is_personalization_holdout_user(d, "pholdout-v2", 0.2)
+            })
+            .count();
+        assert!(
+            moved > 50,
+            "only {moved} of 500 users moved; salt is not reshuffling"
+        );
+    }
+
+    #[test]
+    fn holdout_is_orthogonal_to_the_interleaving_and_thompson_salts() {
+        // Sharing a salt would correlate holdout membership with bandit arms, so a holdout readout
+        // would partly be measuring the bandit. Assert the assignments are near-independent.
+        let users = dids(2000);
+        let mut both = 0usize;
+        let mut held = 0usize;
+        let mut other = 0usize;
+        for d in &users {
+            let h = is_personalization_holdout_user(d, "pholdout-v1", 0.5);
+            // Same construction the interleaving/Thompson assignment uses, different salt.
+            let x = graze_common::hash_did(&format!("interleave-salt|{}", d));
+            let o = u64::from_str_radix(&x[..15], 16)
+                .unwrap_or(0)
+                .is_multiple_of(2);
+            if h {
+                held += 1;
+            }
+            if o {
+                other += 1;
+            }
+            if h && o {
+                both += 1;
+            }
+        }
+        let expected = held as f64 * other as f64 / users.len() as f64;
+        let ratio = both as f64 / expected.max(1.0);
+        assert!(
+            (0.85..1.15).contains(&ratio),
+            "holdout and interleaving assignments are correlated: joint/expected = {ratio:.3}"
+        );
     }
 }

@@ -27,7 +27,8 @@ RUN --mount=type=ssh \
     -p graze-api \
     -p graze-like-streamer \
     -p graze-candidate-sync \
-    -p graze-frontdoor
+    -p graze-frontdoor \
+    -p graze-feed-stats
 
 # Stage 2: Final runtime image
 FROM --platform=linux/amd64 gcr.io/distroless/cc-debian12
@@ -38,9 +39,12 @@ WORKDIR /app
 COPY --from=builder /app/target/release/graze-api /app/graze-api
 COPY --from=builder /app/target/release/graze-like-streamer /app/graze-like-streamer
 COPY --from=builder /app/target/release/graze-candidate-sync /app/graze-candidate-sync
+# Phase A of the durable co-liker profile design; built by -p graze-candidate-sync.
+COPY --from=builder /app/target/release/graze-build-coliker-profiles /app/graze-build-coliker-profiles
 COPY --from=builder /app/target/release/graze-backfill-ula /app/graze-backfill-ula
 COPY --from=builder /app/target/release/graze-backfill /app/graze-backfill
 COPY --from=builder /app/target/release/graze-frontdoor /app/graze-frontdoor
+COPY --from=builder /app/target/release/graze-feed-stats /app/graze-feed-stats
 COPY --from=builder /app/target/release/graze-migrate-tranches /app/graze-migrate-tranches
 COPY --from=builder /app/target/release/graze-migrate-dates /app/graze-migrate-dates
 COPY --from=builder /app/target/release/graze-verify-migration /app/graze-verify-migration

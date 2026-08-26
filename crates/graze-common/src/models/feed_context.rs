@@ -72,6 +72,37 @@ pub struct FeedContextProvenance {
         skip_serializing_if = "Option::is_none"
     )]
     pub is_personalization_holdout: Option<bool>,
+
+    /// Which ranker produced this item, when an interleaving experiment is running.
+    ///
+    /// Set only for interleaved items; `None` otherwise. Required for per-item attribution in
+    /// team-draft interleaving, where the whole point is that both rankers contribute to one
+    /// response and engagement must be credited to the right one.
+    ///
+    /// Safe to add without a ClickHouse migration: the blob is stored verbatim in
+    /// `interaction_feed_context String`, `decode` uses plain `serde_json::from_str` (which
+    /// ignores unknown keys), and the lenient consumer decoder reads only two fields.
+    #[serde(rename = "ranker", skip_serializing_if = "Option::is_none")]
+    pub ranker: Option<String>,
+
+    /// Why this response was not personalized, when it was not.
+    ///
+    /// `no_user_data` (no seed in the like window) | `no_auth` (unauthenticated request) |
+    /// `no_algo_posts` (the feed's candidate pool is empty) | `personalization_holdout` |
+    /// `personalization_error`. `None` when the response *was* personalized.
+    ///
+    /// Exists because this reason was previously only ever written to a log line, so coverage
+    /// failures could not be decomposed in ClickHouse and every experiment silently mixed users
+    /// the engine served with users it could not serve. Measured 2026-08-25: 52% of the holdout
+    /// experiment's treatment arm received zero personalized impressions, which is the dominant
+    /// reason the readout will not converge.
+    ///
+    /// Safe to add without a ClickHouse migration, for the same reason `ranker` was: the blob is
+    /// stored verbatim in `interaction_feed_context String`, `decode` uses plain
+    /// `serde_json::from_str` (which ignores unknown keys), and the lenient consumer decoder reads
+    /// only two fields.
+    #[serde(rename = "fallback_reason", skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 /// Compact personalization params for provenance.
@@ -172,6 +203,8 @@ mod tests {
             response_time_ms: Some(150.0),
             is_holdout: Some(false),
             is_personalization_holdout: None,
+            ranker: None,
+            fallback_reason: None,
         };
         let encoded = ctx.encode().expect("encode");
         let decoded = FeedContextProvenance::decode(&encoded).expect("decode");
@@ -193,5 +226,99 @@ mod tests {
     #[test]
     fn test_decode_feed_context_invalid_base64() {
         assert!(FeedContextProvenance::decode("!!!invalid!!!").is_none());
+    }
+
+    /// The `ranker` field must be invisible when unset, so existing consumers and stored blobs
+    /// are unaffected, and must survive a round-trip when set.
+    #[test]
+    fn ranker_is_omitted_when_unset_and_roundtrips_when_set() {
+        let mut ctx = FeedContextProvenance {
+            feed_uri: "at://did:plc:abc/app.bsky.feed.generator/feed".to_string(),
+            algo_id: 1,
+            depth: 0,
+            personalized: true,
+            source: "personalized".to_string(),
+            personalization_type: None,
+            fallback_tranche: None,
+            total: 10,
+            personalized_count: 5,
+            attribution: None,
+            params: None,
+            response_time_ms: None,
+            is_holdout: None,
+            is_personalization_holdout: None,
+            ranker: None,
+            fallback_reason: None,
+        };
+        let json_absent = serde_json::to_string(&ctx).expect("serialize");
+        assert!(
+            !json_absent.contains("ranker"),
+            "unset ranker must not appear on the wire: {}",
+            json_absent
+        );
+
+        ctx.ranker = Some("sampled_walk".to_string());
+        let decoded =
+            FeedContextProvenance::decode(&ctx.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded.ranker.as_deref(), Some("sampled_walk"));
+    }
+
+    /// A blob produced by an older build (no `ranker` key) must still decode — this is what
+    /// makes the field safe to add without a ClickHouse migration.
+    #[test]
+    fn blob_without_ranker_key_still_decodes() {
+        let legacy = r#"{"feed_uri":"at://x","algo_id":1,"depth":0,"personalized":false,"source":"fallback","total":1,"personalized_count":0}"#;
+        let ctx: FeedContextProvenance = serde_json::from_str(legacy).expect("legacy decode");
+        assert_eq!(ctx.ranker, None);
+        assert_eq!(ctx.source, "fallback");
+    }
+
+    /// `fallback_reason` is what makes coverage failures decomposable in ClickHouse rather than
+    /// only in log lines. Two properties matter and both are asserted here: it must be absent from
+    /// the wire when the response *was* personalized (so personalized rows stay compact and are
+    /// distinguishable by the key's absence), and it must round-trip when set.
+    #[test]
+    fn fallback_reason_is_omitted_when_personalized_and_round_trips_when_set() {
+        let mut ctx = FeedContextProvenance {
+            feed_uri: "at://did:plc:abc/app.bsky.feed.generator/feed".to_string(),
+            algo_id: 1,
+            depth: 0,
+            personalized: true,
+            source: "personalized".to_string(),
+            personalization_type: None,
+            fallback_tranche: None,
+            total: 10,
+            personalized_count: 5,
+            attribution: None,
+            params: None,
+            response_time_ms: None,
+            is_holdout: None,
+            is_personalization_holdout: None,
+            ranker: None,
+            fallback_reason: None,
+        };
+        let json_absent = serde_json::to_string(&ctx).expect("serialize");
+        assert!(
+            !json_absent.contains("fallback_reason"),
+            "a personalized response must not carry fallback_reason: {}",
+            json_absent
+        );
+
+        ctx.personalized = false;
+        ctx.source = "fallback".to_string();
+        ctx.fallback_reason = Some("no_user_data".to_string());
+        let decoded =
+            FeedContextProvenance::decode(&ctx.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded.fallback_reason.as_deref(), Some("no_user_data"));
+    }
+
+    /// The migration-free guarantee, stated for the new field: blobs written by every build before
+    /// this one carry no `fallback_reason` key, and must still decode rather than erroring.
+    #[test]
+    fn blob_without_fallback_reason_key_still_decodes() {
+        let legacy = r#"{"feed_uri":"at://x","algo_id":1,"depth":0,"personalized":false,"source":"fallback","total":1,"personalized_count":0}"#;
+        let ctx: FeedContextProvenance = serde_json::from_str(legacy).expect("legacy decode");
+        assert_eq!(ctx.fallback_reason, None);
+        assert_eq!(ctx.source, "fallback");
     }
 }

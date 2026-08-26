@@ -85,22 +85,16 @@ async fn convert_ids_to_uris(
     exclude: &HashSet<String>,
     limit: usize,
 ) -> Result<Vec<String>> {
-    // Convert IDs to integers
-    let int_ids: Vec<i64> = post_ids
-        .iter()
-        .filter_map(|id| id.parse::<i64>().ok())
-        .collect();
-
-    if int_ids.is_empty() {
+    if post_ids.is_empty() {
         return Ok(Vec::new());
     }
 
     // Batch lookup URIs
-    let id_to_uri = interner.get_uris_batch(&int_ids).await?;
+    let id_to_uri = interner.get_uris_batch(post_ids).await?;
 
     // Filter out excluded posts and return up to limit
     let mut result = Vec::with_capacity(limit);
-    for id in &int_ids {
+    for id in post_ids {
         if let Some(uri) = id_to_uri.get(id) {
             if !exclude.contains(uri) {
                 result.push(uri.clone());
@@ -410,15 +404,13 @@ pub async fn get_blended_posts_with_stats(
             .await
         {
             Ok(result) => {
-                let scored_posts: Vec<(f64, i64)> = result
+                let scored_posts: Vec<(f64, String)> = result
                     .scored_posts
                     .iter()
                     .take(shortfall * 2)
-                    .filter_map(|(score, post_id)| {
-                        post_id.parse::<i64>().ok().map(|id| (*score, id))
-                    })
+                    .map(|(score, post_id)| (*score, post_id.clone()))
                     .collect();
-                let post_ids: Vec<i64> = scored_posts.iter().map(|(_, id)| *id).collect();
+                let post_ids: Vec<String> = scored_posts.iter().map(|(_, id)| id.clone()).collect();
                 let uri_map = interner.get_uris_batch(&post_ids).await.unwrap_or_default();
 
                 for (_, post_id) in scored_posts {
@@ -547,10 +539,7 @@ pub async fn load_user_liked_uris(
         return HashSet::new();
     }
 
-    let ids: Vec<i64> = liked_items
-        .into_iter()
-        .filter_map(|(id_str, _)| id_str.parse::<i64>().ok())
-        .collect();
+    let ids: Vec<String> = liked_items.into_iter().map(|(id_str, _)| id_str).collect();
 
     match interner.get_uris_batch(&ids).await {
         Ok(map) => map.into_values().collect(),

@@ -8,6 +8,7 @@ pub mod api;
 pub mod audit;
 pub mod config;
 pub mod error;
+pub mod experiment;
 pub mod interaction_queue;
 pub mod metrics;
 

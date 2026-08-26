@@ -28,6 +28,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Load configuration
     let config = Config::from_env();
+    info!(
+        exclusion_did_count = config.exclusion_dids.len(),
+        "like_streamer_exclusion_config"
+    );
 
     // Capture metrics port before wrapping config
     let metrics_port = config.metrics_port;

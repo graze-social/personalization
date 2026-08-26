@@ -122,6 +122,9 @@ fn encode_feed_context(
     is_personalization_holdout: Option<bool>,
     // Which ranker produced this item, when interleaving is active.
     ranker: Option<String>,
+    // Why this response was not personalized, when it was not. Carried into provenance so coverage
+    // failures are decomposable in ClickHouse instead of only in log lines.
+    fallback_reason: Option<String>,
 ) -> Option<String> {
     let (source, personalization_type, fallback_tranche, attribution, personalized) = match prov {
         ItemProvenance::Base(BlendedSource::PostLevelPersonalization) => (
@@ -190,6 +193,7 @@ fn encode_feed_context(
         is_holdout,
         is_personalization_holdout,
         ranker,
+        fallback_reason,
     };
     ctx.encode()
 }
@@ -586,6 +590,9 @@ pub async fn get_feed_skeleton(
                         None,
                         None,
                         None,
+                        // This whole branch is the empty-candidate-pool path; `emit_skip_log`
+                        // above records the same reason.
+                        Some("no_algo_posts".to_string()),
                     );
                     SkeletonFeedPost {
                         post: uri,
@@ -647,6 +654,8 @@ pub async fn get_feed_skeleton(
             is_holdout: None,
             is_personalization_holdout: None,
             ranker: None,
+            // Same reason the debug! above records: no candidate pool and no fallback either.
+            fallback_reason: Some("no_algo_posts".to_string()),
         }
         .encode();
         let response = FeedSkeletonResponse {
@@ -1298,6 +1307,7 @@ pub async fn get_feed_skeleton(
                     None
                 },
                 ranker_by_uri.get(uri).cloned(),
+                fallback_reason.map(str::to_string),
             );
             SkeletonFeedPost {
                 post: uri.clone(),

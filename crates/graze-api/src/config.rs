@@ -347,6 +347,12 @@ pub struct Config {
     // ═══════════════════════════════════════════════════════════════════════════════
     // Author-Affinity Configuration
     // ═══════════════════════════════════════════════════════════════════════════════
+    /// TTL for the per-algorithm candidate-pool cache. `0` disables it, which is the rollback
+    /// path: it restores fetching `ap:{algo_id}` on every request without a rebuild.
+    pub pool_cache_ttl_seconds: u64,
+    /// Total cached pool members across all algos. Bounded on members rather than entries because
+    /// pools range from 1 to ~40,000, so an entry cap would bound almost nothing.
+    pub pool_cache_max_members: usize,
     pub author_affinity_enabled: bool,
     pub max_liked_authors_per_user: usize,
     pub max_likers_per_author: usize,
@@ -654,6 +660,8 @@ impl Config {
             linklonk_normalization_enabled: parse_bool_env("LINKLONK_NORMALIZATION_ENABLED", true),
 
             // Author-Affinity
+            pool_cache_ttl_seconds: parse_u64_env("POOL_CACHE_TTL_SECONDS", 30),
+            pool_cache_max_members: parse_usize_env("POOL_CACHE_MAX_MEMBERS", 600_000),
             author_affinity_enabled: parse_bool_env("AUTHOR_AFFINITY_ENABLED", true),
             max_liked_authors_per_user: parse_usize_env("MAX_LIKED_AUTHORS_PER_USER", 500),
             max_likers_per_author: parse_usize_env("MAX_LIKERS_PER_AUTHOR", 1000),

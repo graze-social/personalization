@@ -111,6 +111,51 @@ pub struct SelectedParams {
     /// True = one dimension was forced by a user-hash randomized experiment. Excluded from
     /// bandit learning, since the value was not chosen by the bandit.
     pub is_hash_experiment: bool,
+    /// Whether this user may be seeded from the follow graph (`uf:`) when the like seed is empty.
+    ///
+    /// Carried here rather than read from config in the seed step because it is a **per-user
+    /// randomized assignment**, and because `SelectedParams` already flows into the provenance blob
+    /// — so the arm reaches ClickHouse with no new analysis plumbing, the same property that made
+    /// the `max_sources` hash experiment analysable.
+    ///
+    /// This is the ARM (pre-treatment), deliberately not the realised seed kind. Conditioning an
+    /// analysis on which seed actually got used would be post-treatment conditioning; the dose
+    /// question is answered instead by the `no_user_data` rate, which `fallback_reason` already
+    /// carries.
+    ///
+    /// `None` = not enrolled, so the plain `follow_seed_read_enabled` config applies.
+    pub follow_seed_arm: Option<bool>,
+}
+
+/// Per-user randomized on/off assignment for follow-graph seeding.
+///
+/// Separate from `HashExperiment` because follow-seeding is not a Thompson dimension — there is no
+/// parameter value to force, only a capability to grant. Uses its own salt so the split is
+/// orthogonal to both the bandit experiment and the holdout.
+#[derive(Debug, Clone)]
+pub struct FollowSeedExperiment {
+    pub enabled: bool,
+    /// Percentage of users enrolled. The remainder keep the current behaviour.
+    pub traffic_pct: u32,
+    pub salt: String,
+}
+
+impl FollowSeedExperiment {
+    /// `Some(true)` = follow-seeding allowed, `Some(false)` = withheld, `None` = not enrolled.
+    ///
+    /// Membership and arm are taken from different parts of the hash, so ramping `traffic_pct` adds
+    /// users without reshuffling the arms of those already enrolled.
+    pub fn assign(&self, user_did: &str) -> Option<bool> {
+        if !self.enabled || self.traffic_pct == 0 {
+            return None;
+        }
+        let h = graze_common::hash_did(&format!("{}|{}", self.salt, user_did));
+        let v = u64::from_str_radix(&h, 16).unwrap_or(0);
+        if (v % 100) >= self.traffic_pct as u64 {
+            return None;
+        }
+        Some(((v / 100) % 2) == 1)
+    }
 }
 
 /// A randomized A/B assignment keyed on the user DID, deliberately independent of the bandit.
@@ -445,6 +490,7 @@ impl ThompsonLearner {
                     is_exploration: false,
                     is_treatment_override: false,
                     is_hash_experiment: false,
+                    follow_seed_arm: None,
                 }
             } else {
                 SelectedParams {
@@ -461,6 +507,7 @@ impl ThompsonLearner {
                     is_exploration: false,
                     is_treatment_override: false,
                     is_hash_experiment: false,
+                    follow_seed_arm: None,
                 }
             };
         }
@@ -482,6 +529,7 @@ impl ThompsonLearner {
                 is_exploration: false,
                 is_treatment_override: true,
                 is_hash_experiment: false,
+                follow_seed_arm: None,
             };
         }
 
@@ -545,6 +593,7 @@ impl ThompsonLearner {
             is_exploration,
             is_treatment_override: false,
             is_hash_experiment: false,
+            follow_seed_arm: None,
         }
     }
 
@@ -585,6 +634,7 @@ impl ThompsonLearner {
             is_exploration: false,
             is_treatment_override: false,
             is_hash_experiment: false,
+            follow_seed_arm: None,
         }
     }
 
@@ -1151,6 +1201,7 @@ mod tests {
             max_sources_per_post: Some(75),
             seed_sample_pool: Some(1000),
             corater_decay_pct: Some(20),
+            follow_seed: None,
         };
         let selected = learner.selected_params_from_provenance(&p);
         assert_eq!(selected.min_post_likes, 10);
@@ -1172,6 +1223,7 @@ mod tests {
             max_sources_per_post: None,
             seed_sample_pool: None,
             corater_decay_pct: None,
+            follow_seed: None,
         };
         let selected2 = learner.selected_params_from_provenance(&p_partial);
         assert_eq!(selected2.min_post_likes, 7);
@@ -1197,6 +1249,7 @@ mod tests {
             is_exploration: false,
             is_treatment_override: false,
             is_hash_experiment: false,
+            follow_seed_arm: None,
         };
 
         assert_eq!(params.min_post_likes, 5);
@@ -1329,5 +1382,114 @@ mod hash_experiment_tests {
             None
         );
         assert!(!p.is_hash_experiment);
+    }
+}
+
+#[cfg(test)]
+mod follow_seed_experiment_tests {
+    use super::FollowSeedExperiment;
+
+    fn exp(pct: u32) -> FollowSeedExperiment {
+        FollowSeedExperiment {
+            enabled: true,
+            traffic_pct: pct,
+            salt: "v1".to_string(),
+        }
+    }
+
+    #[test]
+    fn disabled_or_zero_traffic_enrols_nobody() {
+        let mut e = exp(100);
+        e.enabled = false;
+        assert_eq!(e.assign("did:plc:aaa"), None);
+        assert_eq!(exp(0).assign("did:plc:aaa"), None);
+    }
+
+    /// Assignment must be stable per user, or the same person drifts between arms and the
+    /// comparison is attenuated toward zero. That is exactly what the per-request holdout coin flip
+    /// did: 18% of users were in both arms at once.
+    #[test]
+    fn assignment_is_deterministic_per_user() {
+        let e = exp(100);
+        for did in ["did:plc:aaa", "did:plc:bbb", "did:plc:ccc"] {
+            let first = e.assign(did);
+            for _ in 0..20 {
+                assert_eq!(e.assign(did), first, "assignment drifted for {did}");
+            }
+        }
+    }
+
+    #[test]
+    fn both_arms_are_populated_at_full_traffic() {
+        let e = exp(100);
+        let mut t = 0;
+        let mut c = 0;
+        for i in 0..4000 {
+            match e.assign(&format!("did:plc:user{i}")) {
+                Some(true) => t += 1,
+                Some(false) => c += 1,
+                None => panic!("nobody should be unenrolled at 100% traffic"),
+            }
+        }
+        let frac = t as f64 / (t + c) as f64;
+        assert!(
+            (0.45..0.55).contains(&frac),
+            "expected a roughly even split, got {frac:.3} ({t} vs {c})"
+        );
+    }
+
+    /// Membership and arm are drawn from different parts of the hash, so ramping traffic must add
+    /// users without flipping the arm of anyone already enrolled — otherwise a ramp silently
+    /// invalidates the data collected before it.
+    #[test]
+    fn ramping_traffic_does_not_reshuffle_existing_arms() {
+        let small = exp(20);
+        let large = exp(60);
+        let mut checked = 0;
+        for i in 0..4000 {
+            let did = format!("did:plc:user{i}");
+            if let Some(arm) = small.assign(&did) {
+                assert_eq!(
+                    large.assign(&did),
+                    Some(arm),
+                    "arm flipped for {did} when traffic was ramped"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "test did not actually enrol anyone");
+    }
+
+    #[test]
+    fn traffic_pct_bounds_enrolment() {
+        let e = exp(25);
+        let enrolled = (0..4000)
+            .filter(|i| e.assign(&format!("did:plc:user{i}")).is_some())
+            .count();
+        let frac = enrolled as f64 / 4000.0;
+        assert!(
+            (0.20..0.30).contains(&frac),
+            "expected ~25% enrolled, got {frac:.3}"
+        );
+    }
+
+    /// A different salt must give an independent split, so this experiment cannot correlate with
+    /// the holdout or the bandit experiment.
+    #[test]
+    fn a_different_salt_gives_an_independent_split() {
+        let a = exp(100);
+        let mut b = exp(100);
+        b.salt = "v2".to_string();
+        let disagreements = (0..2000)
+            .filter(|i| {
+                let did = format!("did:plc:user{i}");
+                a.assign(&did) != b.assign(&did)
+            })
+            .count();
+        // Independent splits disagree about half the time; identical ones never would.
+        assert!(
+            (700..1300).contains(&disagreements),
+            "salts look correlated: {disagreements} disagreements of 2000"
+        );
     }
 }

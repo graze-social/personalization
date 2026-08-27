@@ -31,8 +31,8 @@ pub use scoring_core::{
     score_posts_parallel, score_posts_topk, to_fx_hashmap, ScoredPostResult,
 };
 pub use thompson::{
-    FeedOutcome, FeedOutcomeDetails, HashExperiment, SelectedParams, ThompsonConfig,
-    ThompsonLearner,
+    FeedOutcome, FeedOutcomeDetails, FollowSeedExperiment, HashExperiment, SelectedParams,
+    ThompsonConfig, ThompsonLearner,
 };
 
 use rustc_hash::FxHashMap;
@@ -603,9 +603,15 @@ impl LinkLonkAlgorithm {
         // Step 1: Get or compute co-likers (post-level or author-level)
         let coliker_weights = if params.use_author_affinity {
             debug!("step1_author_coliker_start");
+            // The arm decides when the experiment is running; otherwise the plain config flag
+            // applies. Resolved here because this is where `params` lives -- the seed step is too
+            // deep to know a per-user assignment.
+            let allow_follow_seed = params
+                .follow_seed_arm
+                .unwrap_or(self.config.follow_seed_read_enabled);
             let weights = self
                 .author_coliker
-                .get_or_compute_author_colikes(user_hash, false)
+                .get_or_compute_author_colikes_with_seed(user_hash, false, allow_follow_seed)
                 .await?;
             debug!(
                 coliker_count = weights.len(),

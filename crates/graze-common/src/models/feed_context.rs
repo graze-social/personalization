@@ -132,6 +132,14 @@ pub struct ProvenanceParams {
     pub seed_sample_pool: Option<usize>,
     #[serde(rename = "corater_decay_pct", skip_serializing_if = "Option::is_none")]
     pub corater_decay_pct: Option<usize>,
+    /// Follow-seed experiment arm: `true` = allowed to seed from the follow graph.
+    ///
+    /// The ARM, not the realised seed kind. Analysis must be intention-to-treat; conditioning on
+    /// which seed actually got used would be post-treatment conditioning. The dose question — did
+    /// treated users actually get served — is answered by the `no_user_data` rate in
+    /// `fallback_reason`, which needs no new field.
+    #[serde(rename = "follow_seed", skip_serializing_if = "Option::is_none")]
+    pub follow_seed: Option<bool>,
 }
 
 impl ProvenanceParams {
@@ -158,7 +166,18 @@ impl ProvenanceParams {
             max_sources_per_post: Some(max_sources_per_post),
             seed_sample_pool: Some(seed_sample_pool),
             corater_decay_pct: Some(corater_decay_pct),
+            follow_seed: None,
         }
+    }
+
+    /// Attach the follow-seed experiment arm.
+    ///
+    /// A builder rather than a tenth positional argument: `from_selected` already carries nine and
+    /// is called from several places, so extending it would churn every caller for a field most do
+    /// not set.
+    pub fn with_follow_seed(mut self, arm: Option<bool>) -> Self {
+        self.follow_seed = arm;
+        self
     }
 }
 

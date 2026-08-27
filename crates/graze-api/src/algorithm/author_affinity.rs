@@ -114,10 +114,13 @@ impl AuthorColikerWorker {
     ///
     /// Checks if pre-computed author co-likers exist and are fresh.
     /// If not, it triggers computation.
-    pub async fn get_or_compute_author_colikes(
+    /// `allow_follow_seed` is the per-user experiment arm resolved by the caller, not a config
+    /// read: follow-seeding is randomized per user, so the seed step cannot decide it locally.
+    pub async fn get_or_compute_author_colikes_with_seed(
         &self,
         user_hash: &str,
         force_refresh: bool,
+        allow_follow_seed: bool,
     ) -> Result<HashMap<String, f64>> {
         if !self.config.author_affinity_enabled {
             debug!(user_hash = %&user_hash[..8.min(user_hash.len())], "early_exit: author affinity disabled");
@@ -143,11 +146,16 @@ impl AuthorColikerWorker {
         }
 
         // Cache miss or force refresh - compute now
-        self.compute_author_colikes(user_hash).await
+        self.compute_author_colikes(user_hash, allow_follow_seed)
+            .await
     }
 
     /// Compute author-level co-liker aggregation for a user.
-    pub async fn compute_author_colikes(&self, user_hash: &str) -> Result<HashMap<String, f64>> {
+    pub async fn compute_author_colikes(
+        &self,
+        user_hash: &str,
+        allow_follow_seed: bool,
+    ) -> Result<HashMap<String, f64>> {
         let start_time = Instant::now();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -185,7 +193,7 @@ impl AuthorColikerWorker {
         // have zero likes in 365 days, and 86% of them follow 10+ accounts (median 50).
         let seed = if !liked_authors.is_empty() {
             Seed::Likes(liked_authors)
-        } else if self.config.follow_seed_read_enabled {
+        } else if allow_follow_seed {
             let follows = self
                 .redis
                 .zrevrange(

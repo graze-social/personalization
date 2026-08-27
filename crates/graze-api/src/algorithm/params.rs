@@ -52,6 +52,13 @@ pub struct LinkLonkParams {
     // Corater decay: per-rank decay factor for co-liker contributions (0.0 to 1.0).
     // 0.0 = disabled (current behavior). 0.2 = each successive co-liker like gets 20% less weight.
     pub corater_decay: f64,
+
+    /// Follow-seed experiment arm for this user. `None` = not enrolled, so the
+    /// `FOLLOW_SEED_READ_ENABLED` config applies instead.
+    ///
+    /// Threaded on the params struct because the seed step runs too deep to know a per-user
+    /// randomized assignment, and because it must be the ARM rather than the realised seed kind.
+    pub follow_seed_arm: Option<bool>,
 }
 
 impl Default for LinkLonkParams {
@@ -72,6 +79,7 @@ impl Default for LinkLonkParams {
             use_author_affinity: false,
             seed_sample_pool: 0,
             corater_decay: 0.0,
+            follow_seed_arm: None,
         }
     }
 }
@@ -186,6 +194,7 @@ pub fn apply_thompson_params(
         max_algo_checks: thompson.max_algo_checks,
         seed_sample_pool: thompson.seed_sample_pool,
         corater_decay: thompson.corater_decay_pct as f64 / 100.0,
+        follow_seed_arm: thompson.follow_seed_arm,
         // Keep other params from base preset
         ..base
     }

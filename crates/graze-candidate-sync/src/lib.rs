@@ -6,6 +6,7 @@
 
 pub mod coliker_profiles;
 pub mod config;
+pub mod follow_seeds;
 pub mod metrics;
 pub mod sync;
 

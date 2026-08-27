@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "graze-build-coliker-profiles"
 path = "src/bin/build_coliker_profiles.rs"
 
+[[bin]]
+name = "graze-build-follow-seeds"
+path = "src/bin/build_follow_seeds.rs"
+
 [lib]
 name = "graze_candidate_sync"
 path = "src/lib.rs"

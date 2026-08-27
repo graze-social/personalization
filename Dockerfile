@@ -41,6 +41,7 @@ COPY --from=builder /app/target/release/graze-like-streamer /app/graze-like-stre
 COPY --from=builder /app/target/release/graze-candidate-sync /app/graze-candidate-sync
 # Phase A of the durable co-liker profile design; built by -p graze-candidate-sync.
 COPY --from=builder /app/target/release/graze-build-coliker-profiles /app/graze-build-coliker-profiles
+COPY --from=builder /app/target/release/graze-build-follow-seeds /app/graze-build-follow-seeds
 COPY --from=builder /app/target/release/graze-backfill-ula /app/graze-backfill-ula
 COPY --from=builder /app/target/release/graze-backfill /app/graze-backfill
 COPY --from=builder /app/target/release/graze-frontdoor /app/graze-frontdoor

@@ -1,0 +1,63 @@
+# Keep follow-graph seeds (`uf:{hash}`) in step with new unreachable users.
+#
+# The first population run was a one-shot pod, which makes the seeds a snapshot. Roughly 290 users
+# per day newly hit `no_user_data`, and without a seed for them the treatment arm is under-delivered
+# for exactly the users follow-seeding exists to reach. That is the same class of failure that made
+# the holdout unconvergeable: ~39% of the treatment arm receiving no personalized content at all.
+#
+# Cheap to run wide: users that already have a fresh `uf:` or a `uf:miss:` marker are skipped after
+# two Redis EXISTS, so a 7-day lookback re-checks stragglers without re-fetching anyone. The AppView
+# call is the only real cost and it is rate-limited by FOLLOW_SEED_REQUEST_DELAY_MS.
+#
+# 04:23 UTC: off-peak, and off the :00/:30 marks everything else lands on.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: personalization-follow-seeds
+  namespace: default
+spec:
+  schedule: "23 4 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: docr-graze-social-labs
+          containers:
+            - name: follow-seeds
+              # Pinned by DIGEST. The release workflow publishes `latest` and a short SHA, both
+              # mutable, so a tag here would silently change what this job runs. Bump it with any
+              # deploy that changes the binary.
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:c7b9af9c17055c245768826eeeb61caf221c5e57238aa288f03590df912d709d
+              command: ["/app/graze-build-follow-seeds"]
+              env:
+                # Headroom over the ~290/day arrival rate, so a backlog after an outage still clears.
+                - name: FOLLOW_SEED_MAX_USERS
+                  value: "1500"
+                - name: FOLLOW_SEED_LOOKBACK_DAYS
+                  value: "7"
+                - name: RUST_LOG
+                  value: "info"
+              # Same ordering as personalization-api: both app-secrets and personalization-secrets
+              # define REDIS_URL and the later entry wins, so this writes to the Valkey the service
+              # reads.
+              envFrom:
+                - configMapRef:
+                    name: personalization-env
+                - secretRef:
+                    name: app-secrets
+                - secretRef:
+                    name: personalization-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi

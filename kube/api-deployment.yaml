@@ -107,21 +107,34 @@ spec:
                 configMapKeyRef:
                   name: graze-personalization-config
                   key: default-max-likers-per-post
-          livenessProbe:
-            httpGet:
-              path: /internal/alive
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
-          readinessProbe:
+          # startupProbe, NOT readinessProbe, for the Redis-dependent check.
+          #
+          # /internal/ready returns 503 when a Redis ping fails. All replicas share one Valkey, so
+          # as a readinessProbe a single blip fails readiness on every pod simultaneously and empties
+          # the Service -- a correlated total outage, strictly worse than serving degraded responses.
+          # This repo already has that failure mode on record elsewhere: a readiness check tied to an
+          # upstream dependency is what wedged network-cache on grazer-prod2 for hours.
+          #
+          # As a startupProbe it gates initial traffic until Redis is connected and is then never
+          # evaluated again, so a later blip cannot take pods out of rotation. 3s x 40 = up to 120s
+          # to connect before the pod is failed.
+          startupProbe:
             httpGet:
               path: /internal/ready
               port: 8080
-            initialDelaySeconds: 5
-            periodSeconds: 5
+            periodSeconds: 3
             timeoutSeconds: 3
+            failureThreshold: 40
+          # /internal/alive is a static 200, so it cannot correlate-fail on a dependency. This is
+          # what actually fixes the rollout gap: without any readinessProbe, Kubernetes marks a pod
+          # Ready the instant the container starts and routes traffic to it before the HTTP listener
+          # is accepting connections.
+          readinessProbe:
+            httpGet:
+              path: /internal/alive
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           securityContext:
             runAsNonRoot: true

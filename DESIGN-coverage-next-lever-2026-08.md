@@ -334,3 +334,69 @@ collapse.
    500 ms Thompson gate at 2,530 sources. Cheap, and it is the one number this measurement did not
    settle.
 4. **Then** the randomized experiment, with the holdout window reset in the same change.
+
+---
+
+# Latency pre-flight (2026-08-27): the 500-post scoring cap is the answer
+
+Driven against the real `/v1/personalize` path on 8 genuinely-seeded production users (selected as
+recently personalized, so their seed and pool are live), sweeping `max_total_sources`.
+`/v1/invalidate` clears both `ll:{algo}:{hash}` and `colikes:{hash}`, so cold calls include the
+fan-out and warm calls isolate the cached per-request path.
+
+## Response latency
+
+| max_total_sources | cold p50 | cold max | warm p50 | warm max |
+|---:|---:|---:|---:|---:|
+| 250 | 491 ms | 854 ms | 41 ms | 284 ms |
+| 500 | 585 ms | 1,547 ms | 33 ms | 214 ms |
+| 1,000 | 200 ms | 456 ms | 16 ms | 30 ms |
+| **2,530** | **406 ms** | **815 ms** | **20 ms** | **46 ms** |
+| 5,000 | 682 ms | 1,047 ms | 29 ms | 73 ms |
+| 10,000 | 342 ms | 627 ms | 17 ms | 35 ms |
+
+**There is no trend.** 250 → 2,530 gives 0.83× cold and 0.48× warm — latency *decreasing* with more
+sources, which cannot be a real effect. The variation is noise at n=8.
+
+## Why: `total_scored` saturates at a hard cap of 500
+
+| max_total_sources | median `total_scored` | median `posts_checked` |
+|---:|---:|---:|
+| 250 | **86** | 23,734 |
+| 1,000 | 364 | 23,734 |
+| **2,530** | **500** | 23,734 |
+| 10,000 | 500 | 23,734 |
+
+`posts_checked` is flat at 23,734 — the candidate-pool scan is a fixed cost independent of sources.
+`total_scored` rises with sources and **saturates at 500**, which it reaches by ~2,530.
+
+## Corrected conclusion, and a correction to my own framing
+
+Earlier in this document I wrote that 6.2× the sources means 6.2× the scoring work. **That is wrong.**
+Scoring work *is* source-driven, but only until the 500-post cap, and follow-seeding's 2,530 sources
+is right where that cap binds. The cap is the protection: going from 410 to 2,530 sources moves users
+from **under-scored to saturated**, not from saturated to 6× saturated.
+
+**Honest limit on this measurement:** `scoring_time_ms` medians came out 92 / 158 / 82 / 152 ms across
+the four configurations — no resolvable trend even though `total_scored` went 86 → 500. At n=6 per
+config the variance (Redis latency, pool contention, node noise) dominates the signal. So the right
+statement is *bounded by the cap*, not *costs exactly X ms more*. Worth a larger sample if anyone
+wants the marginal number.
+
+## Two findings that were not the question
+
+**1. The cold path already breaches the 500 ms gate today, at every source count** — cold p50 ranges
+200–682 ms and cold max reaches 1,547 ms, including at the current default. This is pre-existing and
+independent of follow-seeding; it deserves its own investigation rather than being attributed to this
+change. Warm p50 of 16–41 ms is what users actually experience on cached requests, comfortably inside
+the gate.
+
+**2. At 250 sources the scorer is starved** — median 86 posts scored against a possible 500. That is
+an independent argument for more sources, and it explains T21 from the other side: capping at 250 was
+not an improvement precisely because it leaves 83% of the scoring budget unused.
+
+## Verdict
+
+**Latency is not a blocker for follow-seeding.** The source increase is bounded by the 500-post
+scoring cap, per-request warm latency is 16–41 ms, and the cold-path gate breach is pre-existing.
+Build order item 3 is cleared; proceed to the follow-specific filter and weight.

@@ -1,0 +1,142 @@
+# Is the follow-seed treatment actually being DELIVERED?
+#
+# Deliberately not a like_rate readout. Only ~322 users have a uf: seed, so ~161 land in treatment --
+# and the holdout has 4,600 units while still sitting at p=0.11, so a like_rate comparison at this
+# size cannot resolve. The answerable question now is the mechanism one: does no_user_data FALL in the
+# treated arm? That is a large effect on an event every single impression carries.
+#
+# This is the gate on every downstream number. If the arms do not differ here the treatment is inert,
+# and a null like_rate would mean "undelivered", not "follows do not help". That distinction is
+# exactly what went wrong with the durable co-liker profiles, whose keys had silently expired.
+#
+# 15:07 UTC = 08:07 America/Los_Angeles: morning for the reader, and off the :00/:30 marks.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: personalization-dose-check-src
+  namespace: default
+data:
+  dose.py: |
+    """Follow-seed dose check: enrolment balance, then delivery."""
+    import os
+    import clickhouse_connect
+
+    # The flip moment. Rows before this carry no arm, and an absent JSON field extracts as false --
+    # so without this bound every pre-flip row would land in the control arm.
+    FLIP = os.environ.get("FOLLOW_SEED_FLIP_AT", "2026-08-27 17:29:54")
+    DEC = "tryBase64Decode(interaction_feed_context)"
+    ARM = f"JSONExtractBool({DEC},'params','follow_seed')"
+    SEEN = "app.bsky.feed.defs#interactionSeen"
+
+    c = clickhouse_connect.get_client(
+        host=os.environ["CLICKHOUSE_HOST"],
+        port=int(os.environ.get("CLICKHOUSE_PORT", "8443")),
+        username=os.environ.get("CLICKHOUSE_USER", "default"),
+        password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
+        database="default",
+        secure=True,
+    )
+
+    BASE = f"""FROM default.feed_interactions
+    WHERE occurred >= toDateTime('{FLIP}') AND interaction_feed_context != ''
+      AND JSONHas({DEC},'algo_id')
+      AND JSONHas({DEC},'params','follow_seed')
+      AND interaction_event = '{SEEN}'"""
+
+    print(f"=== follow-seed dose check (since {FLIP}Z) ===\n")
+
+    rows = c.query(f"""SELECT {ARM} AS arm, count() AS imp, uniqExact(did) AS users
+                       {BASE} GROUP BY arm ORDER BY arm""").result_rows
+    if not rows:
+        print("  NO ENROLLED ROWS YET. Clients echo feedContext back with a lag.")
+        print("  Not a failure signal on its own -- but if this persists past a day, check that")
+        print("  FOLLOW_SEED_EXPERIMENT_ENABLED is still 1 on deploy/personalization-api.")
+        raise SystemExit(0)
+
+    tot_u = sum(r[2] for r in rows) or 1
+    for arm, imp, users in rows:
+        label = "treatment (seed allowed)" if arm else "control (withheld)"
+        print(f"  {label:<26} impressions={imp:<8,} users={users:<6,} ({users/tot_u*100:.0f}%)")
+    if len(rows) < 2:
+        print("\n  ONLY ONE ARM PRESENT -- cannot compare. Too early, or assignment is broken.")
+        raise SystemExit(0)
+    # A lopsided split means the hash assignment is wrong, and every comparison below is void.
+    t_share = next((r[2] for r in rows if r[0]), 0) / tot_u
+    if tot_u >= 100 and not (0.40 <= t_share <= 0.60):
+        print(f"\n  !! SPLIT IS LOPSIDED ({t_share*100:.0f}% treated) on {tot_u} users.")
+        print("     Expected ~50/50. Suspect the assignment before reading anything below.")
+
+    print("\n=== DOSE: is the treatment reaching anyone? ===")
+    q = f"""SELECT {ARM} AS arm, count() AS n,
+      countIf(JSONExtractString({DEC},'fallback_reason') = 'no_user_data') AS nud,
+      countIf(JSONExtractInt({DEC},'personalized_count') > 0) AS pers
+      {BASE} GROUP BY arm ORDER BY arm"""
+    res = {arm: (n, nud, pers) for arm, n, nud, pers in c.query(q).result_rows}
+    for arm in (False, True):
+        if arm not in res:
+            continue
+        n, nud, pers = res[arm]
+        label = "treatment" if arm else "control  "
+        print(f"  {label}  n={n:<8,} no_user_data={nud:<7,} ({nud/max(n,1)*100:5.1f}%)"
+              f"   personalized={pers:<7,} ({pers/max(n,1)*100:5.1f}%)")
+
+    if False in res and True in res:
+        cn, cnud, cpers = res[False]
+        tn, tnud, tpers = res[True]
+        d_nud = tnud / max(tn, 1) - cnud / max(cn, 1)
+        d_pers = tpers / max(tn, 1) - cpers / max(cn, 1)
+        print(f"\n  no_user_data  treatment - control = {d_nud*100:+.2f}pp   (want NEGATIVE)")
+        print(f"  personalized  treatment - control = {d_pers*100:+.2f}pp   (want POSITIVE)")
+        if min(cn, tn) < 500:
+            print(f"\n  ⚠ UNDERPOWERED: smallest arm has {min(cn,tn):,} impressions. Directional only.")
+        elif d_nud < -0.01 and d_pers > 0.01:
+            print("\n  DELIVERED: the seed is reaching users the like graph could not.")
+            print("  A like_rate readout becomes meaningful as seeds accrue (~290/day).")
+        else:
+            print("\n  NOT DELIVERED: the arms do not differ on coverage.")
+            print("  Nothing downstream is interpretable. Check (a) the follow-seeds CronJob has")
+            print("  run, (b) uf: keys exist and have not expired, (c) the read path flag is on.")
+            print("  A null like_rate here would mean UNDELIVERED, not 'follows do not help'.")
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: personalization-dose-check
+  namespace: default
+spec:
+  schedule: "7 15 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      template:
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: dockerhub-secret
+          volumes:
+            - name: src
+              configMap:
+                name: personalization-dose-check-src
+          containers:
+            - name: dose
+              image: dgaff/graze-analysis@sha256:a590d81cd2045bf680e4b2c3b61ddfa861a30ddbf5f49f8aa1a822761b261bc2
+              command: ["python", "/src/dose.py"]
+              volumeMounts:
+                - name: src
+                  mountPath: /src
+              env:
+                # Must match the moment FOLLOW_SEED_EXPERIMENT_ENABLED went to 1. Re-set it if the
+                # experiment is ever restarted, or pre-flip rows silently join the control arm.
+                - name: FOLLOW_SEED_FLIP_AT
+                  value: "2026-08-27 17:29:54"
+              envFrom:
+                - configMapRef:
+                    name: personalization-env
+                - secretRef:
+                    name: app-secrets
+                - secretRef:
+                    name: personalization-secrets

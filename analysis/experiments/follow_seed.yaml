@@ -16,7 +16,7 @@ design: ab
 # ⚠️ MUST be set to the moment FOLLOW_SEED_EXPERIMENT_ENABLED goes live, and re-set on any change to
 # traffic_pct or salt — both move the hash boundary and reassign users, which starts a different
 # experiment. The holdout spec has already been reset twice for exactly this reason.
-start: "2026-12-31T00:00:00Z"
+start: "2026-08-27T17:29:54Z"
 
 unit: user
 primary_metric: like_rate

@@ -547,6 +547,33 @@ impl Keys {
         format!("ucl:{}", user_did_hash)
     }
 
+    // ═══════════════════════════════════════════════════════════════════════════════
+    // Follow-graph seed keys
+    // ═══════════════════════════════════════════════════════════════════════════════
+
+    /// Hashed authors this user FOLLOWS, as a seed for users with no like history.
+    ///
+    /// Measured 2026-08-27: `no_user_data` is 98.1% of addressable non-personalization, and 73.6%
+    /// of those users have zero likes in 365 days. The engine seeds exclusively from likes, so they
+    /// are structurally unreachable by it — but 86% of them follow 10+ accounts (median 50).
+    /// Follows are the one seed that does not require a like history.
+    ///
+    /// Scores are a uniform placeholder: a follow carries no strength signal the way a like count
+    /// does, and picking the real weight is a separate decision (see
+    /// `DESIGN-coverage-next-lever-2026-08.md`).
+    pub fn user_follows(user_did_hash: &str) -> String {
+        format!("uf:{}", user_did_hash)
+    }
+
+    /// Marker that a follow fetch was attempted and produced nothing usable.
+    ///
+    /// Exists because an empty ZSET cannot persist in Redis, so the absence of `uf:` cannot
+    /// distinguish "never tried" from "tried, no follows". Without it every run would re-fetch the
+    /// same unusable accounts forever. Carries a short TTL so genuine new follows are picked up.
+    pub fn user_follows_miss(user_did_hash: &str) -> String {
+        format!("uf:miss:{}", user_did_hash)
+    }
+
     /// DEPRECATED: Use author_likers_date() for new writes.
     #[inline]
     pub fn author_likers_day(author_did_hash: &str, day: u8) -> String {

@@ -45,6 +45,7 @@ WORKDIR /app
 COPY --from=builder /app/target/release/graze-api /app/graze-api
 COPY --from=builder /app/target/release/graze-candidate-sync /app/graze-candidate-sync
 COPY --from=builder /app/target/release/graze-build-coliker-profiles /app/graze-build-coliker-profiles
+COPY --from=builder /app/target/release/graze-build-follow-seeds /app/graze-build-follow-seeds
 
 COPY lua ./lua
 

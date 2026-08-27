@@ -85,8 +85,12 @@ data:
     unlabelled = sum(r[1] for r in rows if r[0] == UNLABELLED)
     if unlabelled:
         print(f"\n  !! {unlabelled:,} impressions ({unlabelled/total*100:.1f}%) are UNLABELLED --")
-        print("     served by a build predating fallback_reason (2026-08-26). Until this reaches ~0")
-        print("     the shares below understate every cause. Do not quote them as final.")
+        print("     served by a build predating fallback_reason (2026-08-26), echoed back by clients")
+        print("     scrolling feeds served before it. This tail decays with FEED age, not wall clock,")
+        print("     so it is not expected to reach zero.")
+        print("     => The impression-share column ABOVE is diluted by it: read it as a lower bound.")
+        print("     => The addressable composition and hourly check BELOW divide within the failure")
+        print("        set, so they are NOT affected. Those are the numbers to quote.")
     addressable = [r for r in rows
                    if r[0] not in ('PERSONALIZED', 'personalization_holdout', 'no_auth', UNLABELLED)]
     addr_total = sum(r[1] for r in addressable) or 1
@@ -97,61 +101,87 @@ data:
 
     # Per-USER, because per-impression is biased: zero-seed users paginate at a ~1s cadence against
     # ~60s for seeded users, so they are ~23% of people but ~50% of requests.
+    #
+    # The TREATED ARM is the headline. An earlier version of this block counted all users, including
+    # the ~20% personalization holdout who are SUPPOSED to receive zero -- it printed 52.4% and was
+    # mistaken for confirmation of a 52% figure measured on the treated arm alone, when the matched
+    # number was 38.7%. Two populations, one number, coincidentally equal. Both are printed now, and
+    # which is which is stated.
     print("\n=== per-user view (per-impression is pagination-biased) ===")
-    rows = q(f"""
-      WITH u AS (
-        SELECT did,
-               countIf(JSONExtractInt({DEC},'personalized_count') > 0) AS pers,
-               countIf({CAUSE} != 'UNLABELLED (pre-instrumentation)') AS tot
-        FROM default.feed_interactions
-        WHERE {WINDOW} AND interaction_feed_context != '' AND ({POP})
-          AND interaction_event = '{SEEN}'
-        GROUP BY did
-        HAVING tot > 0)
-      SELECT countIf(pers=0) AS zero_pers, countIf(pers>0) AS some_pers,
-             round(avg(pers/tot)*100,2) AS mean_pct
-      FROM u
-    """)
-    z, s, m = rows[0]
-    print(f"  users with ZERO personalized impressions : {z:,}")
-    print(f"  users with >0                            : {s:,}")
-    if z + s:
-        print(f"  => {z/(z+s)*100:.1f}% of users the engine did not serve at all")
-    print(f"  mean share of a user's impressions personalized: {m}%")
+    HOLDOUT = f"JSONExtractBool({DEC},'is_personalization_holdout')"
+    for label, extra, headline in (
+        ("TREATED ARM (the number that matters)", f"AND {HOLDOUT} = 0", True),
+        ("all users, holdout included (NOT comparable to the above)", "", False),
+    ):
+        rows = q(f"""
+          WITH u AS (
+            SELECT did,
+                   countIf(JSONExtractInt({DEC},'personalized_count') > 0) AS pers,
+                   countIf({CAUSE} != 'UNLABELLED (pre-instrumentation)') AS tot
+            FROM default.feed_interactions
+            WHERE {WINDOW} AND interaction_feed_context != '' AND ({POP})
+              AND interaction_event = '{SEEN}' {extra}
+            GROUP BY did
+            HAVING tot > 0)
+          SELECT countIf(pers=0) AS zero_pers, countIf(pers>0) AS some_pers,
+                 round(avg(pers/tot)*100,2) AS mean_pct
+          FROM u
+        """)
+        z, sm, m = rows[0]
+        print(f"  {label}")
+        print(f"    zero personalized: {z:,}   some: {sm:,}", end="")
+        if z + sm:
+            print(f"   => {z/(z+sm)*100:.1f}% never served", end="")
+        print(f"   (mean personalized share {m}%)")
+    print("  NB 'never served' here = never received a RESPONSE CONTAINING personalized content.")
+    print("     A stricter reading -- never SAW a personalized item -- gives a higher figure.")
 
     # Diurnal stability. This is the whole reason the window is 24h: if a cause's share swings by
     # hour, any single-window figure (including the 73% from a 6-hour log scrape) is a sample of the
     # traffic mix, not a property of the system.
-    print("\n=== hourly share of the top addressable cause (drift check) ===")
+    #
+    # The metric here is the cause's share OF ADDRESSABLE FAILURES, not of all impressions. That
+    # choice is what makes it robust: an earlier version divided by all labelled impressions and
+    # gated out any hour under 90% instrumented, which skipped 20 of 24 hours. The unlabelled tail
+    # does not decay with wall clock the way that gate assumed -- clients echo blobs from feeds
+    # served before the instrumentation shipped, so 200+ unlabelled rows still arrive in the newest
+    # hours and the gate would keep the check permanently blind. Dividing within the failure set
+    # removes PERSONALIZED from the denominator entirely, so old personalized rows cannot pin an
+    # hour near zero. The remaining assumption is only that unlabelled failures have a similar cause
+    # mix to labelled ones, which is far weaker than requiring 90% instrumentation.
+    print("\n=== hourly composition of addressable failures (drift check) ===")
     if addressable:
         top = addressable[0][0]
+        addr_names = ", ".join("'" + r[0].replace("'", "\\'") + "'" for r in addressable)
         rows = q(f"""
           SELECT toStartOfHour(occurred) AS h,
                  countIf(JSONExtractString({DEC},'fallback_reason') = '{top}') AS c,
-                 countIf({CAUSE} != 'UNLABELLED (pre-instrumentation)') AS n,
+                 countIf(JSONExtractString({DEC},'fallback_reason') IN ({addr_names})) AS addr,
+                 countIf({CAUSE} = 'UNLABELLED (pre-instrumentation)') AS unl,
                  count() AS n_all
           FROM default.feed_interactions
           WHERE {WINDOW} AND interaction_feed_context != '' AND ({POP})
             AND interaction_event = '{SEEN}'
-          GROUP BY h HAVING n > 0 ORDER BY h
+          GROUP BY h ORDER BY h
         """)
-        # An hour is only comparable if nearly all of it carries the field. A partly-instrumented
-        # hour puts old PERSONALIZED rows in the denominator while its non-personalized rows are
-        # unlabelled, which pins it near 0% and would read as a real diurnal trough.
-        shares, skipped = [], 0
-        for h, cc, n, n_all in rows:
-            if n_all == 0 or n / n_all < 0.9:
-                skipped += 1
+        MIN_ADDR = 20  # below this the ratio is noise, not drift
+        shares, thin = [], 0
+        print(f"  {'hour':<21}{top:>16}{'addr n':>9}{'unlab':>8}")
+        for h, cc, addr, unl, n_all in rows:
+            if addr < MIN_ADDR:
+                thin += 1
                 continue
-            pct = cc / n * 100
+            pct = cc / addr * 100
             shares.append(pct)
-            print(f"  {h}  {top}: {pct:5.1f}%  (n={n:,})")
-        if skipped:
-            print(f"  [{skipped} hour(s) skipped: under 90% instrumented, not comparable]")
+            unl_pct = unl / n_all * 100 if n_all else 0.0
+            print(f"  {str(h):<21}{pct:>15.1f}%{addr:>9,}{unl_pct:>7.0f}%")
+        if thin:
+            print(f"  [{thin} hour(s) omitted: fewer than {MIN_ADDR} addressable failures, ratio is noise]")
         if len(shares) >= 2:
             lo, hi = min(shares), max(shares)
             print(f"\n  range across the cycle: {lo:.1f}% .. {hi:.1f}%  (spread {hi-lo:.1f}pp)")
             print("  A wide spread means single-window figures are not comparable to each other.")
+            print("  The 'unlab' column is data quality only -- it no longer affects the ratio.")
     else:
         print("  no addressable causes in window")
 ---

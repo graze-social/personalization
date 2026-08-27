@@ -3,6 +3,21 @@ name: Release Docker Build
 on:
   release:
     types: [published]
+  # On-demand builds, so shipping a change does not require cutting a release.
+  #
+  # Without this the only way to produce an amd64 image was a local build, and this repo's
+  # Dockerfiles have no cargo cache mounts -- so every iteration was a full cold Rust compile
+  # under QEMU on an arm64 dev host (~15 min, load ~9). These runners are natively amd64, so the
+  # same build needs no emulation at all.
+  #
+  # A dispatch build has no semver tag to derive from, so it publishes `latest` and the short SHA;
+  # deploy by digest rather than by either of those, since both are mutable.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (defaults to the branch this is dispatched on)"
+        required: false
+        type: string
 
 concurrency:
   group: release-${{ github.ref }}
@@ -14,6 +29,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

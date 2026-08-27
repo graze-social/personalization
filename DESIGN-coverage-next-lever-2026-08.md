@@ -255,3 +255,82 @@ the numerator of the value and the denominator of the noise, now confirmed from 
    have produced a null read as "the idea doesn't work." Do not repeat it.
 4. **Interleaving for ranker iteration**, once there is personalized content to interleave.
 5. **Durable profiles stay shelved** at a 3.7% ceiling.
+
+---
+
+# Fan-out cost, measured (2026-08-27)
+
+Measured against prod Valkey for 24 real users from the unreachable cohort, using their actual
+follow lists from the AppView, hashed with the same SHA256-first-16-hex `hash_did`. Cost model taken
+from `author_affinity.rs::compute_author_colikes`: one `ZREVRANGE` on the seed, then
+`6 x ZREVRANGEBYSCORE` per surviving author (`DEFAULT_RETENTION_DAYS=6`), each limited to
+`AUTHOR_AFFINITY_MAX_LIKERS_PER_AUTHOR=100`, authors capped at `AUTHOR_AFFINITY_MAX_AUTHORS=100`.
+
+| | follow-seeded | like-seeded (current, users *with* a seed) | ratio |
+|---|---:|---:|---:|
+| median seed authors | **59** | 6 | 9.8× |
+| median Redis ops / user | **354** | 40 | 8.9× |
+| median liker members read | **2,864** | ~410 | 7.0× |
+| median **unique sources** | **2,530** | 410 | **6.2×** |
+| max unique sources | 6,016 | — | |
+| wall clock | **90 ms/user** | — | |
+
+Baseline note: of 24 sampled `ula:` users only **18 had a usable seed** after the
+`min_author_likes >= 2` filter, and the all-users median seed is **2 authors**. The current path is
+thin even for users it does serve.
+
+## The verdict on cost: affordable, because the fan-out is cached hourly
+
+`AUTHOR_AFFINITY_TTL_SECONDS=3600` with a 600 s refresh threshold, so this runs about **once per user
+per hour, not per request**. 354 ops at 90 ms, amortised over an hour, is not a per-request cost.
+
+Rough scale check: provenance shows on the order of 900 distinct users per 24h, so ~100–200
+author-affinity recomputations per hour → **roughly 20–70 ops/sec**. Against the measured Valkey
+baseline where `zcard` alone runs ~2,655/sec and is 26.6% of all commands, this is under 1%. The
+fan-out is not the problem.
+
+**2,530 median unique sources also sits comfortably under `max_total_sources = 10000`**, and T21
+found capping at 250 was not an improvement and leaned negative — so more sources is not a known
+harm. The number to watch is end-to-end latency against the Thompson speed gate
+(`max_response_time_ms = 500`), since 6.2× the sources means 6.2× the scoring work, and scoring is
+the CPU-heavy stage rather than the fan-out.
+
+## 🔴 Correction: "substitutes the seed set and leaves the rest unchanged" was wrong
+
+The claim earlier in this document that follow-seeding is a pure seed swap does not survive reading
+the aggregation loop. Two things in `compute_author_colikes` are **like-count-dependent**:
+
+```rust
+.filter(|(_, like_count)| *like_count >= min_author_likes as f64)   // MIN_AUTHOR_LIKES = 2
+let weight = user_like_count.sqrt();                                // the aggregation weight
+```
+
+A follow carries no like count. So a naive seed swap yields **every followed author filtered out**
+(score absent or 0, below 2), and weight `sqrt(0) = 0` for anything that slipped through. The fan-out
+and the scorer are genuinely reusable; the **filter and the weight are not**, and they need to be
+designed rather than inherited.
+
+### Recommended weighting, and why
+
+Uniform weight 1.0 is the obvious placeholder but throws away the only affinity signal available.
+The principled option is **inverse author popularity** — a follow of a niche account says far more
+about a user than a follow of a huge one, which is the same intuition as LinkLonk's fairness term
+`1/|items source upvoted|` that production already relies on to stop prolific upvoters dominating.
+
+Conveniently the fan-out already reads each author's liker-set size, so `1 / sqrt(|authl|)` costs
+nothing extra. **This is a design decision that needs its own validation, not an assumption** — it is
+exactly the kind of unvalidated modelling choice that made the T17 "ranking signal is noise" claim
+wrong (it was measuring the harness, not production) and the T7 inverted-lookup cost argument
+collapse.
+
+## Revised build order
+
+1. **Follow fetch + cache**, TTL well beyond the experiment horizon. Follows are far more stable than
+   likes, so a long TTL is both safe and cheap — and the durable-profile silent expiry is the
+   specification for getting this wrong.
+2. **A follow-specific filter and weight** in the author-affinity seed step. Start with uniform, ship
+   inverse-popularity behind a flag, and let the randomized experiment choose.
+3. **Latency pre-flight before exposing anyone:** score a follow-seeded user end-to-end and check the
+   500 ms Thompson gate at 2,530 sources. Cheap, and it is the one number this measurement did not
+   settle.
+4. **Then** the randomized experiment, with the holdout window reset in the same change.

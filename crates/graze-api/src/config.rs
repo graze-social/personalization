@@ -353,6 +353,16 @@ pub struct Config {
     /// Total cached pool members across all algos. Bounded on members rather than entries because
     /// pools range from 1 to ~40,000, so an entry cap would bound almost nothing.
     pub pool_cache_max_members: usize,
+    /// Seed author-affinity from `uf:{hash}` (followed authors) when the like-based seed is empty.
+    ///
+    /// Defaults OFF: this is the read path for follow seeds, and it changes what users are served.
+    /// Turning it on is a treatment change and therefore resets the holdout experiment window.
+    pub follow_seed_read_enabled: bool,
+    /// How a followed author is weighted: `uniform` or `inverse_popularity`.
+    ///
+    /// A follow carries no strength signal the way a like count does, so unlike the like path there
+    /// is no weight to inherit -- one has to be chosen, and the choice needs its own validation.
+    pub follow_seed_weight_mode: String,
     pub author_affinity_enabled: bool,
     pub max_liked_authors_per_user: usize,
     pub max_likers_per_author: usize,
@@ -662,6 +672,9 @@ impl Config {
             // Author-Affinity
             pool_cache_ttl_seconds: parse_u64_env("POOL_CACHE_TTL_SECONDS", 30),
             pool_cache_max_members: parse_usize_env("POOL_CACHE_MAX_MEMBERS", 600_000),
+            follow_seed_read_enabled: parse_bool_env("FOLLOW_SEED_READ_ENABLED", false),
+            follow_seed_weight_mode: std::env::var("FOLLOW_SEED_WEIGHT_MODE")
+                .unwrap_or_else(|_| "uniform".to_string()),
             author_affinity_enabled: parse_bool_env("AUTHOR_AFFINITY_ENABLED", true),
             max_liked_authors_per_user: parse_usize_env("MAX_LIKED_AUTHORS_PER_USER", 500),
             max_likers_per_author: parse_usize_env("MAX_LIKERS_PER_AUTHOR", 1000),

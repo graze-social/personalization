@@ -160,17 +160,20 @@ fn encode_feed_context(
     };
     let (params, response_time_ms, is_holdout) = match thompson_meta {
         Some(meta) => (
-            Some(ProvenanceParams::from_selected(
-                meta.params.min_post_likes,
-                meta.params.max_likers_per_post,
-                meta.params.max_total_sources,
-                meta.params.max_algo_checks,
-                meta.params.min_co_likes,
-                meta.params.max_user_likes,
-                meta.params.max_sources_per_post,
-                meta.params.seed_sample_pool,
-                meta.params.corater_decay_pct,
-            )),
+            Some(
+                ProvenanceParams::from_selected(
+                    meta.params.min_post_likes,
+                    meta.params.max_likers_per_post,
+                    meta.params.max_total_sources,
+                    meta.params.max_algo_checks,
+                    meta.params.min_co_likes,
+                    meta.params.max_user_likes,
+                    meta.params.max_sources_per_post,
+                    meta.params.seed_sample_pool,
+                    meta.params.corater_decay_pct,
+                )
+                .with_follow_seed(meta.params.follow_seed_arm),
+            ),
             Some(meta.response_time_ms),
             Some(meta.is_holdout),
         ),
@@ -908,6 +911,24 @@ pub async fn get_feed_skeleton(
                             value = v,
                             "ab_experiment_assigned"
                         );
+                    }
+                }
+
+                // Follow-seed experiment: a per-user on/off assignment, orthogonal to both the
+                // bandit experiment above and the holdout (its own salt).
+                //
+                // The holdout is never enrolled -- holdout users receive no personalization at all,
+                // so granting them a seed capability would be meaningless and would blur two arms.
+                if state.config.follow_seed_experiment_enabled && !thompson_params.is_holdout {
+                    let fs_exp = crate::algorithm::FollowSeedExperiment {
+                        enabled: true,
+                        traffic_pct: state.config.follow_seed_experiment_traffic_pct,
+                        salt: state.config.follow_seed_experiment_salt.clone(),
+                    };
+                    thompson_params.follow_seed_arm =
+                        fs_exp.assign(user_did.as_deref().unwrap_or(""));
+                    if let Some(arm) = thompson_params.follow_seed_arm {
+                        debug!(algo_id, arm, "follow_seed_experiment_assigned");
                     }
                 }
 

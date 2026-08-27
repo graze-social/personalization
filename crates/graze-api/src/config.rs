@@ -358,6 +358,13 @@ pub struct Config {
     /// Defaults OFF: this is the read path for follow seeds, and it changes what users are served.
     /// Turning it on is a treatment change and therefore resets the holdout experiment window.
     pub follow_seed_read_enabled: bool,
+    /// Randomize follow-seeding per user instead of applying `follow_seed_read_enabled` to everyone.
+    ///
+    /// When on, the arm decides and `follow_seed_read_enabled` is ignored. This is what makes the
+    /// change measurable rather than merely shipped.
+    pub follow_seed_experiment_enabled: bool,
+    pub follow_seed_experiment_traffic_pct: u32,
+    pub follow_seed_experiment_salt: String,
     /// How a followed author is weighted: `uniform` or `inverse_popularity`.
     ///
     /// A follow carries no strength signal the way a like count does, so unlike the like path there
@@ -673,6 +680,13 @@ impl Config {
             pool_cache_ttl_seconds: parse_u64_env("POOL_CACHE_TTL_SECONDS", 30),
             pool_cache_max_members: parse_usize_env("POOL_CACHE_MAX_MEMBERS", 600_000),
             follow_seed_read_enabled: parse_bool_env("FOLLOW_SEED_READ_ENABLED", false),
+            follow_seed_experiment_enabled: parse_bool_env("FOLLOW_SEED_EXPERIMENT_ENABLED", false),
+            follow_seed_experiment_traffic_pct: parse_u32_env(
+                "FOLLOW_SEED_EXPERIMENT_TRAFFIC_PCT",
+                100,
+            ),
+            follow_seed_experiment_salt: std::env::var("FOLLOW_SEED_EXPERIMENT_SALT")
+                .unwrap_or_else(|_| "v1".to_string()),
             follow_seed_weight_mode: std::env::var("FOLLOW_SEED_WEIGHT_MODE")
                 .unwrap_or_else(|_| "uniform".to_string()),
             author_affinity_enabled: parse_bool_env("AUTHOR_AFFINITY_ENABLED", true),

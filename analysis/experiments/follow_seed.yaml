@@ -1,0 +1,75 @@
+# Does seeding personalization from the FOLLOW graph reach users the like graph cannot?
+#
+# The engine seeds exclusively from likes. Measured 2026-08-27: `no_user_data` is 98.1% of
+# addressable non-personalization (100.0% in 22 of 24 hours), and 73.6% of the users it turns away
+# have zero likes in 365 days — so nothing built from like history reaches them, which is why
+# durable co-liker profiles cap out at 3.7%. But 86% of them follow 10+ accounts, median 50.
+#
+# This is the randomized test of that idea. It also matters for the holdout: ~39% of the treatment
+# arm currently receives no personalized content at all, so the holdout measures a treatment that is
+# undelivered for two users in five. Raising coverage raises the dose, which raises the effect, and
+# that is the only route to a holdout that resolves — power cannot be bought from a richer outcome
+# table (measured: 82.84x more events exist on our algos but only 0.9% are arm-mappable).
+id: follow_seed
+design: ab
+
+# ⚠️ MUST be set to the moment FOLLOW_SEED_EXPERIMENT_ENABLED goes live, and re-set on any change to
+# traffic_pct or salt — both move the hash boundary and reassign users, which starts a different
+# experiment. The holdout spec has already been reset twice for exactly this reason.
+start: "2026-12-31T00:00:00Z"
+
+unit: user
+primary_metric: like_rate
+
+# Direction: treatment = allowed to seed from follows. `params.follow_seed` is the ARM, assigned by a
+# per-user salted hash before anything is served — deliberately NOT the realised seed kind, which is
+# post-treatment. The dose question (did treated users actually get served) is answered by the
+# `no_user_data` rate in `fallback_reason`, not by conditioning on the outcome.
+arms:
+  control:
+    field: params.follow_seed
+    value: false
+  treatment:
+    field: params.follow_seed
+    value: true
+
+negative_controls:
+  - name: pinned_and_rotating
+    reason: >
+      Pinned and rotating posts are injected by inject_special_posts from a per-feed configuration
+      that never consults the seed graph. Granting a follow seed cannot change which ones are chosen
+      or where they sit, so their like rate must not differ between arms. If it does, the arms differ
+      by something other than the seed source and the primary reading is not attributable.
+    where: "source IN ('pinned', 'rotating')"
+
+# Relevance guardrail. Follow-seeded sources are strangers who liked accounts the user follows, which
+# is a looser affinity signal than a shared like — so this arm could plausibly raise engagement while
+# lowering relevance. requestLess is the only direct relevance signal the client sends.
+# Direction: treatment minus control, so a positive diff means MORE "show me less".
+guardrails:
+  - metric: request_less_rate
+    max: 0.0
+
+cuped_covariate: pre_period_like_rate
+
+# REQUIRED, and not merely for the usual foreign-traffic reason. An absent JSON field extracts as
+# false, so without this every row written before the flag went live — and every unenrolled row —
+# lands in the CONTROL arm and silently dilutes the comparison to nothing. Requiring the nested key
+# to exist restricts the population to genuinely enrolled requests.
+population: >
+  JSONHas(tryBase64Decode(interaction_feed_context), 'algo_id')
+  AND JSONHas(tryBase64Decode(interaction_feed_context), 'params', 'follow_seed')
+
+min_observations: 2000
+
+notes: >
+  Expect this to accrue faster than the holdout: enrolment is 100% of non-holdout users by default
+  rather than 20%, and both arms are the same size.
+
+  Read the ABSOLUTE difference as well as the relative one. The base rate here is low and a large
+  relative lift on a small base is a small change in what users actually do.
+
+  Before believing any result, check the dose. The engine can only follow-seed a user who has a
+  `uf:{hash}` key, written by the personalization-follow-seeds CronJob. If that job has stalled the
+  treatment arm is under-delivered and the estimate is attenuated toward zero — the same failure that
+  made the holdout unconvergeable. `no_user_data` share by arm is the check.

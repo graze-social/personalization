@@ -8,6 +8,7 @@ mod diversity;
 mod feed_cache;
 mod liker_cache;
 mod params;
+mod pool_cache;
 mod proof;
 mod scorer;
 mod scoring_core;
@@ -21,6 +22,7 @@ pub use feed_cache::{FeedCache, FeedCacheStats};
 pub use graze_common::models::FeedSuccessConfig;
 pub use liker_cache::{CacheStats, LikerCache};
 pub use params::{apply_thompson_params, get_preset, merge_params, LinkLonkParams};
+pub use pool_cache::{PoolCache, PoolCacheStats};
 pub use proof::{compute_proof, LinkLonkProof, ProofCollector};
 pub use scorer::{Scorer, ScoringResult};
 pub use scoring_core::{
@@ -72,7 +74,19 @@ impl LinkLonkAlgorithm {
             config.liker_cache_max_size,
             config.liker_cache_ttl_seconds,
         ));
-        let scorer = Scorer::new(redis.clone(), liker_cache.clone(), config.clone());
+        // One pool cache, shared by both scorers. Unlike LikerCache -- which is deliberately
+        // per-arm because liker lists depend on max_likers_per_post -- a candidate pool is the
+        // same Redis set whatever the params, so sharing is correct rather than a leak.
+        let pool_cache = Arc::new(pool_cache::PoolCache::new(
+            config.pool_cache_ttl_seconds,
+            config.pool_cache_max_members,
+        ));
+        let scorer = Scorer::new(
+            redis.clone(),
+            liker_cache.clone(),
+            config.clone(),
+            pool_cache.clone(),
+        );
 
         // The durable arm gets its own scorer with relaxed candidate filters. Cloning the
         // config and overriding just those fields keeps every other knob in lockstep with
@@ -92,7 +106,12 @@ impl LinkLonkAlgorithm {
                 config.liker_cache_max_size,
                 config.liker_cache_ttl_seconds,
             ));
-            Scorer::new(redis.clone(), profile_liker_cache, Arc::new(profile_config))
+            Scorer::new(
+                redis.clone(),
+                profile_liker_cache,
+                Arc::new(profile_config),
+                pool_cache.clone(),
+            )
         };
 
         Self {

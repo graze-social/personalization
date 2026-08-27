@@ -131,6 +131,10 @@ impl ScoringResult {
 pub struct Scorer {
     redis: Arc<RedisClient>,
     liker_cache: Arc<LikerCache>,
+    /// Per-algorithm candidate pool, cached because `SMEMBERS ap:{algo_id}` was costing 71-107 ms
+    /// per request for data that is identical across every user of the feed and static between
+    /// candidate-sync runs.
+    pool_cache: Arc<crate::algorithm::PoolCache>,
     min_post_likes: usize,
     max_likers_per_post: usize,
     max_posts_to_score: usize,
@@ -153,10 +157,16 @@ pub struct Scorer {
 
 impl Scorer {
     /// Create a new scorer.
-    pub fn new(redis: Arc<RedisClient>, liker_cache: Arc<LikerCache>, config: Arc<Config>) -> Self {
+    pub fn new(
+        redis: Arc<RedisClient>,
+        liker_cache: Arc<LikerCache>,
+        config: Arc<Config>,
+        pool_cache: Arc<crate::algorithm::PoolCache>,
+    ) -> Self {
         Self {
             redis,
             liker_cache,
+            pool_cache,
             min_post_likes: config.inverted_min_post_likes,
             max_likers_per_post: config.inverted_max_likers_per_post,
             max_posts_to_score: config.inverted_max_posts_to_score,
@@ -960,14 +970,41 @@ impl Scorer {
         } else {
             -1
         };
-        let (algo_posts_result, user_likes_result, seen_posts_result) = tokio::join!(
-            self.redis.smembers(&algo_posts_key),
-            self.redis
-                .zrevrangebyscore_merged(&user_likes_keys, now, min_time, fetch_limit),
-            self.redis.zrevrange(&user_seen_key, 0, seen_limit)
-        );
+        // The pool is the one fetch here that is shared across every user of this feed, so it is
+        // served from cache when fresh and only the two user-specific reads stay on the hot path.
+        let cached_pool = self.pool_cache.get(algo_id);
+        let (algo_posts, user_likes_result, seen_posts_result) = match cached_pool {
+            Some(pool) => {
+                let (user_likes_result, seen_posts_result) = tokio::join!(
+                    self.redis.zrevrangebyscore_merged(
+                        &user_likes_keys,
+                        now,
+                        min_time,
+                        fetch_limit
+                    ),
+                    self.redis.zrevrange(&user_seen_key, 0, seen_limit)
+                );
+                (pool, user_likes_result, seen_posts_result)
+            }
+            None => {
+                let (algo_posts_result, user_likes_result, seen_posts_result) = tokio::join!(
+                    self.redis.smembers(&algo_posts_key),
+                    self.redis.zrevrangebyscore_merged(
+                        &user_likes_keys,
+                        now,
+                        min_time,
+                        fetch_limit
+                    ),
+                    self.redis.zrevrange(&user_seen_key, 0, seen_limit)
+                );
+                let fetched: Arc<Vec<String>> = Arc::new(algo_posts_result?);
+                // Cache even an empty pool: a feed mid-sync would otherwise re-issue the full
+                // SMEMBERS on every request precisely while it is least able to answer it.
+                self.pool_cache.put(algo_id, fetched.clone());
+                (fetched, user_likes_result, seen_posts_result)
+            }
+        };
 
-        let algo_posts: Vec<String> = algo_posts_result?;
         let mut user_likes = user_likes_result?;
         let seen_posts: Vec<String> = seen_posts_result.unwrap_or_default();
 
@@ -1003,14 +1040,23 @@ impl Scorer {
         excluded_posts.extend(seen_posts);
 
         // Step 2: Filter posts (remove already liked or seen)
-        let mut candidates: Vec<String> = algo_posts
-            .into_iter()
-            .filter(|p| !excluded_posts.contains(p))
+        //
+        // `take` rather than collect-then-truncate. The previous form allocated a Vec of every
+        // non-excluded post -- up to ~39,000 for the largest pools -- and then discarded all but
+        // `max_posts_to_score` of it. Short-circuiting keeps the identical result (the first N
+        // non-excluded posts in iteration order) while allocating only N, which more than pays for
+        // cloning out of the shared pool rather than consuming it.
+        let take_n = if self.max_posts_to_score > 0 {
+            self.max_posts_to_score
+        } else {
+            usize::MAX
+        };
+        let candidates: Vec<String> = algo_posts
+            .iter()
+            .filter(|p| !excluded_posts.contains(p.as_str()))
+            .take(take_n)
+            .cloned()
             .collect();
-
-        if self.max_posts_to_score > 0 && candidates.len() > self.max_posts_to_score {
-            candidates.truncate(self.max_posts_to_score);
-        }
 
         if candidates.is_empty() {
             return Ok(ScoringResult {

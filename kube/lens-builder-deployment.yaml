@@ -44,10 +44,15 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
+      # Required: the default service account carries no pull secrets, so
+      # without this the pod fails with ImagePullBackOff against DOCR.
+      imagePullSecrets:
+        - name: docr-graze-social-labs
       containers:
         - name: builder
-          # TODO(deploy): replace with the digest built from this commit.
-          image: registry.digitalocean.com/graze-social-labs/graze-personalization@sha256:REPLACE_ME
+          # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
+          # the short-SHA tag are mutable on DOCR.
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:79d0c8af00d3c3110276a88e702e26ae79930eef8d93a6d5f409e237cf2cc3ea
           command: ["/app/graze-lens-builder"]
           resources:
             requests:

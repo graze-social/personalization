@@ -509,7 +509,7 @@ impl LinkLonkAlgorithm {
         user_hash: &str,
         algo_id: i32,
         params: &LinkLonkParams,
-        audit: Option<&mut AuditCollector>,
+        mut audit: Option<&mut AuditCollector>,
     ) -> Result<ScoringResult> {
         let compute_start = Instant::now();
         info!(
@@ -600,15 +600,17 @@ impl LinkLonkAlgorithm {
             }
         }
 
+        // The arm decides when the experiment is running; otherwise the plain config flag applies.
+        // Resolved here because this is where `params` lives -- the seed step runs too deep to know
+        // a per-user assignment. Hoisted above the seed selection so the empty-coliker fallback
+        // below can see it, not just the author-affinity branch.
+        let allow_follow_seed = params
+            .follow_seed_arm
+            .unwrap_or(self.config.follow_seed_read_enabled);
+
         // Step 1: Get or compute co-likers (post-level or author-level)
         let coliker_weights = if params.use_author_affinity {
             debug!("step1_author_coliker_start");
-            // The arm decides when the experiment is running; otherwise the plain config flag
-            // applies. Resolved here because this is where `params` lives -- the seed step is too
-            // deep to know a per-user assignment.
-            let allow_follow_seed = params
-                .follow_seed_arm
-                .unwrap_or(self.config.follow_seed_read_enabled);
             let weights = self
                 .author_coliker
                 .get_or_compute_author_colikes_with_seed(user_hash, false, allow_follow_seed)
@@ -647,10 +649,44 @@ impl LinkLonkAlgorithm {
             // already serve never reaches this code, so there is no regression surface.
             if self.config.durable_profile_shadow_mode || self.config.durable_profile_enabled {
                 if let Some(result) = self
-                    .try_durable_profile(user_hash, algo_id, params, audit)
+                    .try_durable_profile(user_hash, algo_id, params, audit.as_deref_mut())
                     .await?
                 {
                     return Ok(result);
+                }
+            }
+
+            // Follow-graph seeding attaches at the same point, for the same reason: these users
+            // currently receive nothing from the live path, so there is no regression surface.
+            //
+            // It has to be HERE rather than in the primary seed selection above. That branch is
+            // gated on `params.use_author_affinity`, which is false in production
+            // (AUTHOR_AFFINITY_ENABLED=false), so a follow-seed read wired there was unreachable --
+            // the arm was assigned, recorded, and then consulted by code that never ran.
+            //
+            // Measured: no_user_data is 98.1% of addressable non-personalization, 73.6% of those
+            // users have zero likes in 365 days, and 86% of them follow 10+ accounts (median 50).
+            if allow_follow_seed {
+                let follow_weights = self
+                    .author_coliker
+                    .get_or_compute_follow_seeded(user_hash, false)
+                    .await?;
+                if !follow_weights.is_empty() {
+                    debug!(
+                        user_hash = %&user_hash[..8.min(user_hash.len())],
+                        algo_id,
+                        sources = follow_weights.len(),
+                        "follow_seed_fallback_engaged"
+                    );
+                    return self
+                        .score_with_lookup_comparison(
+                            user_hash,
+                            algo_id,
+                            &follow_weights,
+                            params,
+                            audit,
+                        )
+                        .await;
                 }
             }
 

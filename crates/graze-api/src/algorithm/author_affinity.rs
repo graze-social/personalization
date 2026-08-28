@@ -126,7 +126,32 @@ impl AuthorColikerWorker {
             debug!(user_hash = %&user_hash[..8.min(user_hash.len())], "early_exit: author affinity disabled");
             return Ok(HashMap::new());
         }
+        self.cached_or_compute(user_hash, force_refresh, allow_follow_seed)
+            .await
+    }
 
+    /// Follow-seeded author affinity, used ONLY as a fallback for users the post-level path serves
+    /// nothing.
+    ///
+    /// Deliberately NOT gated on `author_affinity_enabled`. That flag controls whether author
+    /// affinity replaces the post-level co-liker path as the PRIMARY seed for everyone, and it is
+    /// `false` in production — which is why the follow-seed read path was unreachable even after the
+    /// arm plumbing was fixed. This entry point only ever runs where the live path already produced
+    /// no co-likers, so it cannot regress anyone it does not currently serve.
+    pub async fn get_or_compute_follow_seeded(
+        &self,
+        user_hash: &str,
+        force_refresh: bool,
+    ) -> Result<HashMap<String, f64>> {
+        self.cached_or_compute(user_hash, force_refresh, true).await
+    }
+
+    async fn cached_or_compute(
+        &self,
+        user_hash: &str,
+        force_refresh: bool,
+        allow_follow_seed: bool,
+    ) -> Result<HashMap<String, f64>> {
         let author_colikes_key = Keys::author_colikes(user_hash);
 
         if !force_refresh {

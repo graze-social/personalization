@@ -123,7 +123,7 @@ spec:
                 name: personalization-dose-check-src
           containers:
             - name: dose
-              image: dgaff/graze-analysis@sha256:a590d81cd2045bf680e4b2c3b61ddfa861a30ddbf5f49f8aa1a822761b261bc2
+              image: dgaff/graze-analysis@sha256:304409b35ea970b57a3790c40928347f5367606af4b200d04985e6ba877c0696
               command: ["python", "/src/dose.py"]
               volumeMounts:
                 - name: src
@@ -132,7 +132,7 @@ spec:
                 # Must match the moment FOLLOW_SEED_EXPERIMENT_ENABLED went to 1. Re-set it if the
                 # experiment is ever restarted, or pre-flip rows silently join the control arm.
                 - name: FOLLOW_SEED_FLIP_AT
-                  value: "2026-08-27 17:29:54"
+                  value: "2026-08-28 13:41:26"
               envFrom:
                 - configMapRef:
                     name: personalization-env

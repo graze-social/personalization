@@ -24,18 +24,16 @@ design: ab
 #
 # The rate also changed here (0.05 -> 0.20). A rate change moves the hash boundary, which reassigns
 # some users, so it starts a new experiment for the same reason.
-# ⚠️ RESET #3, 2026-08-27T17:29:54Z: FOLLOW_SEED_EXPERIMENT_ENABLED went to 1, so half of the non-holdout
-# population may now be seeded from the follow graph. That changes what the TREATED arm receives, so
-# pooling across the flip would make this a time-weighted blend of two different treatments rather
-# than one comparison. Same reasoning as the two earlier resets (the per-request-to-per-user
-# assignment fix, and the 0.05 -> 0.20 rate change, both of which moved who was in which arm).
+# ⚠️ RESET, 2026-08-28T13:41:26Z. The 2026-08-27 reset was premature: it was made for a
+# treatment change that did not actually happen, because follow-seeding was inert (see
+# follow_seed.yaml for the four reasons). This is the moment the treated arm's treatment really
+# changed -- half of the non-holdout population can now be seeded from the follow graph.
 #
-# What was discarded: the window from 2026-08-14T18:47:00Z, which had reached ~4,600 units at
-# diff=+0.0307 (+287.9%) and p=0.1087 -- positive, large, and NOT converging. p had risen from 0.0952
-# while the sample grew, so this reset costs nothing that was going to resolve. The reason it could
-# not converge is the reason for the flip: ~39% of the treated arm received no personalized content
-# at all, so the treatment was undelivered for two users in five.
-start: "2026-08-27T17:29:54Z"
+# Discarded across both resets: ~4,600 units at diff=+0.0307 (+287.9%), p=0.1087. Positive, large,
+# and NOT converging -- p had risen from 0.0952 as the sample grew -- so nothing that was going to
+# resolve was lost. The reason it could not resolve is the reason for the flip: ~39% of the treated
+# arm received no personalized content at all.
+start: "2026-08-28T13:41:26Z"
 unit: user
 primary_metric: like_rate
 

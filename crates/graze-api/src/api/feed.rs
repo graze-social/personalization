@@ -125,6 +125,9 @@ fn encode_feed_context(
     // Why this response was not personalized, when it was not. Carried into provenance so coverage
     // failures are decomposable in ClickHouse instead of only in log lines.
     fallback_reason: Option<String>,
+    // Follow-seed experiment arm. Passed alongside fallback_reason rather than inside
+    // thompson_meta, so it is recorded on responses where personalization never ran.
+    follow_seed: Option<bool>,
 ) -> Option<String> {
     let (source, personalization_type, fallback_tranche, attribution, personalized) = match prov {
         ItemProvenance::Base(BlendedSource::PostLevelPersonalization) => (
@@ -160,20 +163,17 @@ fn encode_feed_context(
     };
     let (params, response_time_ms, is_holdout) = match thompson_meta {
         Some(meta) => (
-            Some(
-                ProvenanceParams::from_selected(
-                    meta.params.min_post_likes,
-                    meta.params.max_likers_per_post,
-                    meta.params.max_total_sources,
-                    meta.params.max_algo_checks,
-                    meta.params.min_co_likes,
-                    meta.params.max_user_likes,
-                    meta.params.max_sources_per_post,
-                    meta.params.seed_sample_pool,
-                    meta.params.corater_decay_pct,
-                )
-                .with_follow_seed(meta.params.follow_seed_arm),
-            ),
+            Some(ProvenanceParams::from_selected(
+                meta.params.min_post_likes,
+                meta.params.max_likers_per_post,
+                meta.params.max_total_sources,
+                meta.params.max_algo_checks,
+                meta.params.min_co_likes,
+                meta.params.max_user_likes,
+                meta.params.max_sources_per_post,
+                meta.params.seed_sample_pool,
+                meta.params.corater_decay_pct,
+            )),
             Some(meta.response_time_ms),
             Some(meta.is_holdout),
         ),
@@ -197,6 +197,7 @@ fn encode_feed_context(
         is_personalization_holdout,
         ranker,
         fallback_reason,
+        follow_seed,
     };
     ctx.encode()
 }
@@ -596,6 +597,7 @@ pub async fn get_feed_skeleton(
                         // This whole branch is the empty-candidate-pool path; `emit_skip_log`
                         // above records the same reason.
                         Some("no_algo_posts".to_string()),
+                        None,
                     );
                     SkeletonFeedPost {
                         post: uri,
@@ -659,6 +661,7 @@ pub async fn get_feed_skeleton(
             ranker: None,
             // Same reason the debug! above records: no candidate pool and no fallback either.
             fallback_reason: Some("no_algo_posts".to_string()),
+            follow_seed: None,
         }
         .encode();
         let response = FeedSkeletonResponse {
@@ -679,6 +682,11 @@ pub async fn get_feed_skeleton(
         std::collections::HashMap::new();
     let mut was_personalized = false;
     let mut fallback_reason: Option<&str> = None;
+    // Recorded independently of response_thompson_meta, which is only set on the personalization
+    // SUCCESS branch. Measured 2026-08-28: 2,129 no_user_data rows carried no arm at all, so the
+    // enrolled population excluded precisely the responses follow-seeding exists to change --
+    // coverage could never move in the readout, regardless of whether the treatment worked.
+    let mut follow_seed_arm: Option<bool> = None;
     let mut feed_cache_hit = false;
     let mut response_thompson_meta: Option<ResponseThompsonMeta> = None;
     // The arm is a pure function of the DID, so compute it once for EVERY request — first page or
@@ -927,6 +935,7 @@ pub async fn get_feed_skeleton(
                     };
                     thompson_params.follow_seed_arm =
                         fs_exp.assign(user_did.as_deref().unwrap_or(""));
+                    follow_seed_arm = thompson_params.follow_seed_arm;
                     if let Some(arm) = thompson_params.follow_seed_arm {
                         debug!(algo_id, arm, "follow_seed_experiment_assigned");
                     }
@@ -940,6 +949,9 @@ pub async fn get_feed_skeleton(
                     min_co_likes: Some(thompson_params.min_co_likes),
                     seed_sample_pool: Some(thompson_params.seed_sample_pool),
                     corater_decay: Some(thompson_params.corater_decay_pct as f64 / 100.0),
+                    // Without this the arm never reaches the seed step: merge_params is the bridge
+                    // that actually builds LinkLonkParams, and it reads this struct.
+                    follow_seed: thompson_params.follow_seed_arm,
                     ..Default::default()
                 };
 
@@ -1329,6 +1341,7 @@ pub async fn get_feed_skeleton(
                 },
                 ranker_by_uri.get(uri).cloned(),
                 fallback_reason.map(str::to_string),
+                follow_seed_arm,
             );
             SkeletonFeedPost {
                 post: uri.clone(),

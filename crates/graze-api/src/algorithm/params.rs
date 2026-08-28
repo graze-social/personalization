@@ -222,6 +222,7 @@ pub fn merge_params(
         use_author_affinity: o.use_author_affinity,
         seed_sample_pool: o.seed_sample_pool.unwrap_or(base.seed_sample_pool),
         corater_decay: o.corater_decay.unwrap_or(base.corater_decay),
+        follow_seed_arm: o.follow_seed.or(base.follow_seed_arm),
         ..base
     }
 }
@@ -272,4 +273,50 @@ mod tests {
         assert_eq!(args[15], "0"); // seed_sample_pool (disabled)
         assert_eq!(args[16], "0"); // corater_decay (disabled)
     }
+}
+
+#[cfg(test)]
+mod follow_seed_arm_plumbing_tests {
+    use super::*;
+    use graze_common::models::PersonalizationParams;
+
+    /// The regression this pins: the arm was originally threaded through
+    /// `apply_thompson_params`, which is exported but **never called** on the serving path.
+    /// `merge_params` is the real bridge, so the arm reached the provenance blob and never reached
+    /// the seed step — the treatment was inert for 19 hours while looking correctly randomized.
+    #[test]
+    fn merge_params_carries_the_follow_seed_arm() {
+        let base = LinkLonkParams::default();
+        assert_eq!(base.follow_seed_arm, None, "default must be unenrolled");
+
+        for arm in [Some(true), Some(false)] {
+            let overrides = PersonalizationParams {
+                follow_seed: arm,
+                ..Default::default()
+            };
+            let merged = merge_params(LinkLonkParams::default(), Some(&overrides));
+            assert_eq!(
+                merged.follow_seed_arm, arm,
+                "merge_params dropped the arm: it would never reach the seed step"
+            );
+        }
+    }
+
+    /// An absent override must not clobber an arm already set on the base params.
+    #[test]
+    fn merge_params_does_not_erase_an_existing_arm() {
+        let base = LinkLonkParams {
+            follow_seed_arm: Some(true),
+            ..Default::default()
+        };
+        let overrides = PersonalizationParams::default();
+        assert_eq!(
+            merge_params(base, Some(&overrides)).follow_seed_arm,
+            Some(true)
+        );
+    }
+
+    // Note: `apply_thompson_params` also copies the arm, but it is NOT on the serving path and
+    // SelectedParams has no public constructor, so it is not covered here. If a future caller puts
+    // it on the serving path, this module is where the matching test belongs.
 }

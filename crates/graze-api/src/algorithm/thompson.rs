@@ -1201,7 +1201,6 @@ mod tests {
             max_sources_per_post: Some(75),
             seed_sample_pool: Some(1000),
             corater_decay_pct: Some(20),
-            follow_seed: None,
         };
         let selected = learner.selected_params_from_provenance(&p);
         assert_eq!(selected.min_post_likes, 10);
@@ -1223,7 +1222,6 @@ mod tests {
             max_sources_per_post: None,
             seed_sample_pool: None,
             corater_decay_pct: None,
-            follow_seed: None,
         };
         let selected2 = learner.selected_params_from_provenance(&p_partial);
         assert_eq!(selected2.min_post_likes, 7);

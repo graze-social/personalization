@@ -8,6 +8,14 @@ pub struct PersonalizationParams {
     /// Preset name (default, discovery, stable, fast).
     pub preset: Option<String>,
 
+    /// Follow-seed experiment arm. `None` = not enrolled, so config applies.
+    ///
+    /// Lives here because `merge_params` is what actually builds `LinkLonkParams` on the serving
+    /// path. An earlier attempt threaded this through `apply_thompson_params` instead, which is
+    /// exported but never called -- so the arm reached the provenance blob and never reached the
+    /// seed step, and the treatment was inert while looking correctly randomized.
+    pub follow_seed: Option<bool>,
+
     /// Maximum user likes to consider.
     pub max_user_likes: Option<usize>,
 

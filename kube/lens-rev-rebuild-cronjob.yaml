@@ -1,0 +1,87 @@
+# graze-lens-rev-rebuild — rebuilds the reverse follow index.
+#
+# `follow_edges` answers "who does X follow". `mutuals` needs the opposite, and
+# that cannot be a materialized view: a follow delete carries no followee, so a
+# row-by-row view would receive unfollows as edges pointing at '' and never
+# retract the real one. The reverse direction has to come from the *folded*
+# forward table, which means this periodic rebuild.
+#
+# Nothing in M0 reads `follow_edges_rev`; this exists so the index is warm and
+# correct by the time the M1 `mutuals` facet ships. Until then it is cheap
+# insurance, and its cost is one scheduled ClickHouse pass.
+#
+# Prereqs (created out of band):
+#   * secret `app-secrets` — CLICKHOUSE_{HOST,USER,PASSWORD}
+#   * ClickHouse tables — `feed-processor/scripts/create_follow_edges_tables.py`
+#
+# Safety: the job builds into `follow_edges_rev_next` and EXCHANGEs it in, so a
+# run that dies partway leaves the live index untouched. It also refuses to swap
+# a result under LENS_REV_MIN_RATIO (default 0.5) of the current row count —
+# without that, one bad run would replace the index with an empty table and
+# `mutuals` would quietly return nobody for every viewer. Override deliberately
+# with LENS_REV_FORCE=true when a genuine shrink is expected.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: graze-lens-rev-rebuild
+  labels:
+    app: graze-lens
+    component: rev-rebuild
+spec:
+  # Nightly, off-peak. The reverse index feeds `mutuals`, whose semantics do not
+  # change minute to minute; running it more often buys freshness nobody can
+  # perceive and costs a full-table pass each time.
+  schedule: "17 9 * * *" # 09:17 UTC ≈ 02:17 sfo3
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Skip a run entirely rather than piling up after downtime: a missed rebuild
+  # is a day-stale index, which is survivable; two concurrent rebuilds are not
+  # (they would fight over the staging table).
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 10800 # 3h
+      template:
+        metadata:
+          labels:
+            app: graze-lens
+            component: rev-rebuild
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: rev-rebuild
+              # TODO(deploy): replace with the digest built from this commit.
+              image: registry.digitalocean.com/graze-social-labs/graze-personalization@sha256:REPLACE_ME
+              command: ["/app/graze-lens-rev-rebuild"]
+              resources:
+                requests:
+                  memory: "128Mi"
+                  cpu: "100m"
+                limits:
+                  # The work happens inside ClickHouse; this process only issues
+                  # SQL and reads counts back.
+                  memory: "512Mi"
+                  cpu: "500m"
+              envFrom:
+                - secretRef:
+                    name: app-secrets
+              env:
+                - name: LENS_REV_MAX_EXECUTION_SECONDS
+                  value: "1800"
+                - name: LENS_REV_MIN_RATIO
+                  value: "0.5"
+                - name: RUST_LOG
+                  value: "info"
+              securityContext:
+                runAsNonRoot: true
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+          securityContext:
+            # Numeric, not a name: distroless nonroot has no /etc/passwd entry.
+            runAsUser: 65532
+            runAsGroup: 65532

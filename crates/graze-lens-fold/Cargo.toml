@@ -1,0 +1,42 @@
+[package]
+name = "graze-lens-fold"
+version = "0.2.0"
+edition = "2021"
+description = "Tails the Bluesky follow graph into ClickHouse follow_edges"
+license = "MIT"
+
+[[bin]]
+name = "graze-lens-fold"
+path = "src/main.rs"
+
+# Periodic rebuild of the reverse index. Lives here because it maintains the
+# same tables the fold writes.
+[[bin]]
+name = "graze-lens-rev-rebuild"
+path = "src/bin/rev_rebuild.rs"
+
+[lib]
+name = "graze_lens_fold"
+path = "src/lib.rs"
+
+[dependencies]
+graze-common = { path = "../graze-common" }
+
+tokio = { version = "1.43", features = ["full", "signal"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+axum = "0.8"
+
+reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"], default-features = false }
+deadpool-redis = "0.22"
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = "0.4"
+rand = "0.8"
+
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+prometheus-client = "0.22"

@@ -1,0 +1,92 @@
+# graze-lens-builder — drains the lens build queue.
+#
+# Off the serve path entirely. feeder-rs enqueues a build the first time it wants
+# a lens it does not have and serves that request unlensed; this worker folds
+# `follow_edges` for the viewer and publishes the set. If it is down, feeds keep
+# serving — every request just takes the fail-open branch.
+#
+# Prereqs (created out of band):
+#   * secret `app-secrets` — CLICKHOUSE_{HOST,USER,PASSWORD}, PERSONALIZATION_REDIS_URL
+#   * ClickHouse tables — `feed-processor/scripts/create_follow_edges_tables.py`
+#
+# Image is pinned by digest, not tag. Both `latest` and the short-SHA tag are
+# mutable on DOCR, and a reused tag has silently changed what was running before
+# (see the note in feeder-rs/kube/feeder-rs-deployment.yml). Get the digest from
+# the docker-release workflow run, or:
+#   doctl registry repository list-tags graze-personalization --format Tag,ManifestDigest
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: graze-lens-builder
+  labels:
+    app: graze-lens
+    component: builder
+spec:
+  # Horizontally scalable: the consumer group hands each request to exactly one
+  # replica. Kept at 1 for M0, where the whole population is an allowlist.
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: graze-lens
+      component: builder
+  template:
+    metadata:
+      labels:
+        app: graze-lens
+        component: builder
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: builder
+          # TODO(deploy): replace with the digest built from this commit.
+          image: registry.digitalocean.com/graze-social-labs/graze-personalization@sha256:REPLACE_ME
+          command: ["/app/graze-lens-builder"]
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "1"
+          envFrom:
+            - secretRef:
+                name: app-secrets
+          env:
+            # Consumer identity within the group. Must differ per replica, so it
+            # comes from the pod name rather than a literal.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # M0 publishes into the personalization instance feeder-rs already
+            # pools. M1 points this at the dedicated lens-valkey instead.
+            - name: LENS_SET_TTL_SECONDS
+              value: "900"
+            - name: LENS_QUERY_MAX_EXECUTION_SECONDS
+              value: "20"
+            - name: LENS_MAX_SET_SIZE
+              value: "200000"
+            - name: RUST_LOG
+              value: "info"
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        # Numeric, not a name: the distroless nonroot image has no /etc/passwd
+        # entry for the kubelet to resolve, so a named user fails to start.
+        runAsUser: 65532
+        runAsGroup: 65532
+      # Long enough to finish the build in flight and ack it; an unacked request
+      # is simply re-enqueued by the serve path on the viewer's next request.
+      terminationGracePeriodSeconds: 30

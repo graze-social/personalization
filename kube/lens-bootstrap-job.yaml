@@ -1,0 +1,91 @@
+# graze-lens-bootstrap — backfills historical follow edges for a set of accounts.
+#
+# `graze-lens-fold` only sees follows from the moment it connects; this fills in
+# the history behind it, reading each account's follow records from its PDS.
+#
+# IDEMPOTENT. Rows are versioned by the record's own TID, so re-running writes
+# identical (follower, rkey, seq) tuples and ReplacingMergeTree collapses them.
+# Re-run freely — that is also the recovery procedure.
+#
+# Prereqs (created out of band):
+#   * secret `app-secrets` — CLICKHOUSE_{HOST,USER,PASSWORD}
+#   * ClickHouse tables — `feed-processor/scripts/create_follow_edges_tables.py`
+#   * ConfigMap `lens-bootstrap-dids` with a `dids.txt` key, one DID per line
+#     (blank lines and `#` comments are ignored):
+#       kubectl create configmap lens-bootstrap-dids --from-file=dids.txt
+#
+# Scope note: this is the per-account path, and it is what M0 needs — it covers
+# exactly the accounts that asked for a lens, over public unauthenticated
+# endpoints. Warming the *global* graph is a different job, blocked on a
+# bsky.network archive token plus a decoder for the .jss segment format; when
+# that lands, this remains the repair path for history the archive predates.
+#
+# Dry run first on a new DID list:
+#   kubectl set env job/graze-lens-bootstrap LENS_BOOTSTRAP_DRY_RUN=true
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: graze-lens-bootstrap
+  labels:
+    app: graze-lens
+    component: bootstrap
+spec:
+  # No retries. The job is re-runnable by hand, and an automatic retry of a
+  # partially-succeeded backfill just re-walks every PDS for no benefit.
+  backoffLimit: 0
+  # ~4h ceiling: a 50k-follow account is ~500 paged requests, and the default
+  # concurrency of 4 is deliberately polite to other people's servers.
+  activeDeadlineSeconds: 14400
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: graze-lens
+        component: bootstrap
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: bootstrap
+          # TODO(deploy): replace with the digest built from this commit.
+          image: registry.digitalocean.com/graze-social-labs/graze-personalization@sha256:REPLACE_ME
+          command: ["/app/graze-lens-bootstrap"]
+          args: ["--file", "/config/dids.txt"]
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              # Edges buffer in memory until a batch fills; a very large DID list
+              # of whales is the case that needs the headroom.
+              memory: "2Gi"
+              cpu: "1"
+          envFrom:
+            - secretRef:
+                name: app-secrets
+          env:
+            - name: LENS_BOOTSTRAP_CONCURRENCY
+              value: "4"
+            - name: LENS_BOOTSTRAP_PAGE_DELAY_MS
+              value: "150"
+            - name: LENS_BOOTSTRAP_INSERT_BATCH
+              value: "20000"
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: dids
+              mountPath: /config
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        # Numeric, not a name: distroless nonroot has no /etc/passwd entry.
+        runAsUser: 65532
+        runAsGroup: 65532
+      volumes:
+        - name: dids
+          configMap:
+            name: lens-bootstrap-dids

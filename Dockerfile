@@ -28,7 +28,10 @@ RUN --mount=type=ssh \
     -p graze-like-streamer \
     -p graze-candidate-sync \
     -p graze-frontdoor \
-    -p graze-feed-stats
+    -p graze-feed-stats \
+    -p graze-lens-builder \
+    -p graze-lens-fold \
+    -p graze-lens-bootstrap
 
 # Stage 2: Final runtime image
 FROM --platform=linux/amd64 gcr.io/distroless/cc-debian12
@@ -46,6 +49,12 @@ COPY --from=builder /app/target/release/graze-backfill-ula /app/graze-backfill-u
 COPY --from=builder /app/target/release/graze-backfill /app/graze-backfill
 COPY --from=builder /app/target/release/graze-frontdoor /app/graze-frontdoor
 COPY --from=builder /app/target/release/graze-feed-stats /app/graze-feed-stats
+# Viewer-graph lenses; selected by `command:` in kube/lens-builder-deployment.yaml.
+COPY --from=builder /app/target/release/graze-lens-builder /app/graze-lens-builder
+COPY --from=builder /app/target/release/graze-lens-fold /app/graze-lens-fold
+COPY --from=builder /app/target/release/graze-lens-bootstrap /app/graze-lens-bootstrap
+# Built by -p graze-lens-fold; selected by `command:` in the CronJob.
+COPY --from=builder /app/target/release/graze-lens-rev-rebuild /app/graze-lens-rev-rebuild
 COPY --from=builder /app/target/release/graze-migrate-tranches /app/graze-migrate-tranches
 COPY --from=builder /app/target/release/graze-migrate-dates /app/graze-migrate-dates
 COPY --from=builder /app/target/release/graze-verify-migration /app/graze-verify-migration

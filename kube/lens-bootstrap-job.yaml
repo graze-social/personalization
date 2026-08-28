@@ -10,9 +10,9 @@
 # Prereqs (created out of band):
 #   * secret `app-secrets` — CLICKHOUSE_{HOST,USER,PASSWORD}
 #   * ClickHouse tables — `feed-processor/scripts/create_follow_edges_tables.py`
-#   * ConfigMap `lens-bootstrap-dids` with a `dids.txt` key, one DID per line
-#     (blank lines and `#` comments are ignored):
-#       kubectl create configmap lens-bootstrap-dids --from-file=dids.txt
+#   * ConfigMap `graze-beta-cohort` (key `dids.txt`) — the shared beta cohort,
+#     not a lens-specific list. Source of truth is `cohorts/beta.txt`; see its
+#     header for how to regenerate the ConfigMap after editing.
 #
 # Scope note: this is the per-account path, and it is what M0 needs — it covers
 # exactly the accounts that asked for a lens, over public unauthenticated
@@ -93,4 +93,6 @@ spec:
       volumes:
         - name: dids
           configMap:
-            name: lens-bootstrap-dids
+            # The shared beta cohort, so "who is in the beta" stays one decision
+            # in one place rather than a per-feature allowlist.
+            name: graze-beta-cohort

@@ -16,7 +16,17 @@ design: ab
 # ⚠️ MUST be set to the moment FOLLOW_SEED_EXPERIMENT_ENABLED goes live, and re-set on any change to
 # traffic_pct or salt — both move the hash boundary and reassign users, which starts a different
 # experiment. The holdout spec has already been reset twice for exactly this reason.
-start: "2026-08-27T17:29:54Z"
+# START. This is the FOURTH start for this experiment and the first that measures anything.
+# Three earlier windows contained no valid contrast because the treatment was inert:
+#   - the arm was threaded through `apply_thompson_params`, which is never called
+#   - the arm was nested under `params`, written only on the personalization-success path
+#   - the read path hung off the author-affinity branch, and AUTHOR_AFFINITY_ENABLED=false
+#   - the seed gate turned these users away BEFORE personalization was attempted, so no hook
+#     inside compute_personalization could reach them
+#
+# Set to the moment the gate fix finished rolling out. First confirmed engagement was 13:46:23Z:
+# follow_seed_fallback_engaged, algo 2323, 300 sources, seed_kind=follows.
+start: "2026-08-28T13:41:26Z"
 
 unit: user
 primary_metric: like_rate
@@ -27,10 +37,10 @@ primary_metric: like_rate
 # `no_user_data` rate in `fallback_reason`, not by conditioning on the outcome.
 arms:
   control:
-    field: params.follow_seed
+    field: follow_seed
     value: false
   treatment:
-    field: params.follow_seed
+    field: follow_seed
     value: true
 
 negative_controls:
@@ -58,7 +68,7 @@ cuped_covariate: pre_period_like_rate
 # to exist restricts the population to genuinely enrolled requests.
 population: >
   JSONHas(tryBase64Decode(interaction_feed_context), 'algo_id')
-  AND JSONHas(tryBase64Decode(interaction_feed_context), 'params', 'follow_seed')
+  AND JSONHas(tryBase64Decode(interaction_feed_context), 'follow_seed')
 
 min_observations: 2000
 

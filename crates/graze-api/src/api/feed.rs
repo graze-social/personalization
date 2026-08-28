@@ -687,6 +687,18 @@ pub async fn get_feed_skeleton(
     // enrolled population excluded precisely the responses follow-seeding exists to change --
     // coverage could never move in the readout, regardless of whether the treatment worked.
     let mut follow_seed_arm: Option<bool> = None;
+    // Resolved before the seed gate below, which now depends on it. The assignment needs only the
+    // DID and config, so it can be computed this early; it is copied onto thompson_params later.
+    if state.config.follow_seed_experiment_enabled {
+        let fs_exp = crate::algorithm::FollowSeedExperiment {
+            enabled: true,
+            traffic_pct: state.config.follow_seed_experiment_traffic_pct,
+            salt: state.config.follow_seed_experiment_salt.clone(),
+        };
+        follow_seed_arm = fs_exp.assign(user_did.as_deref().unwrap_or(""));
+    }
+    let allow_follow_seed_for_gate =
+        follow_seed_arm.unwrap_or(state.config.follow_seed_read_enabled);
     let mut feed_cache_hit = false;
     let mut response_thompson_meta: Option<ResponseThompsonMeta> = None;
     // The arm is a pure function of the DID, so compute it once for EVERY request — first page or
@@ -848,11 +860,37 @@ pub async fn get_feed_skeleton(
             // a rebuild.
             let check_days = state.config.user_data_check_days;
             let user_likes_keys = Keys::user_likes_retention(&user_hash, check_days);
-            let user_has_data = state
+            let has_like_seed = state
                 .redis
                 .exists_any(&user_likes_keys)
                 .await
                 .unwrap_or(false);
+
+            // A like seed is no longer the only way in.
+            //
+            // This gate is why every alternative-seed mechanism built so far has served nothing.
+            // It runs BEFORE personalization is attempted, so a user without `ul:` never reaches
+            // compute_personalization at all -- and both the durable co-liker profile hook and the
+            // follow-seed hook live inside it, at the `coliker_weights.is_empty()` branch. The
+            // durable-profile Phase B has been deployed since 2026-08-11 and has never fired for
+            // this reason ("0 shadow firings in 40 min"), and the follow-seed read path produced
+            // zero `follow_seed_fallback_engaged` lines across two deploys until this changed.
+            //
+            // Cost is one EXISTS, and only on the path where the like-seed check already failed --
+            // roughly 14% of requests.
+            let has_follow_seed = if has_like_seed || !allow_follow_seed_for_gate {
+                false
+            } else {
+                state
+                    .redis
+                    .exists(&Keys::user_follows(&user_hash))
+                    .await
+                    .unwrap_or(false)
+            };
+            let user_has_data = has_like_seed || has_follow_seed;
+            if has_follow_seed {
+                debug!(algo_id, "follow_seed_admitted_user_without_like_seed");
+            }
 
             if user_has_data {
                 // Load feed-specific Thompson config (holdout override, etc.)
@@ -927,16 +965,12 @@ pub async fn get_feed_skeleton(
                 //
                 // The holdout is never enrolled -- holdout users receive no personalization at all,
                 // so granting them a seed capability would be meaningless and would blur two arms.
-                if state.config.follow_seed_experiment_enabled && !thompson_params.is_holdout {
-                    let fs_exp = crate::algorithm::FollowSeedExperiment {
-                        enabled: true,
-                        traffic_pct: state.config.follow_seed_experiment_traffic_pct,
-                        salt: state.config.follow_seed_experiment_salt.clone(),
-                    };
-                    thompson_params.follow_seed_arm =
-                        fs_exp.assign(user_did.as_deref().unwrap_or(""));
-                    follow_seed_arm = thompson_params.follow_seed_arm;
-                    if let Some(arm) = thompson_params.follow_seed_arm {
+                // Assigned above the seed gate; here it only rides onto thompson_params so it
+                // reaches merge_params and the provenance blob. The holdout is never enrolled --
+                // those users receive no personalization at all, so a seed capability is moot.
+                if !thompson_params.is_holdout {
+                    thompson_params.follow_seed_arm = follow_seed_arm;
+                    if let Some(arm) = follow_seed_arm {
                         debug!(algo_id, arm, "follow_seed_experiment_assigned");
                     }
                 }

@@ -57,9 +57,9 @@ spec:
             - name: docr-graze-social-labs
           containers:
             - name: rev-rebuild
-              # Built from commit 870ef35 (feat/lens-completeness-guard). Digest-pinned:
+              # Built from commit 1a835eb (feat/lens-completeness-guard). Digest-pinned:
               # both `latest` and the short-SHA tag are mutable on DOCR.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:96d6ea3f361c3a31be9ff243c909c7dc0491a2b46d01d35dfdb9a37d0ea3048d
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:03f7834205eb6b259b49297131e5586c785e4ea3a72d946aa9f9478d22dc013a
               command: ["/app/graze-lens-rev-rebuild"]
               resources:
                 requests:

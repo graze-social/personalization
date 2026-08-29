@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod cursor;
+pub mod delta;
 pub mod event;
 pub mod metrics;
 pub mod rev;
@@ -15,6 +16,7 @@ pub mod streamer;
 
 pub use config::Config;
 pub use cursor::Cursor;
+pub use delta::DeltaApplier;
 pub use event::{parse, FollowEdge};
 pub use metrics::Metrics;
 pub use sink::Sink;

@@ -2,8 +2,8 @@
 
 use anyhow::Context;
 use deadpool_redis::{Config as RedisConfig, Runtime};
-use graze_lens_fold::{Config, Cursor, Metrics, Sink, Streamer};
-use tracing::info;
+use graze_lens_fold::{Config, Cursor, DeltaApplier, Metrics, Sink, Streamer};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -24,12 +24,26 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics = Metrics::new();
     let sink = Sink::new(config.clickhouse.clone(), config.insert_timeout).context("sink")?;
-    let cursor = Cursor::new(pool);
+    let cursor = Cursor::new(pool.clone());
+
+    let deltas = if config.deltas_enabled {
+        let applier = DeltaApplier::new(pool, metrics.clone(), config.set_ttl_seconds);
+        // Warm the active list before the first event, so a restart does not
+        // spend an interval ignoring deltas for viewers who are already live.
+        match applier.refresh_active().await {
+            Ok(n) => info!(active_viewers = n, "live lens maintenance enabled"),
+            Err(e) => warn!(error = %e, "could not load active viewers at startup"),
+        }
+        Some(applier)
+    } else {
+        info!("live lens maintenance disabled; sets will expire on their TTL");
+        None
+    };
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     serve_metrics(config.metrics_port, metrics.clone());
 
-    let streamer = Streamer::new(config, cursor, sink, metrics);
+    let streamer = Streamer::new(config, cursor, sink, metrics, deltas);
     let run = streamer.run(shutdown_rx);
 
     tokio::select! {

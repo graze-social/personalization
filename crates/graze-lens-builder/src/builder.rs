@@ -19,6 +19,10 @@ use tracing::{debug, warn};
 
 use crate::config::Config;
 
+/// Viewers whose sets graze-lens-fold should keep fresh. Shared key; the fold
+/// side owns the constant in `graze_lens_fold::delta`.
+const ACTIVE_KEY: &str = "lens:active";
+
 /// Current followees of one viewer.
 ///
 /// Two things here are load-bearing and easy to "simplify" into a bug:
@@ -198,6 +202,11 @@ impl Builder {
             .hset(Self::meta_key(viewer), "facet", facet)
             .hset(Self::meta_key(viewer), "count", members.len())
             .expire(Self::meta_key(viewer), ttl as i64)
+            // Register the viewer for live maintenance. graze-lens-fold reads
+            // this to decide whose sets to keep current from the follow stream,
+            // which is what lets the TTL above be long rather than minutes.
+            // It prunes its own entries when a set turns out to be gone.
+            .sadd(ACTIVE_KEY, viewer)
             .query_async::<()>(&mut conn)
             .await?;
 
@@ -230,6 +239,14 @@ mod tests {
             "lens:v1:follows:did:plc:abc"
         );
         assert_eq!(Builder::meta_key("did:plc:abc"), "lensmeta:did:plc:abc");
+    }
+
+    /// The fold declares this same key in `graze_lens_fold::delta::ACTIVE_KEY`.
+    /// If they drift, the builder registers viewers nobody watches and every
+    /// lens silently goes back to rotting until its TTL.
+    #[test]
+    fn active_key_matches_the_fold_side() {
+        assert_eq!(ACTIVE_KEY, graze_lens_fold::delta::ACTIVE_KEY);
     }
 
     /// Staging must not collide with the live key, or the rename would be a

@@ -30,6 +30,10 @@ use serde::Deserialize;
 
 pub const FOLLOW_COLLECTION: &str = "app.bsky.graph.follow";
 
+/// The facet these edges feed. Matches `FACET_FOLLOWS` in feeder-rs and
+/// `lensFacets` in the ui — the three are one wire contract.
+pub const FACET_FOLLOWS: &str = "follows";
+
 #[derive(Debug, Deserialize)]
 pub struct JetstreamMessage {
     pub kind: Option<String>,

@@ -14,6 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::cursor::Cursor;
+use crate::delta::DeltaApplier;
 use crate::event::{self, FollowEdge, FOLLOW_COLLECTION};
 use crate::metrics::Metrics;
 use crate::sink::Sink;
@@ -23,15 +24,25 @@ pub struct Streamer {
     cursor: Cursor,
     sink: Sink,
     metrics: Metrics,
+    /// Keeps already-published lens sets fresh. `None` disables live
+    /// maintenance and falls back to sets expiring on their TTL.
+    deltas: Option<DeltaApplier>,
 }
 
 impl Streamer {
-    pub fn new(config: Config, cursor: Cursor, sink: Sink, metrics: Metrics) -> Self {
+    pub fn new(
+        config: Config,
+        cursor: Cursor,
+        sink: Sink,
+        metrics: Metrics,
+        deltas: Option<DeltaApplier>,
+    ) -> Self {
         Self {
             config,
             cursor,
             sink,
             metrics,
+            deltas,
         }
     }
 
@@ -95,6 +106,8 @@ impl Streamer {
         let read_timeout = Duration::from_secs(self.config.read_timeout_seconds);
         let mut flush_tick = tokio::time::interval(self.config.batch_interval);
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut active_tick = tokio::time::interval(self.config.active_refresh_interval);
+        active_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -106,6 +119,16 @@ impl Streamer {
                 _ = flush_tick.tick() => {
                     self.flush(&mut batch, &mut batch_start, last_seq).await;
                     self.publish_age(last_seq);
+                }
+                _ = active_tick.tick() => {
+                    // Whose sets are live? Refreshed on a timer rather than per
+                    // event; a viewer who appears between ticks simply waits one
+                    // interval before their set starts tracking the stream.
+                    if let Some(deltas) = &self.deltas {
+                        if let Err(e) = deltas.refresh_active().await {
+                            warn!(error = %e, "could not refresh active viewers");
+                        }
+                    }
                 }
                 frame = tokio::time::timeout(read_timeout, read.next()) => {
                     match frame {
@@ -125,6 +148,15 @@ impl Streamer {
                                     "create" => self.metrics.follows.inc(),
                                     _ => self.metrics.unfollows.inc(),
                                 };
+                                // Keep live sets fresh. Gated on a hash lookup
+                                // first, so the overwhelming majority of events
+                                // -- follows by accounts nobody has a lens for
+                                // -- cost nothing beyond that check.
+                                if let Some(deltas) = &self.deltas {
+                                    if deltas.is_active(&edge.follower).await {
+                                        deltas.apply(&edge).await;
+                                    }
+                                }
                                 batch.push(edge);
                                 if batch.len() >= self.config.batch_size {
                                     self.flush(&mut batch, &mut batch_start, last_seq).await;

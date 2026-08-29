@@ -24,6 +24,17 @@ pub struct Config {
     /// Reconnect if no frame arrives within this window.
     pub read_timeout_seconds: u64,
 
+    /// Apply the follow stream to lens sets that already exist, so they stay
+    /// correct and their TTL can be long. Off means sets rot until they expire.
+    pub deltas_enabled: bool,
+    /// How often to reload the set of viewers worth tracking.
+    pub active_refresh_interval: Duration,
+    /// Life extension applied to a set each time a delta lands. Long on
+    /// purpose: with deltas keeping it correct, an actively-read set should
+    /// never expire, and expiry becomes a garbage-collector for readers who
+    /// have gone away rather than a correctness mechanism.
+    pub set_ttl_seconds: u64,
+
     pub metrics_port: u16,
 }
 
@@ -53,6 +64,15 @@ impl Config {
             insert_timeout: Duration::from_secs(parse("LENS_FOLD_INSERT_TIMEOUT_SECONDS", 30)?),
             max_pending_rows: parse("LENS_FOLD_MAX_PENDING_ROWS", 250_000)?,
             read_timeout_seconds: parse("LENS_FOLD_READ_TIMEOUT_SECONDS", 45)?,
+
+            deltas_enabled: parse("LENS_FOLD_DELTAS_ENABLED", true)?,
+            active_refresh_interval: Duration::from_secs(parse(
+                "LENS_FOLD_ACTIVE_REFRESH_SECONDS",
+                60,
+            )?),
+            // 7 days. With deltas keeping the set correct, this is a GC horizon
+            // for readers who stopped reading, not a freshness bound.
+            set_ttl_seconds: parse("LENS_SET_TTL_SECONDS", 604_800)?,
 
             metrics_port: parse("METRICS_PORT", 9090)?,
         })

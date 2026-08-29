@@ -20,6 +20,14 @@ pub struct Metrics {
     pub insert_failures: Counter,
     pub reconnects: Counter,
     pub cursor_age_seconds: Gauge,
+
+    /// Live-set maintenance. `deltas_applied` rising while
+    /// `deltas_rebuild_requested` stays low is the healthy shape: follows are
+    /// cheap to apply, unfollows cost a rebuild.
+    pub deltas_applied: Counter,
+    pub deltas_rebuild_requested: Counter,
+    pub delta_failures: Counter,
+    pub active_viewers: Gauge,
 }
 
 impl Metrics {
@@ -70,6 +78,34 @@ impl Metrics {
             cursor_age_seconds.clone(),
         );
 
+        let deltas_applied = Counter::default();
+        registry.register(
+            "deltas_applied",
+            "Follows applied directly to a live lens set",
+            deltas_applied.clone(),
+        );
+
+        let deltas_rebuild_requested = Counter::default();
+        registry.register(
+            "deltas_rebuild_requested",
+            "Rebuilds requested because an unfollow cannot name its subject",
+            deltas_rebuild_requested.clone(),
+        );
+
+        let delta_failures = Counter::default();
+        registry.register(
+            "delta_failures",
+            "Delta applications that errored",
+            delta_failures.clone(),
+        );
+
+        let active_viewers = Gauge::default();
+        registry.register(
+            "active_viewers",
+            "Viewers with a live lens set being kept fresh",
+            active_viewers.clone(),
+        );
+
         Self {
             registry: Arc::new(registry),
             frames_received,
@@ -79,6 +115,10 @@ impl Metrics {
             insert_failures,
             reconnects,
             cursor_age_seconds,
+            deltas_applied,
+            deltas_rebuild_requested,
+            delta_failures,
+            active_viewers,
         }
     }
 

@@ -31,8 +31,13 @@ pub struct Config {
     /// How long to block waiting for work before looping.
     pub block: Duration,
 
-    /// TTL on a built lens set. M0 has no delta application, so this doubles as
-    /// the freshness bound: a viewer's follows can be at most this stale.
+    /// TTL on a built lens set.
+    ///
+    /// Long, because graze-lens-fold now applies the follow stream to live sets
+    /// and extends this on every delta. It is a garbage-collection horizon for
+    /// readers who stopped reading, not a freshness bound — the short TTL this
+    /// used to carry meant an active reader kept falling off the end of their
+    /// own lens and seeing an unfiltered feed while it rebuilt.
     pub set_ttl: Duration,
     /// Refuse to publish a set larger than this. A pathological account should
     /// degrade to "no lens" rather than push a multi-megabyte value into Redis
@@ -75,7 +80,7 @@ impl Config {
             batch_size: parse("LENS_BATCH_SIZE", 16)?,
             block: Duration::from_millis(parse("LENS_BLOCK_MS", 5_000)?),
 
-            set_ttl: Duration::from_secs(parse("LENS_SET_TTL_SECONDS", 900)?),
+            set_ttl: Duration::from_secs(parse("LENS_SET_TTL_SECONDS", 604_800)?),
             max_set_size: parse("LENS_MAX_SET_SIZE", 200_000)?,
 
             metrics_port: parse("METRICS_PORT", 9090)?,

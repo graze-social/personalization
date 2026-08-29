@@ -33,3 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 prometheus-client = "0.22"
+
+[dev-dependencies]
+# Only to assert the shared `lens:active` key matches on both sides.
+graze-lens-fold = { path = "../graze-lens-fold" }

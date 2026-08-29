@@ -99,6 +99,18 @@ impl Backfiller {
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
+
+                // An account that has been deleted or deactivated is not a
+                // backfill failure — it is an answer. The PDS is telling us
+                // this repo has no records, and treating that as an error makes
+                // a bulk run over thousands of accounts report failure for
+                // doing exactly the right thing. Seen constantly at hop-2
+                // scale, where a slice of anyone's follow list has since left.
+                if is_repo_gone(status, &body) {
+                    debug!(did, %status, "repo unavailable; treating as no records");
+                    return Ok(Vec::new());
+                }
+
                 anyhow::bail!(
                     "listRecords failed for {did} ({}): {}",
                     status,
@@ -175,6 +187,24 @@ fn edge_from_record(did: &str, record: &Record) -> Option<FollowEdge> {
         seq,
         created_at,
     })
+}
+
+/// Is this PDS response "that account is gone" rather than "something broke"?
+///
+/// Matched on the response body rather than the status alone, because a bare
+/// 400 also covers genuine client errors we do want to hear about — a malformed
+/// DID, a bad cursor. Only the specific repo-missing shapes are treated as an
+/// empty answer.
+fn is_repo_gone(status: reqwest::StatusCode, body: &str) -> bool {
+    if status != reqwest::StatusCode::BAD_REQUEST && status != reqwest::StatusCode::NOT_FOUND {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    b.contains("could not find repo")
+        || b.contains("reponotfound")
+        || b.contains("repodeactivated")
+        || b.contains("repotakendown")
+        || b.contains("account is deactivated")
 }
 
 /// `at://did/app.bsky.graph.follow/<rkey>` → `<rkey>`.
@@ -282,6 +312,44 @@ mod tests {
             None,
         );
         assert!(edge_from_record("did:plc:a", &r).is_none());
+    }
+
+    /// A deleted or deactivated account is an answer, not an error. At hop-2
+    /// scale a slice of anyone's follow list has since left, and failing the
+    /// whole run for that would report failure for correct behaviour.
+    #[test]
+    fn gone_repos_are_not_failures() {
+        use reqwest::StatusCode;
+        assert!(is_repo_gone(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"InvalidRequest","message":"Could not find repo: did:plc:x"}"#
+        ));
+        assert!(is_repo_gone(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"RepoNotFound"}"#
+        ));
+        assert!(is_repo_gone(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"RepoDeactivated"}"#
+        ));
+        assert!(is_repo_gone(StatusCode::NOT_FOUND, "RepoTakendown"));
+    }
+
+    /// But a genuine client error must still surface. A bare 400 is not on its
+    /// own evidence the account is gone.
+    #[test]
+    fn other_client_errors_still_fail() {
+        use reqwest::StatusCode;
+        assert!(!is_repo_gone(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"InvalidRequest","message":"Invalid cursor"}"#
+        ));
+        assert!(!is_repo_gone(StatusCode::BAD_REQUEST, "malformed did"));
+        assert!(!is_repo_gone(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not find repo"
+        ));
+        assert!(!is_repo_gone(StatusCode::TOO_MANY_REQUESTS, "slow down"));
     }
 
     #[test]

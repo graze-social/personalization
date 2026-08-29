@@ -122,6 +122,9 @@ async fn main() -> anyhow::Result<()> {
                     Ok(BuildOutcome::Published) => info!(viewer, facet, "lens published"),
                     Ok(BuildOutcome::Empty) => info!(viewer, facet, "viewer follows nobody"),
                     Ok(BuildOutcome::TooLarge) => warn!(viewer, facet, "lens over size budget"),
+                    Ok(BuildOutcome::UnknownFacet) => {
+                        warn!(viewer, facet, "unknown facet; nothing built")
+                    }
                     Ok(BuildOutcome::NeedsBackfill) => {
                         warn!(
                             viewer,

@@ -28,8 +28,20 @@ use graze_lens_fold::Sink;
 /// side owns the constant in `graze_lens_fold::delta`.
 const ACTIVE_KEY: &str = "lens:active";
 
-/// Facet name on the wire. Matches `lensFacets` in the ui and feeder-rs.
+/// Facet names on the wire. These match `SUPPORTED_FACETS` in feeder-rs, which
+/// turns them into Redis key names — a name that disagrees between the two
+/// builds a key nobody reads.
+pub const FACET_FOLLOWS: &str = "follows";
 pub const FACET_FOLLOWS2: &str = "follows2";
+
+/// Facets this builder can actually produce.
+///
+/// Deliberately not every facet the *reader* accepts: `network` is a blend the
+/// reader composes from these two, so it is a legal thing to ask a feed for and
+/// an illegal thing to ask the builder for.
+pub fn is_buildable_facet(facet: &str) -> bool {
+    matches!(facet, FACET_FOLLOWS | FACET_FOLLOWS2)
+}
 
 fn now_secs() -> u32 {
     std::time::SystemTime::now()
@@ -86,6 +98,10 @@ pub enum BuildOutcome {
     /// any lens we built would be based on incidental stream data. Nothing is
     /// published; the feed serves unlensed.
     NeedsBackfill,
+    /// The requested facet is not one this builder produces. Nothing is
+    /// published and no state is written, so the viewer is left exactly as they
+    /// were rather than stuck mid-build.
+    UnknownFacet,
 }
 
 pub struct Builder {
@@ -191,6 +207,21 @@ impl Builder {
     /// edges as if it were their graph — a wrong feed, not a narrow one, and
     /// indistinguishable from someone who genuinely follows almost nobody.
     pub async fn build(&self, viewer: &str, facet: &str) -> anyhow::Result<BuildOutcome> {
+        // Reject an unknown facet before anything else, and in particular before
+        // marking the viewer "building" — a state nothing would ever clear.
+        //
+        // The dispatch below falls through to the first-degree publisher for any
+        // name it does not recognise, so an unknown facet would not fail: it
+        // would cheerfully publish the viewer's follows under that name, and the
+        // serve path would read a lens that answers a different question than
+        // the one its key claims. A composite like `network` is expanded by the
+        // reader into its underlying facets and never arrives here as itself, so
+        // seeing one is already a bug worth surfacing.
+        if !is_buildable_facet(facet) {
+            warn!(viewer, facet, "unknown facet; refusing to build");
+            return Ok(BuildOutcome::UnknownFacet);
+        }
+
         self.mark_state(viewer, "building").await?;
 
         if let Some(store) = &self.completeness {
@@ -531,6 +562,22 @@ impl Builder {
 
 #[cfg(test)]
 mod tests {
+    /// The reader accepts `network` and expands it into these two before
+    /// enqueueing; the builder must never accept it directly, or it would
+    /// publish a first-degree set under a name that promises a blend.
+    #[test]
+    fn only_real_facets_are_buildable() {
+        assert!(is_buildable_facet(FACET_FOLLOWS));
+        assert!(is_buildable_facet(FACET_FOLLOWS2));
+        assert!(
+            !is_buildable_facet("network"),
+            "network is composed by the reader, not built here"
+        );
+        assert!(!is_buildable_facet("mutuals"), "not implemented yet");
+        assert!(!is_buildable_facet(""));
+        assert!(!is_buildable_facet("FOLLOWS"), "matching is exact");
+    }
+
     use super::*;
 
     /// feeder-rs reads these exact key shapes (`feeder-rs/src/lens.rs`). They

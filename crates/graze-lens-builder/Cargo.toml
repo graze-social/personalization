@@ -1,0 +1,39 @@
+[package]
+name = "graze-lens-builder"
+version = "0.2.0"
+edition = "2021"
+description = "Builds per-viewer author sets (lenses) from the follow graph"
+license = "MIT"
+
+[[bin]]
+name = "graze-lens-builder"
+path = "src/main.rs"
+
+[lib]
+name = "graze_lens_builder"
+path = "src/lib.rs"
+
+[dependencies]
+graze-common = { path = "../graze-common" }
+
+tokio = { version = "1.43", features = ["full", "signal"] }
+reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"], default-features = false }
+deadpool-redis = "0.22"
+# Direct dependency purely to turn on `streams` for the consumer-group commands;
+# must track the version deadpool-redis re-exports or the types will not line up.
+redis = { version = "0.32", features = ["streams", "tokio-comp"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+anyhow = "1.0"
+thiserror = "2.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+prometheus-client = "0.22"
+
+[dev-dependencies]
+# Only to assert the shared `lens:active` key matches on both sides.
+graze-lens-fold = { path = "../graze-lens-fold" }

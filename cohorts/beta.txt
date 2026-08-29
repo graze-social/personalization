@@ -1,0 +1,56 @@
+# Graze beta cohort
+#
+# The people who get new, risky, or half-finished features first. This list is
+# deliberately NOT lens-specific: any feature that wants a small trusted audience
+# should read this cohort rather than inventing its own allowlist, so that
+# "who is in the beta" is one decision recorded in one place.
+#
+# Established 2026-08-28 for the graze-lens (viewer-graph feeds) beta.
+#
+# ## Keyed on DID, not handle
+#
+# Handles are mutable — someone moving from alice.bsky.social to alice.com would
+# silently drop out of a handle-keyed cohort, and worse, the old handle could
+# later be claimed by someone else who would silently drop *in*. DIDs never
+# change. The handle beside each DID is a comment for humans; it may go stale and
+# that is fine. Re-resolve with:
+#
+#   curl -s "https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=<handle>"
+#
+# ## Consumers
+#
+#   * ConfigMap `graze-beta-cohort` (key `dids.txt`) — the runtime artifact any
+#     job or service can mount. Regenerate after editing this file:
+#
+#       grep -v '^#' cohorts/beta.txt | grep -v '^$' > /tmp/dids.txt
+#       kubectl create configmap graze-beta-cohort --from-file=dids.txt=/tmp/dids.txt \
+#         --dry-run=client -o yaml | kubectl apply -f -
+#
+#   * `kube/lens-bootstrap-job.yaml` mounts that ConfigMap to pick which accounts
+#     to backfill follow history for.
+#
+#   * feeder-rs reads `LENS_ALLOWLIST_DIDS` (comma-separated) from `app-secrets`.
+#     Build it from this file:
+#
+#       grep -v '^#' cohorts/beta.txt | grep -v '^$' | paste -sd, -
+#
+# Anyone added here gains early access to unfinished features; that is the point,
+# but it is also worth their knowing. Adding someone is a product decision, not a
+# config change.
+
+# richferro.com
+did:plc:an5cb3ab3cjswxhb3czqqjov
+# fema.monster
+did:plc:lptjvw6ut224kwrj7ub3sqbe
+# aendra.com
+did:plc:kkf4naxqmweop7dv4l2iqqf5
+# byarielm.fyi
+did:plc:6i6n57nrkq6xavqbdo6bvkqr
+# zombiegomoan.on.bike
+did:plc:zmxjf4b7tzmuvtanyqjzslcn
+# clarabelle.xyz
+did:plc:geoqe3qls5mwezckxxsewys2
+# devingaffney.com
+did:plc:jijwtzgroy76samnivlqrpec
+# hipstersmoothie.com
+did:plc:m2sjv3wncvsasdapla35hzwj

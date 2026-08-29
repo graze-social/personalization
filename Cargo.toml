@@ -7,6 +7,9 @@ members = [
     "crates/graze-candidate-sync",
     "crates/graze-frontdoor",
     "crates/graze-feed-stats",
+    "crates/graze-lens-builder",
+    "crates/graze-lens-fold",
+    "crates/graze-lens-bootstrap",
 ]
 
 [workspace.package]

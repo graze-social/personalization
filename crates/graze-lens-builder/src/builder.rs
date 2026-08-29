@@ -129,7 +129,22 @@ impl Builder {
             cfg.backfill_page_delay,
             cfg.backfill_max_pages,
         ));
-        builder.sink = Some(Sink::new(cfg.clickhouse.clone(), cfg.query_timeout)?);
+        // Straight to the base table, NOT through follow_edges_buffer.
+        //
+        // The buffer exists to coalesce the *stream's* one-row-at-a-time
+        // inserts; a backfill is already a bulk write of hundreds or thousands
+        // of rows, so it gains nothing there and loses something important.
+        // Buffered rows are invisible to a plain SELECT on the base table until
+        // the buffer flushes (10k rows or 100s), so a rebuild landing inside
+        // that window would read back almost nothing and republish the
+        // truncated set this guard exists to prevent. Measured: a viewer
+        // backfilled to 681 follows had their set regress to 1 on the very next
+        // build. Writing directly closes the window entirely.
+        builder.sink = Some(Sink::new_with_table(
+            cfg.clickhouse.clone(),
+            cfg.query_timeout,
+            "follow_edges",
+        )?);
         Ok(builder)
     }
 

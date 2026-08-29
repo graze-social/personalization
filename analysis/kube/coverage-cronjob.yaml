@@ -210,7 +210,7 @@ spec:
                 name: personalization-coverage-src
           containers:
             - name: coverage
-              image: dgaff/graze-analysis@sha256:eae619d9a5917f394e41a77415a5b1285164b9fe1bc9d7089aa3041c738e9c54
+              image: dgaff/graze-analysis@sha256:3bcd3c2630886ca5ef935685d43c84bb836745898ac250c0ea66fe61ae00596e
               command: ["python", "/src/coverage.py"]
               volumeMounts:
                 - name: src

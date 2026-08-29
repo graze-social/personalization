@@ -197,3 +197,43 @@ def test_spec_without_guardrails_prints_none():
     control = _rows(150, 1, 20, 10000) + _rows(150, 1, 20, 250)
     readout = analyse_ab(_spec(), FakeReader(primary, control))
     assert "guardrail" not in "\n".join(readout.lines)
+
+
+class _KeysReader:
+    """Returns canned key listings for the contract check."""
+
+    def __init__(self, top, nested):
+        self._top = [(k, 1) for k in top]
+        self._nested = [(k, 1) for k in nested]
+
+    def query(self, sql):
+        return self._nested if "'params'" in sql else self._top
+
+
+def test_contract_accepts_a_top_level_field_that_exists():
+    from graze_analysis.contract import field_is_present
+
+    assert field_is_present("follow_seed", {"follow_seed", "algo_id"}, set())
+
+
+def test_contract_rejects_a_field_nothing_writes():
+    """The regression this pins.
+
+    `follow_seed` moved from `params.follow_seed` to the top level and a consumer kept reading the
+    old path. It did not error -- it matched 54 stale blobs and reported NOT DELIVERED for 24 hours
+    while the treatment was working.
+    """
+    from graze_analysis.contract import field_is_present
+
+    assert not field_is_present("params.follow_seed", {"follow_seed"}, set())
+    assert not field_is_present("ranker", {"algo_id", "source"}, set())
+
+
+def test_contract_handles_nested_params_paths():
+    from graze_analysis.contract import field_is_present
+
+    top, nested = {"params", "algo_id"}, {"max_total_sources"}
+    assert field_is_present("params.max_total_sources", top, nested)
+    assert not field_is_present("params.not_written", top, nested)
+    # A nested path under anything other than `params` is a spec error, not a lookup.
+    assert not field_is_present("source.nope", {"source"}, {"nope"})

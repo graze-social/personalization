@@ -46,6 +46,14 @@ pub struct Config {
 
     pub metrics_port: u16,
 
+    /// Scored entries kept per second-degree map. 20k at 6 bytes is 120 KB —
+    /// the strongest signals, sized to the serve path's read budget.
+    pub second_degree_top_k: usize,
+    /// Ceiling on rows pulled for one second-degree build. Bounds both the
+    /// transfer and the bloom; past this the tail is noise that costs bytes on
+    /// every request.
+    pub second_degree_cap: usize,
+
     /// Builds allowed to run at once. Almost all of a build is waiting -- on
     /// someone else's PDS during a backfill, or on ClickHouse -- so overlapping
     /// them costs little and stops one slow viewer stalling the queue.
@@ -99,6 +107,9 @@ impl Config {
             max_set_size: parse("LENS_MAX_SET_SIZE", 200_000)?,
 
             metrics_port: parse("METRICS_PORT", 9090)?,
+
+            second_degree_top_k: parse("LENS_SECOND_DEGREE_TOP_K", 20_000)?,
+            second_degree_cap: parse("LENS_SECOND_DEGREE_CAP", 500_000)?,
 
             concurrency: parse("LENS_BUILD_CONCURRENCY", 8)?,
             drain_timeout: Duration::from_secs(parse("LENS_BUILD_DRAIN_SECONDS", 30)?),

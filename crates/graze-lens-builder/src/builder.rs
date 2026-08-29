@@ -19,12 +19,24 @@ use tracing::{debug, info, warn};
 
 use crate::completeness::CompletenessStore;
 use crate::config::Config;
+use crate::interner::Interner;
+use crate::second_degree;
 use graze_lens_bootstrap::{Backfiller, Resolver};
 use graze_lens_fold::Sink;
 
 /// Viewers whose sets graze-lens-fold should keep fresh. Shared key; the fold
 /// side owns the constant in `graze_lens_fold::delta`.
 const ACTIVE_KEY: &str = "lens:active";
+
+/// Facet name on the wire. Matches `lensFacets` in the ui and feeder-rs.
+pub const FACET_FOLLOWS2: &str = "follows2";
+
+fn now_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
 
 /// Current followees of one viewer.
 ///
@@ -86,6 +98,8 @@ pub struct Builder {
     completeness: Option<CompletenessStore>,
     backfiller: Option<Backfiller>,
     sink: Option<Sink>,
+    /// Shared DID interner, on the cache Redis. Required for v2/follows2.
+    interner: Option<Interner>,
 }
 
 impl Builder {
@@ -103,13 +117,22 @@ impl Builder {
             completeness: None,
             backfiller: None,
             sink: None,
+            interner: None,
         })
     }
 
     /// The production builder: refuses to publish a lens for a viewer whose
     /// follow history has not been backfilled, and backfills them instead.
-    pub fn with_backfill(redis: Pool, config: Config) -> anyhow::Result<Self> {
+    ///
+    /// `interner_redis` is the *cache* Redis, where the shared DID id space
+    /// lives — a different instance from the one lens blobs are published to.
+    pub fn with_backfill(
+        redis: Pool,
+        interner_redis: Option<Pool>,
+        config: Config,
+    ) -> anyhow::Result<Self> {
         let mut builder = Self::new(redis, config)?;
+        builder.interner = interner_redis.map(Interner::new);
         let cfg = &builder.config;
 
         let http = reqwest::Client::builder()
@@ -200,8 +223,143 @@ impl Builder {
             return Ok(BuildOutcome::TooLarge);
         }
 
+        // `follows` publishes a v1 set (what feeder-rs reads today) and also a
+        // v2 scored blob, so the reader can change formats without a flag day.
+        // `follows²` is v2 only — a set cannot carry reach.
+        if facet == FACET_FOLLOWS2 {
+            return self.publish_second_degree(viewer, &followees).await;
+        }
+
         self.publish(viewer, facet, &followees).await?;
+        self.publish_v2_uniform(viewer, facet, &followees).await;
         Ok(BuildOutcome::Published)
+    }
+
+    /// Build and publish `follows²` from the traversal projection.
+    async fn publish_second_degree(
+        &self,
+        viewer: &str,
+        first_degree: &[String],
+    ) -> anyhow::Result<BuildOutcome> {
+        let Some(interner) = &self.interner else {
+            warn!(viewer, "no interner configured; cannot build follows2");
+            self.mark_state(viewer, "failed").await?;
+            return Ok(BuildOutcome::NeedsBackfill);
+        };
+
+        // Seeds must be ids, and must be inlined into the query. Interning the
+        // viewer's own follows is cheap and mostly cache-hits after the first
+        // build.
+        let ids = interner.intern_many(first_degree).await?;
+        let seeds: Vec<u32> = ids.values().copied().collect();
+        if seeds.is_empty() {
+            self.mark_state(viewer, "ready").await?;
+            return Ok(BuildOutcome::Empty);
+        }
+
+        let sql = second_degree::reach_query(
+            &self.clickhouse.database,
+            &seeds,
+            self.config.second_degree_cap,
+        );
+        let text = self.query_text(&sql).await?;
+
+        let mut map = second_degree::parse_reach_tsv(&text, self.config.second_degree_top_k);
+        second_degree::exclude_first_degree(&mut map, &seeds);
+        second_degree::warn_if_thin(viewer, seeds.len(), map.all_ids.len());
+
+        if map.is_empty() {
+            self.mark_state(viewer, "ready").await?;
+            return Ok(BuildOutcome::Empty);
+        }
+
+        let built_at = now_secs();
+        let blob = map.encode(built_at);
+        info!(
+            viewer,
+            seeds = seeds.len(),
+            reached = map.all_ids.len(),
+            scored = map.entries.len(),
+            max_reach = map.max_reach,
+            bytes = blob.len(),
+            "built second degree"
+        );
+
+        self.publish_blob(viewer, FACET_FOLLOWS2, &blob).await?;
+        Ok(BuildOutcome::Published)
+    }
+
+    /// Also publish `follows` as a v2 blob, at uniform full weight.
+    ///
+    /// A follow carries no strength signal, so every entry is full confidence;
+    /// the value is format uniformity, so the reader has one decoder and the
+    /// blend has one shape to weight. Best-effort: the v1 set is still the
+    /// authority until the reader moves over, so a failure here must not fail
+    /// the build.
+    async fn publish_v2_uniform(&self, viewer: &str, facet: &str, followees: &[String]) {
+        let Some(interner) = &self.interner else {
+            return;
+        };
+        let result = async {
+            let ids = interner.intern_many(followees).await?;
+            let entries: Vec<(u32, u16)> = ids
+                .values()
+                .map(|id| (*id, crate::scored::WEIGHT_MAX))
+                .collect();
+            let blob = crate::scored::encode(crate::scored::FACET_FOLLOWS, now_secs(), entries);
+            self.publish_blob(viewer, facet, &blob).await
+        }
+        .await;
+        if let Err(e) = result {
+            warn!(error = %e, viewer, facet, "v2 mirror publish failed; v1 set still authoritative");
+        }
+    }
+
+    /// Write a v2 blob and mark the viewer ready.
+    async fn publish_blob(&self, viewer: &str, facet: &str, blob: &[u8]) -> anyhow::Result<()> {
+        let key = format!("lens:v2:{facet}:{viewer}");
+        let ttl = self.config.set_ttl.as_secs();
+        let mut conn = self.redis.get().await?;
+        deadpool_redis::redis::pipe()
+            .atomic()
+            .set_ex(&key, blob, ttl)
+            .hset(Self::meta_key(viewer), "state", "ready")
+            .hset(
+                Self::meta_key(viewer),
+                format!("v2_{facet}_bytes"),
+                blob.len(),
+            )
+            .expire(Self::meta_key(viewer), ttl as i64)
+            .sadd(ACTIVE_KEY, viewer)
+            .query_async::<()>(&mut conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Run a query that returns raw text (TSV).
+    async fn query_text(&self, sql: &str) -> anyhow::Result<String> {
+        let response = self
+            .http
+            .post(self.clickhouse.base_url())
+            .basic_auth(&self.clickhouse.user, Some(&self.clickhouse.password))
+            .header("Content-Type", "text/plain")
+            .timeout(self.config.query_timeout)
+            .query(&[
+                (
+                    "max_execution_time",
+                    self.config.max_execution_seconds.to_string(),
+                ),
+                ("cancel_http_readonly_queries_on_client_close", "1".into()),
+            ])
+            .body(sql.to_string())
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("query failed ({status}): {}", &text[..text.len().min(400)]);
+        }
+        Ok(text)
     }
 
     /// Pull a viewer's follows from their own PDS, persist them, and publish

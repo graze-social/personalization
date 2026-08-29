@@ -36,7 +36,36 @@ async fn main() -> anyhow::Result<()> {
     );
     queue.ensure_group().await.context("consumer group")?;
 
-    let builder = Arc::new(Builder::with_backfill(pool, config.clone()).context("builder")?);
+    // The shared DID interner lives on the *cache* Redis, a different instance
+    // from the one lens blobs are published to. Optional: without it the
+    // builder still serves v1 sets, it just cannot build v2 or follows².
+    let interner_pool = match std::env::var("REDIS_URL").ok().filter(|u| !u.is_empty()) {
+        Some(url) => {
+            let built = RedisConfig::from_url(url)
+                .builder()
+                .map_err(anyhow::Error::from)
+                .and_then(|b| {
+                    b.max_size(4)
+                        .runtime(Runtime::Tokio1)
+                        .build()
+                        .map_err(anyhow::Error::from)
+                });
+            match built {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    warn!(error = %e, "interner redis unavailable; v2 and follows2 disabled");
+                    None
+                }
+            }
+        }
+        None => {
+            warn!("REDIS_URL unset; v2 and follows2 disabled");
+            None
+        }
+    };
+
+    let builder =
+        Arc::new(Builder::with_backfill(pool, interner_pool, config.clone()).context("builder")?);
     let queue = Arc::new(queue);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency.max(1)));
 

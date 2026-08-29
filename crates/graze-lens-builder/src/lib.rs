@@ -11,6 +11,7 @@ pub mod config;
 pub mod interner;
 pub mod queue;
 pub mod scored;
+pub mod second_degree;
 
 pub use builder::{BuildOutcome, Builder};
 pub use completeness::CompletenessStore;

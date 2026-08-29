@@ -97,9 +97,11 @@ pub fn header(blob: &[u8]) -> Option<Header> {
         return None;
     }
     let count = u32::from_le_bytes(blob[8..12].try_into().ok()?);
-    // A count that disagrees with the byte length means truncation or
-    // corruption; trusting it would read past the end or silently drop members.
-    if blob.len() != HEADER_LEN + count as usize * ENTRY_LEN {
+    // A blob shorter than its declared entries is truncation or corruption;
+    // trusting the count would read past the end. Longer is legal: the space
+    // after the entries belongs to optional trailers (the bloom), which the
+    // entries section — being exactly sized by `count` — safely delimits.
+    if blob.len() < HEADER_LEN + count as usize * ENTRY_LEN {
         return None;
     }
     Some(Header {
@@ -129,6 +131,101 @@ pub fn weight_of(blob: &[u8], id: u32) -> Option<u16> {
     }
     None
 }
+
+// ---------------------------------------------------------------------------
+// Bloom trailer: the approximate tail of a lens.
+//
+// The scored entries carry the top-K, but second degree runs to hundreds of
+// thousands of members, and shipping them all defeats the size budget. The
+// bloom answers "is this author in the lens AT ALL" for everyone past the
+// top-K, at ~1 byte per member.
+//
+// The error direction is what makes an approximation acceptable here: a bloom
+// has false POSITIVES only. A stranger occasionally passes the lens with
+// epsilon weight and ranks last — an extra post shown. It can never hide a
+// genuinely-followed author, because membership never reads false for a real
+// member. Inclusive errors degrade gracefully; exclusive ones would not.
+//
+// Hashing is FNV-1a/splitmix double-hashing implemented inline, because the
+// bits are read by feeder-rs in another repo and std's SipHash keys are
+// deliberately unstable across processes.
+// ---------------------------------------------------------------------------
+
+pub const BLOOM_MAGIC: &[u8; 4] = b"BLM1";
+/// Bits per member. 8 → ~2.1% false positives with k=6, chosen over 10 bits/1%
+/// because the marginal 60KB per viewer buys almost nothing at epsilon weight.
+pub const BLOOM_BITS_PER_MEMBER: usize = 8;
+pub const BLOOM_K: u32 = 6;
+
+fn fnv1a(id: u32) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in id.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn splitmix(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+/// Append a bloom of `members` to an encoded blob.
+pub fn append_bloom(blob: &mut Vec<u8>, members: &[u32]) {
+    let m_bits = (members.len().max(1) * BLOOM_BITS_PER_MEMBER).next_power_of_two() as u32;
+    let mut bits = vec![0u8; m_bits as usize / 8];
+    for &id in members {
+        let (h1, h2) = (fnv1a(id), splitmix(id as u64));
+        for i in 0..BLOOM_K as u64 {
+            let bit = (h1.wrapping_add(i.wrapping_mul(h2)) % m_bits as u64) as usize;
+            bits[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+    blob.extend_from_slice(BLOOM_MAGIC);
+    blob.extend_from_slice(&m_bits.to_le_bytes());
+    blob.extend_from_slice(&BLOOM_K.to_le_bytes());
+    blob.extend_from_slice(&bits);
+}
+
+/// Where the bloom trailer starts, if the blob carries one.
+fn bloom_at(blob: &[u8]) -> Option<usize> {
+    let h = header(blob)?;
+    let at = HEADER_LEN + h.count as usize * ENTRY_LEN;
+    if blob.len() >= at + 12 && &blob[at..at + 4] == BLOOM_MAGIC {
+        Some(at)
+    } else {
+        None
+    }
+}
+
+/// Approximate membership via the bloom trailer.
+///
+/// `None` means "no bloom present" — distinct from `Some(false)`, so a caller
+/// can fall back to exact-only behaviour on blobs built without one.
+pub fn bloom_contains(blob: &[u8], id: u32) -> Option<bool> {
+    let at = bloom_at(blob)?;
+    let m_bits = u32::from_le_bytes(blob[at + 4..at + 8].try_into().ok()?);
+    let k = u32::from_le_bytes(blob[at + 8..at + 12].try_into().ok()?);
+    let bits = &blob[at + 12..];
+    if m_bits as usize / 8 > bits.len() || m_bits == 0 {
+        return None;
+    }
+    let (h1, h2) = (fnv1a(id), splitmix(id as u64));
+    for i in 0..k as u64 {
+        let bit = (h1.wrapping_add(i.wrapping_mul(h2)) % m_bits as u64) as usize;
+        if bits[bit / 8] & (1 << (bit % 8)) == 0 {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+// The layout of the header means the entries section is self-delimiting, so a
+// v2 reader that predates blooms simply never looks past the entries — the
+// trailer is backward compatible by construction.
 
 #[cfg(test)]
 mod tests {
@@ -224,6 +321,106 @@ mod tests {
         assert_eq!(header(&blob).unwrap().count, 2);
         assert!(weight_of(&blob, 7).is_some());
         assert_eq!(weight_of(&blob, 9), Some(30));
+    }
+
+    /// The bloom must never produce a false negative — that would hide a
+    /// genuinely-followed author, the one error direction we cannot accept.
+    #[test]
+    fn bloom_has_no_false_negatives() {
+        let members: Vec<u32> = (0..50_000u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        let mut blob = encode(FACET_FOLLOWS2, 0, vec![(1, 1)]);
+        append_bloom(&mut blob, &members);
+        for &m in &members {
+            assert_eq!(
+                bloom_contains(&blob, m),
+                Some(true),
+                "false negative for {m}"
+            );
+        }
+    }
+
+    /// And its false-positive rate must be near the design point (~2.1% at 8
+    /// bits/member, k=6). Well above that means the sizing math is wrong and
+    /// strangers pour through the lens.
+    #[test]
+    fn bloom_false_positive_rate_is_near_design() {
+        let members: Vec<u32> = (0..100_000u32).map(|i| i * 7 + 1).collect();
+        let mut blob = encode(FACET_FOLLOWS2, 0, vec![(1, 1)]);
+        append_bloom(&mut blob, &members);
+        let mut fp = 0u32;
+        let trials = 100_000u32;
+        for i in 0..trials {
+            let candidate = 1_000_000_000u32 + i; // disjoint from members
+            if bloom_contains(&blob, candidate) == Some(true) {
+                fp += 1;
+            }
+        }
+        let rate = fp as f64 / trials as f64;
+        assert!(
+            rate < 0.035,
+            "fp rate {rate:.4} far above the ~2.1% design point"
+        );
+        assert!(
+            rate > 0.001,
+            "fp rate {rate:.4} suspiciously low; bloom likely broken"
+        );
+    }
+
+    /// A blob without a trailer answers None — "no bloom", not "not a member" —
+    /// so readers can distinguish exact-only blobs from misses.
+    #[test]
+    fn absent_bloom_is_none_not_false() {
+        let blob = golden();
+        assert_eq!(bloom_contains(&blob, 42), None);
+    }
+
+    /// A blob with a bloom must still serve exact lookups: the trailer cannot
+    /// break the entries section it follows.
+    #[test]
+    fn entries_survive_a_bloom_trailer() {
+        let mut blob = golden();
+        append_bloom(&mut blob, &[9, 10, 11]);
+        assert_eq!(weight_of(&blob, 700_530), Some(WEIGHT_MAX));
+        assert_eq!(weight_of(&blob, 999), None);
+        assert!(header(&blob).is_some());
+        assert_eq!(bloom_contains(&blob, 9), Some(true));
+    }
+
+    /// Serve-path cost check: both lookups must be far under a microsecond, so
+    /// a 30-post page costs tens of microseconds, invisible next to a 28ms p99.
+    #[test]
+    fn lookups_are_sub_microsecond() {
+        let entries: Vec<(u32, u16)> = (0..20_000u32).map(|i| (i * 13, 1u16)).collect();
+        let members: Vec<u32> = (0..250_000u32).map(|i| i * 11).collect();
+        let mut blob = encode(FACET_FOLLOWS2, 0, entries);
+        append_bloom(&mut blob, &members);
+
+        let start = std::time::Instant::now();
+        let mut hits = 0u64;
+        for i in 0..1_000_000u32 {
+            if weight_of(&blob, i).is_some() {
+                hits += 1;
+            }
+        }
+        let per_search = start.elapsed().as_nanos() / 1_000_000;
+
+        let start = std::time::Instant::now();
+        for i in 0..1_000_000u32 {
+            if bloom_contains(&blob, i) == Some(true) {
+                hits += 1;
+            }
+        }
+        let per_bloom = start.elapsed().as_nanos() / 1_000_000;
+
+        eprintln!(
+            "binary search: {per_search} ns/lookup, bloom: {per_bloom} ns/lookup (hits={hits})"
+        );
+        // Debug builds are ~10x slower than release; 5µs here is ~200-500ns released.
+        assert!(
+            per_search < 5_000,
+            "binary search {per_search} ns is too slow"
+        );
+        assert!(per_bloom < 5_000, "bloom probe {per_bloom} ns is too slow");
     }
 
     #[test]

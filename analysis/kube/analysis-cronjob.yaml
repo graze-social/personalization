@@ -25,7 +25,7 @@ spec:
             - name: dockerhub-secret
           containers:
             - name: analysis
-              image: dgaff/graze-analysis@sha256:304409b35ea970b57a3790c40928347f5367606af4b200d04985e6ba877c0696
+              image: dgaff/graze-analysis@sha256:3bcd3c2630886ca5ef935685d43c84bb836745898ac250c0ea66fe61ae00596e
               # Override the entrypoint so one job runs both the experiment readouts and the
               # density-drift guard. The guard exits non-zero only on a *detection* (a feed that has
               # already stopped being personalized), so a real regression shows up as a failed Job
@@ -34,6 +34,15 @@ spec:
               args:
                 - |
                   set -o pipefail
+                  # Contract check FIRST. A spec whose arm field nothing writes does not error,
+                  # it compares zero rows and reports WITHHELD -- indistinguishable from "not enough
+                  # data yet". That silence hid a broken consumer for 24 hours. Checking before the
+                  # readout means a field rename surfaces as a loud failure, not a quiet null.
+                  python -m graze_analysis.contract \
+                    experiments/personalization_holdout.yaml \
+                    experiments/follow_seed.yaml \
+                    experiments/max_sources_250_vs_10000.yaml
+                  contract=$?
                   python -m graze_analysis.runner \
                     experiments/personalization_holdout.yaml \
                     experiments/follow_seed.yaml \
@@ -42,6 +51,7 @@ spec:
                   python -m graze_analysis.drift
                   drift=$?
                   # Surface either failure, preferring the drift detection since it is actionable.
+                  [ $contract -ne 0 ] && exit $contract
                   [ $drift -ne 0 ] && exit $drift
                   exit $readout
               # Same wiring the personalization-api deployment uses. CLICKHOUSE_HOST/PORT/USER/

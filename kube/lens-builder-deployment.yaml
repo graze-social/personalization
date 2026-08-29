@@ -52,7 +52,7 @@ spec:
         - name: builder
           # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
           # the short-SHA tag are mutable on DOCR.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:f27d73fb112798f7cfa57b9c8fdaaa66a25eb1c8d129c182258a0f3f3d995456
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:96d6ea3f361c3a31be9ff243c909c7dc0491a2b46d01d35dfdb9a37d0ea3048d
           command: ["/app/graze-lens-builder"]
           resources:
             requests:

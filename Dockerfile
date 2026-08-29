@@ -53,8 +53,11 @@ COPY --from=builder /app/target/release/graze-feed-stats /app/graze-feed-stats
 COPY --from=builder /app/target/release/graze-lens-builder /app/graze-lens-builder
 COPY --from=builder /app/target/release/graze-lens-fold /app/graze-lens-fold
 COPY --from=builder /app/target/release/graze-lens-bootstrap /app/graze-lens-bootstrap
-# Built by -p graze-lens-fold; selected by `command:` in the CronJob.
+# Both built by -p graze-lens-fold; selected by `command:` in their CronJobs.
+# A binary missing here does not fail the build — it fails at container start,
+# on a schedule, as an OCI "no such file or directory" nobody is watching for.
 COPY --from=builder /app/target/release/graze-lens-rev-rebuild /app/graze-lens-rev-rebuild
+COPY --from=builder /app/target/release/graze-lens-project /app/graze-lens-project
 COPY --from=builder /app/target/release/graze-migrate-tranches /app/graze-migrate-tranches
 COPY --from=builder /app/target/release/graze-migrate-dates /app/graze-migrate-dates
 COPY --from=builder /app/target/release/graze-verify-migration /app/graze-verify-migration

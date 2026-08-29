@@ -6,9 +6,11 @@
 //! for an hour and feeds keep serving, unlensed.
 
 pub mod builder;
+pub mod completeness;
 pub mod config;
 pub mod queue;
 
 pub use builder::{BuildOutcome, Builder};
+pub use completeness::CompletenessStore;
 pub use config::Config;
 pub use queue::{BuildRequest, Delivery, Queue};

@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
     );
     queue.ensure_group().await.context("consumer group")?;
 
-    let builder = Arc::new(Builder::new(pool, config.clone()).context("builder")?);
+    let builder = Arc::new(Builder::with_backfill(pool, config.clone()).context("builder")?);
 
     let mut shutdown = Box::pin(signal::ctrl_c());
     let block_ms = config.block.as_millis() as u64;
@@ -67,6 +67,12 @@ async fn main() -> anyhow::Result<()> {
                 Ok(BuildOutcome::Published) => info!(viewer, facet, "lens published"),
                 Ok(BuildOutcome::Empty) => info!(viewer, facet, "viewer follows nobody"),
                 Ok(BuildOutcome::TooLarge) => warn!(viewer, facet, "lens over size budget"),
+                Ok(BuildOutcome::NeedsBackfill) => {
+                    warn!(
+                        viewer,
+                        facet, "no follow history and no way to backfill; not publishing"
+                    )
+                }
                 Err(e) => error!(error = %e, viewer, facet, "lens build failed"),
             }
 

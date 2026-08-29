@@ -45,6 +45,14 @@ pub struct Config {
     pub max_set_size: usize,
 
     pub metrics_port: u16,
+
+    /// Backfill settings, used when a viewer has no follow history on record.
+    /// Deliberately polite: this fans out to other people's PDS hosts, and a
+    /// backfill is never urgent — the feed serves unlensed until it lands.
+    pub backfill_request_timeout: Duration,
+    pub backfill_page_delay: Duration,
+    pub backfill_max_pages: usize,
+    pub plc_directory: Option<String>,
 }
 
 impl Config {
@@ -84,6 +92,14 @@ impl Config {
             max_set_size: parse("LENS_MAX_SET_SIZE", 200_000)?,
 
             metrics_port: parse("METRICS_PORT", 9090)?,
+
+            backfill_request_timeout: Duration::from_secs(parse(
+                "LENS_BOOTSTRAP_REQUEST_TIMEOUT",
+                20,
+            )?),
+            backfill_page_delay: Duration::from_millis(parse("LENS_BOOTSTRAP_PAGE_DELAY_MS", 150)?),
+            backfill_max_pages: parse("LENS_BOOTSTRAP_MAX_PAGES", 600)?,
+            plc_directory: optional("LENS_BOOTSTRAP_PLC_DIRECTORY"),
         })
     }
 }

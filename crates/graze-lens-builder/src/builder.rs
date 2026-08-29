@@ -15,9 +15,12 @@ use deadpool_redis::redis::AsyncCommands;
 use deadpool_redis::Pool;
 use graze_common::ClickHouseConfig;
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
+use crate::completeness::CompletenessStore;
 use crate::config::Config;
+use graze_lens_bootstrap::{Backfiller, Resolver};
+use graze_lens_fold::Sink;
 
 /// Viewers whose sets graze-lens-fold should keep fresh. Shared key; the fold
 /// side owns the constant in `graze_lens_fold::delta`.
@@ -67,6 +70,10 @@ pub enum BuildOutcome {
     Empty,
     /// Over `max_set_size`. Marked failed so it is not retried in a loop.
     TooLarge,
+    /// This viewer has no backfill on record and backfill is not configured, so
+    /// any lens we built would be based on incidental stream data. Nothing is
+    /// published; the feed serves unlensed.
+    NeedsBackfill,
 }
 
 pub struct Builder {
@@ -74,9 +81,16 @@ pub struct Builder {
     http: reqwest::Client,
     clickhouse: ClickHouseConfig,
     config: Config,
+    /// Absent means the completeness guard is off and every viewer is treated
+    /// as complete — only appropriate for a backfill-free test setup.
+    completeness: Option<CompletenessStore>,
+    backfiller: Option<Backfiller>,
+    sink: Option<Sink>,
 }
 
 impl Builder {
+    /// A builder with no completeness guard. Publishes whatever ClickHouse
+    /// holds for a viewer, complete or not.
     pub fn new(redis: Pool, config: Config) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -86,7 +100,37 @@ impl Builder {
             http,
             clickhouse: config.clickhouse.clone(),
             config,
+            completeness: None,
+            backfiller: None,
+            sink: None,
         })
+    }
+
+    /// The production builder: refuses to publish a lens for a viewer whose
+    /// follow history has not been backfilled, and backfills them instead.
+    pub fn with_backfill(redis: Pool, config: Config) -> anyhow::Result<Self> {
+        let mut builder = Self::new(redis, config)?;
+        let cfg = &builder.config;
+
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .user_agent(concat!("graze-lens-builder/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+
+        builder.completeness = Some(CompletenessStore::new(
+            cfg.clickhouse.clone(),
+            cfg.query_timeout,
+            cfg.max_execution_seconds,
+        )?);
+        builder.backfiller = Some(Backfiller::new(
+            http.clone(),
+            Resolver::new(http, cfg.plc_directory.clone()),
+            cfg.backfill_request_timeout,
+            cfg.backfill_page_delay,
+            cfg.backfill_max_pages,
+        ));
+        builder.sink = Some(Sink::new(cfg.clickhouse.clone(), cfg.query_timeout)?);
+        Ok(builder)
     }
 
     pub fn set_key(facet: &str, viewer: &str) -> String {
@@ -102,8 +146,21 @@ impl Builder {
     }
 
     /// Build and publish one lens.
+    ///
+    /// A viewer whose follow history was never backfilled is backfilled here
+    /// first. `graze-lens-fold` only sees follows made since it connected, so
+    /// building from ClickHouse alone would publish a handful of incidental
+    /// edges as if it were their graph — a wrong feed, not a narrow one, and
+    /// indistinguishable from someone who genuinely follows almost nobody.
     pub async fn build(&self, viewer: &str, facet: &str) -> anyhow::Result<BuildOutcome> {
         self.mark_state(viewer, "building").await?;
+
+        if let Some(store) = &self.completeness {
+            if !store.is_complete(viewer).await {
+                info!(viewer, facet, "no backfill on record; backfilling first");
+                return self.backfill_then_publish(viewer, facet).await;
+            }
+        }
 
         let followees = self.fetch_follows(viewer).await?;
         debug!(viewer, facet, count = followees.len(), "fetched follows");
@@ -128,6 +185,62 @@ impl Builder {
             return Ok(BuildOutcome::TooLarge);
         }
 
+        self.publish(viewer, facet, &followees).await?;
+        Ok(BuildOutcome::Published)
+    }
+
+    /// Pull a viewer's follows from their own PDS, persist them, and publish
+    /// the lens from what we just read.
+    ///
+    /// Publishing from memory rather than re-querying ClickHouse is deliberate.
+    /// The edges are written through `follow_edges_buffer`, which flushes on
+    /// 10k rows or 100 seconds — so a read immediately after the write would
+    /// see almost none of them and publish the very truncated lens this guard
+    /// exists to prevent. The rows still land for durability and for later
+    /// rebuilds; this build just does not depend on them being visible yet.
+    async fn backfill_then_publish(
+        &self,
+        viewer: &str,
+        facet: &str,
+    ) -> anyhow::Result<BuildOutcome> {
+        let (backfiller, sink, store) = match (&self.backfiller, &self.sink, &self.completeness) {
+            (Some(b), Some(s), Some(c)) => (b, s, c),
+            // Backfill is not configured; refusing to publish beats publishing
+            // a lens we know may be built on nothing.
+            _ => {
+                warn!(viewer, "backfill unavailable; refusing to publish a lens");
+                self.mark_state(viewer, "needs_backfill").await?;
+                return Ok(BuildOutcome::NeedsBackfill);
+            }
+        };
+
+        let edges = backfiller.edges_for(viewer).await?;
+        let count = edges.len();
+        info!(viewer, count, "backfilled follow history");
+
+        if !edges.is_empty() {
+            sink.insert(&edges).await?;
+        }
+
+        // Marked before publishing: if the process dies between the two, the
+        // next build finds the marker, skips the (already persisted) backfill,
+        // and builds from ClickHouse. Marking after would re-walk the PDS.
+        store.mark_complete(viewer, count).await?;
+
+        if count == 0 {
+            self.mark_state(viewer, "ready").await?;
+            return Ok(BuildOutcome::Empty);
+        }
+        if count > self.config.max_set_size {
+            warn!(
+                viewer,
+                count, "lens set over size budget; refusing to publish"
+            );
+            self.mark_state(viewer, "failed").await?;
+            return Ok(BuildOutcome::TooLarge);
+        }
+
+        let followees: Vec<String> = edges.into_iter().map(|e| e.followee).collect();
         self.publish(viewer, facet, &followees).await?;
         Ok(BuildOutcome::Published)
     }

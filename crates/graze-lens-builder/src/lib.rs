@@ -8,9 +8,12 @@
 pub mod builder;
 pub mod completeness;
 pub mod config;
+pub mod interner;
 pub mod queue;
+pub mod scored;
 
 pub use builder::{BuildOutcome, Builder};
 pub use completeness::CompletenessStore;
 pub use config::Config;
+pub use interner::Interner;
 pub use queue::{BuildRequest, Delivery, Queue};

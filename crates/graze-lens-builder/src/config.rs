@@ -46,6 +46,13 @@ pub struct Config {
 
     pub metrics_port: u16,
 
+    /// Builds allowed to run at once. Almost all of a build is waiting -- on
+    /// someone else's PDS during a backfill, or on ClickHouse -- so overlapping
+    /// them costs little and stops one slow viewer stalling the queue.
+    pub concurrency: usize,
+    /// How long to let in-flight builds finish on shutdown.
+    pub drain_timeout: Duration,
+
     /// Backfill settings, used when a viewer has no follow history on record.
     /// Deliberately polite: this fans out to other people's PDS hosts, and a
     /// backfill is never urgent — the feed serves unlensed until it lands.
@@ -92,6 +99,9 @@ impl Config {
             max_set_size: parse("LENS_MAX_SET_SIZE", 200_000)?,
 
             metrics_port: parse("METRICS_PORT", 9090)?,
+
+            concurrency: parse("LENS_BUILD_CONCURRENCY", 8)?,
+            drain_timeout: Duration::from_secs(parse("LENS_BUILD_DRAIN_SECONDS", 30)?),
 
             backfill_request_timeout: Duration::from_secs(parse(
                 "LENS_BOOTSTRAP_REQUEST_TIMEOUT",

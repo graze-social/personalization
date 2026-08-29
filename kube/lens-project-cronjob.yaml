@@ -1,0 +1,113 @@
+# graze-lens-project — rebuilds the second-degree traversal projection.
+#
+# `follow_edges` is keyed and partitioned for per-viewer lookups, which is the
+# wrong shape for a multi-seed traversal: measured on real data, the follows²
+# query against it read the entire table — 636 MB, 424-874 ms, with cold-read
+# variance on top. Against `follow_graph_int` the same query reads 11.87 MB in
+# 34-37 ms. That 54x is not tuning, it is three structural facts the projection
+# has and the fold table cannot: u32 keys instead of DID strings, index
+# granularity 1024 instead of 8192, and no partitioning at all (partitioning
+# taxes every seed one boundary granule in every partition).
+#
+# So the projection is not a cache of `follow_edges` — it is the only structure
+# the second-degree facet can be served from at all, and this job is what keeps
+# it true. A stale projection does not error: it silently serves a lens built
+# from last week's graph.
+#
+# The rebuild also *extends the interner* before projecting. Only 61% of graph
+# accounts were interned when this was written, and an INNER JOIN would have
+# dropped the rest — producing short lenses for real viewers with nothing
+# anywhere reporting a problem.
+#
+# Prereqs (created out of band):
+#   * secret `app-secrets` — CLICKHOUSE_{HOST,USER,PASSWORD}, REDIS_URL
+#     (REDIS_URL is the *cache* Redis, which holds the shared didint space)
+#   * ClickHouse tables — `feed-processor/scripts/create_follow_edges_tables.py`
+#
+# Safety: builds into a staging table and EXCHANGEs it in, so a run that dies
+# partway leaves the live projection untouched. It also refuses to swap in a
+# result under LENS_PROJECT_MIN_RATIO (default 0.5) of the current row count —
+# without that guard, one bad run would replace the projection with an almost
+# empty table and every second-degree lens would quietly go thin rather than
+# fail. Override deliberately with LENS_PROJECT_FORCE=true when a genuine shrink
+# is expected.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: graze-lens-project
+  labels:
+    app: graze-lens
+    component: project
+spec:
+  # Nightly, offset from the reverse-index rebuild so the two full-table passes
+  # do not overlap on the shared ClickHouse. Second-degree membership is a
+  # deliberate approximation — the requirement is near-real-time for the *store*
+  # and the first-degree delta path, not for a 286k-member reach map — so daily
+  # is the intended freshness, not a compromise.
+  schedule: "43 10 * * *" # 10:43 UTC ≈ 03:43 sfo3
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  # Skip a missed run rather than queueing it: a day-stale projection is
+  # survivable, two concurrent rebuilds fighting over the staging table are not.
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 10800 # 3h; the measured rebuild took 89s
+      template:
+        metadata:
+          labels:
+            app: graze-lens
+            component: project
+        spec:
+          restartPolicy: Never
+          # Required: the default service account carries no pull secrets, so
+          # without this the pod fails with ImagePullBackOff against DOCR.
+          imagePullSecrets:
+            - name: docr-graze-social-labs
+          containers:
+            - name: project
+              # Built from commit 870ef35 (feat/lens-completeness-guard).
+              # Digest-pinned: both `latest` and the short-SHA tag are mutable
+              # on DOCR.
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:96d6ea3f361c3a31be9ff243c909c7dc0491a2b46d01d35dfdb9a37d0ea3048d
+              command: ["/app/graze-lens-project"]
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "200m"
+                limits:
+                  # The join and the write happen inside ClickHouse; this
+                  # process issues SQL and interns DIDs in chunks.
+                  memory: "1Gi"
+                  cpu: "1000m"
+              envFrom:
+                - secretRef:
+                    name: app-secrets
+              env:
+                - name: LENS_PROJECT_MAX_EXECUTION_SECONDS
+                  value: "1800"
+                - name: LENS_PROJECT_MIN_RATIO
+                  value: "0.5"
+                # Bounds how many new accounts one pass may add to the shared
+                # interner. That id space lives on a NOEVICTION Redis shared
+                # with rust-smasher and membership-service, so unbounded growth
+                # here is someone else's outage. ~1.5M entries is ~90 MB; the
+                # full network would be ~25M (~1.8 GB), which is the point at
+                # which lenses need their own id space rather than this one.
+                - name: LENS_PROJECT_MAX_INTERN
+                  value: "2000000"
+                - name: RUST_LOG
+                  value: "info"
+              securityContext:
+                runAsNonRoot: true
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+          securityContext:
+            # Numeric, not a name: distroless nonroot has no /etc/passwd entry.
+            runAsUser: 65532
+            runAsGroup: 65532

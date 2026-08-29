@@ -25,7 +25,12 @@ data:
     # so without this bound every pre-flip row would land in the control arm.
     FLIP = os.environ.get("FOLLOW_SEED_FLIP_AT", "2026-08-27 17:29:54")
     DEC = "tryBase64Decode(interaction_feed_context)"
-    ARM = f"JSONExtractBool({DEC},'params','follow_seed')"
+    # TOP-LEVEL, not nested under `params`. The field was moved there so it would be written on
+    # no_user_data responses too, and this consumer was not updated with it -- so for 24 hours the
+    # dose check read 54 stale pre-move blobs instead of 17,494 live rows and reported NOT DELIVERED
+    # while the treatment was in fact working. Same class as every other bug in this feature: the
+    # producer changed and a consumer did not.
+    ARM = f"JSONExtractBool({DEC},'follow_seed')"
     SEEN = "app.bsky.feed.defs#interactionSeen"
 
     c = clickhouse_connect.get_client(
@@ -40,10 +45,26 @@ data:
     BASE = f"""FROM default.feed_interactions
     WHERE occurred >= toDateTime('{FLIP}') AND interaction_feed_context != ''
       AND JSONHas({DEC},'algo_id')
-      AND JSONHas({DEC},'params','follow_seed')
+      AND JSONHas({DEC},'follow_seed')
       AND interaction_event = '{SEEN}'"""
 
     print(f"=== follow-seed dose check (since {FLIP}Z) ===\n")
+
+    # Self-check before reporting anything. If rows carry the arm somewhere this script is not
+    # looking, every number below is drawn from the wrong population.
+    probe = c.query(f"""SELECT
+        countIf(JSONHas({DEC},'follow_seed')) AS top_level,
+        countIf(JSONHas({DEC},'params','follow_seed')) AS nested
+      FROM default.feed_interactions
+      WHERE occurred >= toDateTime('{FLIP}') AND interaction_feed_context != ''
+        AND JSONHas({DEC},'algo_id')
+        AND interaction_event = '{SEEN}'""").result_rows[0]
+    if probe[1] > probe[0]:
+        print(f"  !! ARM FIELD MOVED: {probe[1]:,} rows carry params.follow_seed but only")
+        print(f"     {probe[0]:,} carry top-level follow_seed. This script is reading the wrong")
+        print("     path and every number below is from the wrong population. Fix before reading.")
+        raise SystemExit(1)
+
 
     rows = c.query(f"""SELECT {ARM} AS arm, count() AS imp, uniqExact(did) AS users
                        {BASE} GROUP BY arm ORDER BY arm""").result_rows

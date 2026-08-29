@@ -10,6 +10,7 @@ pub mod cursor;
 pub mod delta;
 pub mod event;
 pub mod metrics;
+pub mod project;
 pub mod rev;
 pub mod sink;
 pub mod streamer;

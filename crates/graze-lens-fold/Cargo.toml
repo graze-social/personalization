@@ -15,6 +15,11 @@ path = "src/main.rs"
 name = "graze-lens-rev-rebuild"
 path = "src/bin/rev_rebuild.rs"
 
+# Rebuilds the u32 traversal projection that second-degree queries read.
+[[bin]]
+name = "graze-lens-project"
+path = "src/bin/project_rebuild.rs"
+
 [lib]
 name = "graze_lens_fold"
 path = "src/lib.rs"

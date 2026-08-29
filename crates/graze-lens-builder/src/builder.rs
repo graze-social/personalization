@@ -226,13 +226,7 @@ impl Builder {
         // `follows` publishes a v1 set (what feeder-rs reads today) and also a
         // v2 scored blob, so the reader can change formats without a flag day.
         // `follows²` is v2 only — a set cannot carry reach.
-        if facet == FACET_FOLLOWS2 {
-            return self.publish_second_degree(viewer, &followees).await;
-        }
-
-        self.publish(viewer, facet, &followees).await?;
-        self.publish_v2_uniform(viewer, facet, &followees).await;
-        Ok(BuildOutcome::Published)
+        self.publish_for_facet(viewer, facet, &followees).await
     }
 
     /// Build and publish `follows²` from the traversal projection.
@@ -414,7 +408,30 @@ impl Builder {
         }
 
         let followees: Vec<String> = edges.into_iter().map(|e| e.followee).collect();
-        self.publish(viewer, facet, &followees).await?;
+        // Route through the same facet dispatch as a normal build. Publishing
+        // directly here would ignore the facet entirely: a `follows2` request
+        // that happened to arrive for an un-backfilled viewer would silently
+        // publish their FIRST degree under the second-degree name — a lens that
+        // looks built, reports a plausible count, and is answering a different
+        // question than the one asked.
+        self.publish_for_facet(viewer, facet, &followees).await
+    }
+
+    /// Publish `followees` under whichever facet was requested.
+    ///
+    /// The single place that decides what a facet's output looks like, so the
+    /// normal and post-backfill paths cannot drift apart.
+    async fn publish_for_facet(
+        &self,
+        viewer: &str,
+        facet: &str,
+        followees: &[String],
+    ) -> anyhow::Result<BuildOutcome> {
+        if facet == FACET_FOLLOWS2 {
+            return self.publish_second_degree(viewer, followees).await;
+        }
+        self.publish(viewer, facet, followees).await?;
+        self.publish_v2_uniform(viewer, facet, followees).await;
         Ok(BuildOutcome::Published)
     }
 

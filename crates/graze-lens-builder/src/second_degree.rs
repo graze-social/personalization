@@ -1,0 +1,240 @@
+//! The `follows²` facet: who the people you follow follow.
+//!
+//! This is the facet that makes lenses usable. Measured on real feeds, 94% of
+//! (feed, reader) pairs had *zero* first-degree overlap — the lens matched
+//! nothing and the page came back unfiltered, which reads to a user as a toggle
+//! that does nothing. Second degree turns one viewer's 1,182-author lens into
+//! ~286,000 authors, ranked, which is the difference between a filter that
+//! usually fires and one that usually doesn't.
+//!
+//! # The score is the product
+//!
+//! `reach` is how many of *your own follows* also follow this author. On real
+//! data it discriminates sharply: the top author for one viewer was followed by
+//! 596 of their 1,182, tailing smoothly from there. That is exactly the
+//! "network statistic with the logged-in user as the distance subject" the
+//! requirements asked for, and it falls out of the same query that produces
+//! membership — aggregated rather than flattened.
+//!
+//! # Why it queries the projection
+//!
+//! Against `follow_edges` this same query read the entire table: 636 MB and
+//! 424–874 ms on real data. Against `follow_graph_int` it reads 11.87 MB in
+//! 34–37 ms. Two rules keep it there, and both are easy to lose:
+//!
+//! * **Literal seed ids, never `IN (subquery)`.** A subquery defeats
+//!   primary-key index analysis and full-scans. We already hold first degree.
+//! * **Never against `follow_edges`.** That table is keyed for per-viewer
+//!   lookups and partitioned for fold correctness, neither of which helps a
+//!   multi-seed traversal.
+
+use graze_lens_fold::project::{seed_list, LIVE_TABLE};
+use tracing::{debug, warn};
+
+use crate::scored::{self, FACET_FOLLOWS2};
+
+/// A built second-degree map, before publishing.
+pub struct SecondDegree {
+    /// Top-K, scored and sorted by id, ready to encode.
+    pub entries: Vec<(u32, u16)>,
+    /// Every id reached, for the bloom tail.
+    pub all_ids: Vec<u32>,
+    pub max_reach: u32,
+}
+
+impl SecondDegree {
+    pub fn is_empty(&self) -> bool {
+        self.all_ids.is_empty()
+    }
+
+    /// Encode as a v2 blob: scored top-K plus a bloom over the whole tail.
+    pub fn encode(&self, built_at: u32) -> Vec<u8> {
+        let mut blob = scored::encode(FACET_FOLLOWS2, built_at, self.entries.clone());
+        scored::append_bloom(&mut blob, &self.all_ids);
+        blob
+    }
+}
+
+/// Parse the projection's TSV response into a scored map.
+///
+/// Rows arrive ordered by reach descending, so the first `top_k` are the
+/// strongest signals; everything else still contributes to the bloom, which is
+/// what lets a lens degrade smoothly past the top-K instead of falling off a
+/// cliff.
+pub fn parse_reach_tsv(text: &str, top_k: usize) -> SecondDegree {
+    let mut entries: Vec<(u32, u16)> = Vec::with_capacity(top_k.min(1024));
+    let mut all_ids: Vec<u32> = Vec::new();
+    let mut max_reach = 0u32;
+
+    for line in text.lines() {
+        let mut cols = line.split('\t');
+        let (Some(id), Some(reach)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        let (Ok(id), Ok(reach)) = (id.trim().parse::<u32>(), reach.trim().parse::<u32>()) else {
+            continue;
+        };
+        if max_reach == 0 {
+            // First row is the largest, since the query orders by reach desc.
+            max_reach = reach;
+        }
+        all_ids.push(id);
+        if entries.len() < top_k {
+            // Normalised against this viewer's own maximum rather than a global
+            // constant: reach is only meaningful relative to how many people
+            // this particular viewer follows. A viewer with 40 follows and one
+            // with 4,000 should both get a full-strength top signal.
+            let w = if max_reach == 0 {
+                0.0
+            } else {
+                reach as f32 / max_reach as f32
+            };
+            entries.push((id, scored::weight_from_f32(w)));
+        }
+    }
+
+    SecondDegree {
+        entries,
+        all_ids,
+        max_reach,
+    }
+}
+
+/// The traversal query, with seeds inlined.
+///
+/// `cap` bounds both the transfer and the bloom: a viewer with a very wide
+/// network yields hundreds of thousands of rows, and past some point the tail
+/// is noise that costs bytes on the serve path's critical read.
+pub fn reach_query(database: &str, seeds: &[u32], cap: usize) -> String {
+    format!(
+        "SELECT followee_int, count() AS reach \
+         FROM {database}.{LIVE_TABLE} \
+         WHERE follower_int IN ({}) \
+         GROUP BY followee_int \
+         ORDER BY reach DESC, followee_int ASC \
+         LIMIT {cap} \
+         FORMAT TabSeparated",
+        seed_list(seeds)
+    )
+}
+
+/// Drop the viewer's own first degree from a second-degree map.
+///
+/// Someone you already follow is not a second-degree discovery, and leaving
+/// them in would let `follows²` quietly restate `follows` at a lower weight —
+/// making a blend of the two look like it was working when it was double
+/// counting one signal.
+pub fn exclude_first_degree(map: &mut SecondDegree, first_degree: &[u32]) {
+    if first_degree.is_empty() {
+        return;
+    }
+    let mut sorted = first_degree.to_vec();
+    sorted.sort_unstable();
+    let before = map.all_ids.len();
+    map.all_ids.retain(|id| sorted.binary_search(id).is_err());
+    map.entries
+        .retain(|(id, _)| sorted.binary_search(id).is_err());
+    debug!(
+        removed = before - map.all_ids.len(),
+        "excluded first degree from second"
+    );
+}
+
+/// Warn when a viewer's network is too small for this facet to mean anything.
+///
+/// Not an error: a genuinely small network is a real answer, and the blend
+/// handles it by falling through to weaker signals. But it is worth seeing in
+/// logs, because it is also what a broken backfill looks like.
+pub fn warn_if_thin(viewer: &str, seeds: usize, reached: usize) {
+    if seeds < 10 || reached < 100 {
+        warn!(
+            viewer,
+            seeds, reached, "second degree is thin; lens will lean on fallbacks"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_reach_rows_and_normalises_to_the_viewers_own_max() {
+        let tsv = "100\t596\n200\t300\n300\t150\n";
+        let m = parse_reach_tsv(tsv, 10);
+        assert_eq!(m.max_reach, 596);
+        assert_eq!(m.all_ids, vec![100, 200, 300]);
+        // Top entry is full confidence; the rest scale against it.
+        assert_eq!(m.entries[0].1, scored::WEIGHT_MAX);
+        assert!(m.entries[1].1 < m.entries[0].1);
+        assert!(m.entries[2].1 < m.entries[1].1);
+    }
+
+    /// Everything past top-K must still reach the bloom — that tail is the
+    /// whole reason the lens degrades smoothly rather than cutting off.
+    #[test]
+    fn tail_beyond_top_k_still_feeds_the_bloom() {
+        let tsv: String = (0..500).map(|i| format!("{i}\t{}\n", 500 - i)).collect();
+        let m = parse_reach_tsv(&tsv, 50);
+        assert_eq!(m.entries.len(), 50, "scored entries are capped");
+        assert_eq!(m.all_ids.len(), 500, "but the bloom sees everything");
+
+        let blob = m.encode(0);
+        // An id past the top-K is absent from entries but present in the bloom.
+        assert_eq!(scored::weight_of(&blob, 400), None);
+        assert_eq!(scored::bloom_contains(&blob, 400), Some(true));
+        // And one inside the top-K is in both.
+        assert!(scored::weight_of(&blob, 0).is_some());
+        assert_eq!(scored::bloom_contains(&blob, 0), Some(true));
+    }
+
+    /// The seed list must be inlined. `IN (subquery)` reads the whole table —
+    /// this is the difference between 11 MB and 636 MB.
+    #[test]
+    fn query_inlines_literal_seeds() {
+        let q = reach_query("default", &[7, 8, 9], 1000);
+        assert!(q.contains("IN (7,8,9)"));
+        assert!(!q.to_uppercase().contains("IN (SELECT"));
+        assert!(q.contains("follow_graph_int"), "must use the projection");
+        assert!(
+            !q.contains("follow_edges"),
+            "must never traverse the fold table"
+        );
+    }
+
+    /// Ordering must be deterministic. Ties broken only by reach would make the
+    /// top-K cut arbitrary between rebuilds, so a viewer's lens would churn
+    /// members for no reason.
+    #[test]
+    fn ordering_is_deterministic() {
+        let q = reach_query("default", &[1], 10);
+        assert!(q.contains("ORDER BY reach DESC, followee_int ASC"));
+    }
+
+    /// People you already follow are not second-degree discoveries; leaving
+    /// them in would let follows² restate follows at lower weight.
+    #[test]
+    fn first_degree_is_excluded() {
+        let tsv = "100\t50\n200\t40\n300\t30\n";
+        let mut m = parse_reach_tsv(tsv, 10);
+        exclude_first_degree(&mut m, &[200]);
+        assert_eq!(m.all_ids, vec![100, 300]);
+        assert!(m.entries.iter().all(|(id, _)| *id != 200));
+    }
+
+    #[test]
+    fn malformed_rows_are_skipped_not_fatal() {
+        let tsv = "100\t50\ngarbage\n\n200\tnope\n300\t30\n";
+        let m = parse_reach_tsv(tsv, 10);
+        assert_eq!(m.all_ids, vec![100, 300]);
+    }
+
+    #[test]
+    fn empty_result_is_empty_not_a_panic() {
+        let m = parse_reach_tsv("", 10);
+        assert!(m.is_empty());
+        assert_eq!(m.max_reach, 0);
+        let blob = m.encode(0);
+        assert!(scored::header(&blob).is_some());
+    }
+}

@@ -15,10 +15,15 @@ path = "src/lib.rs"
 
 [dependencies]
 graze-common = { path = "../graze-common" }
+# The completeness guard backfills a viewer from their PDS before publishing,
+# and writes the edges through the same sink the fold uses.
+graze-lens-bootstrap = { path = "../graze-lens-bootstrap" }
+graze-lens-fold = { path = "../graze-lens-fold" }
 
 tokio = { version = "1.43", features = ["full", "signal"] }
 reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"], default-features = false }
 deadpool-redis = "0.22"
+dashmap = "6"
 # Direct dependency purely to turn on `streams` for the consumer-group commands;
 # must track the version deadpool-redis re-exports or the types will not line up.
 redis = { version = "0.32", features = ["streams", "tokio-comp"] }
@@ -34,6 +39,3 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 prometheus-client = "0.22"
 
-[dev-dependencies]
-# Only to assert the shared `lens:active` key matches on both sides.
-graze-lens-fold = { path = "../graze-lens-fold" }

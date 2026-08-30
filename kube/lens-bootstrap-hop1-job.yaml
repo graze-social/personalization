@@ -1,0 +1,104 @@
+# graze-lens-bootstrap — backfills historical follow edges for a set of accounts.
+#
+# `graze-lens-fold` only sees follows from the moment it connects; this fills in
+# the history behind it, reading each account's follow records from its PDS.
+#
+# IDEMPOTENT. Rows are versioned by the record's own TID, so re-running writes
+# identical (follower, rkey, seq) tuples and ReplacingMergeTree collapses them.
+# Re-run freely — that is also the recovery procedure.
+#
+# Prereqs (created out of band):
+#   * secret `app-secrets` — CLICKHOUSE_{HOST,USER,PASSWORD}
+#   * ClickHouse tables — `feed-processor/scripts/create_follow_edges_tables.py`
+#   * ConfigMap `graze-beta-cohort` (key `dids.txt`) — the shared beta cohort,
+#     not a lens-specific list. Source of truth is `cohorts/beta.txt`; see its
+#     header for how to regenerate the ConfigMap after editing.
+#
+# Scope note: this is the per-account path, and it is what M0 needs — it covers
+# exactly the accounts that asked for a lens, over public unauthenticated
+# endpoints. Warming the *global* graph is a different job, blocked on a
+# bsky.network archive token plus a decoder for the .jss segment format; when
+# that lands, this remains the repair path for history the archive predates.
+#
+# Dry run first on a new DID list:
+#   kubectl set env job/graze-lens-bootstrap LENS_BOOTSTRAP_DRY_RUN=true
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: graze-lens-bootstrap-hop1
+  labels:
+    app: graze-lens
+    component: bootstrap
+spec:
+  # No retries. The job is re-runnable by hand, and an automatic retry of a
+  # partially-succeeded backfill just re-walks every PDS for no benefit.
+  backoffLimit: 0
+  # ~4h ceiling: a 50k-follow account is ~500 paged requests, and the default
+  # concurrency of 4 is deliberately polite to other people's servers.
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: graze-lens
+        component: bootstrap
+    spec:
+      restartPolicy: Never
+      # Required: the default service account carries no pull secrets, so
+      # without this the pod fails with ImagePullBackOff against DOCR.
+      imagePullSecrets:
+        - name: docr-graze-social-labs
+      containers:
+        - name: bootstrap
+          # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
+          # the short-SHA tag are mutable on DOCR.
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:fba7efdda8fdc929fc5318f3df530ef41ec42d1b127c2d8039faff15fa901b62
+          command: ["/app/graze-lens-bootstrap"]
+          args: ["--file", "/config/dids.txt"]
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              # Edges buffer in memory until a batch fills; a very large DID list
+              # of whales is the case that needs the headroom.
+              memory: "2Gi"
+              cpu: "1"
+          envFrom:
+            - secretRef:
+                name: app-secrets
+          env:
+            - name: LENS_BOOTSTRAP_CONCURRENCY
+              value: "12"
+            - name: LENS_BOOTSTRAP_PAGE_DELAY_MS
+              value: "150"
+            - name: LENS_BOOTSTRAP_INSERT_BATCH
+              value: "20000"
+            # Hub cap. 50 pages = 5,000 follows, past which an account is a
+            # hub rather than a person: its follows add reach noise to second
+            # degree and cost minutes each to page. Capping is a feature here,
+            # not a compromise -- the design wanted hub-capping anyway.
+            - name: LENS_BOOTSTRAP_MAX_PAGES
+              value: "50"
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: dids
+              mountPath: /config
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        # Numeric, not a name: distroless nonroot has no /etc/passwd entry.
+        runAsUser: 65532
+        runAsGroup: 65532
+      volumes:
+        - name: dids
+          configMap:
+            # The shared beta cohort, so "who is in the beta" stays one decision
+            # in one place rather than a per-feature allowlist.
+            name: lens-hop1-cohort

@@ -45,6 +45,29 @@ pub struct Config {
     pub max_set_size: usize,
 
     pub metrics_port: u16,
+
+    /// Scored entries kept per second-degree map. 20k at 6 bytes is 120 KB —
+    /// the strongest signals, sized to the serve path's read budget.
+    pub second_degree_top_k: usize,
+    /// Ceiling on rows pulled for one second-degree build. Bounds both the
+    /// transfer and the bloom; past this the tail is noise that costs bytes on
+    /// every request.
+    pub second_degree_cap: usize,
+
+    /// Builds allowed to run at once. Almost all of a build is waiting -- on
+    /// someone else's PDS during a backfill, or on ClickHouse -- so overlapping
+    /// them costs little and stops one slow viewer stalling the queue.
+    pub concurrency: usize,
+    /// How long to let in-flight builds finish on shutdown.
+    pub drain_timeout: Duration,
+
+    /// Backfill settings, used when a viewer has no follow history on record.
+    /// Deliberately polite: this fans out to other people's PDS hosts, and a
+    /// backfill is never urgent — the feed serves unlensed until it lands.
+    pub backfill_request_timeout: Duration,
+    pub backfill_page_delay: Duration,
+    pub backfill_max_pages: usize,
+    pub plc_directory: Option<String>,
 }
 
 impl Config {
@@ -84,6 +107,20 @@ impl Config {
             max_set_size: parse("LENS_MAX_SET_SIZE", 200_000)?,
 
             metrics_port: parse("METRICS_PORT", 9090)?,
+
+            second_degree_top_k: parse("LENS_SECOND_DEGREE_TOP_K", 20_000)?,
+            second_degree_cap: parse("LENS_SECOND_DEGREE_CAP", 500_000)?,
+
+            concurrency: parse("LENS_BUILD_CONCURRENCY", 8)?,
+            drain_timeout: Duration::from_secs(parse("LENS_BUILD_DRAIN_SECONDS", 30)?),
+
+            backfill_request_timeout: Duration::from_secs(parse(
+                "LENS_BOOTSTRAP_REQUEST_TIMEOUT",
+                20,
+            )?),
+            backfill_page_delay: Duration::from_millis(parse("LENS_BOOTSTRAP_PAGE_DELAY_MS", 150)?),
+            backfill_max_pages: parse("LENS_BOOTSTRAP_MAX_PAGES", 600)?,
+            plc_directory: optional("LENS_BOOTSTRAP_PLC_DIRECTORY"),
         })
     }
 }

@@ -59,7 +59,7 @@ spec:
             - name: rev-rebuild
               # Built from commit 1a835eb (feat/lens-completeness-guard). Digest-pinned:
               # both `latest` and the short-SHA tag are mutable on DOCR.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:cd0bc2360393f403566871044e38a3e2a9c5e28b7ffb1cb82e417a7a446fb9d9
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:da3164ede12fd38f63a8a0766aa8a6ffef0cc26f8342d5055c2bccb8dffca5ec
               command: ["/app/graze-lens-rev-rebuild"]
               resources:
                 requests:

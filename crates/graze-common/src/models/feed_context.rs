@@ -115,6 +115,28 @@ pub struct FeedContextProvenance {
     /// got used would be post-treatment conditioning.
     #[serde(rename = "follow_seed", skip_serializing_if = "Option::is_none")]
     pub follow_seed: Option<bool>,
+
+    /// Identifier of the RESPONSE this item was served in, so pages can be counted.
+    ///
+    /// Every item of one getFeedSkeleton response carries the same value, so
+    /// `uniqExact(page_id)` per user is the number of pages that user was served.
+    ///
+    /// This exists because `depth` is not a usable page marker. `depth` does restart at 0 per
+    /// response, but clients report only what was *seen* — measured 2026-08-30, **839 of 1,621
+    /// users had zero `depth = 0` rows despite having impressions**, because they never scrolled
+    /// to the top item. That undercount is not random: it depends on scroll behaviour, which is
+    /// itself an outcome, so it would bias exactly the comparison it was meant to support.
+    ///
+    /// Deliberately NOT the `impression_id` column. `feed_interactions` is shared with other Graze
+    /// services and nothing in this service writes that column, so populating it here would make
+    /// our rows inconsistent with its real producer. The blob is ours, and it is migration-free for
+    /// the same reason `ranker`, `fallback_reason` and `follow_seed` were.
+    ///
+    /// Truncated to 16 hex characters of the request's UUIDv7. That keeps the leading timestamp, so
+    /// values stay time-ordered, and 64 bits is far beyond enough to distinguish the pages of a
+    /// single user — which is the only scope it is ever grouped within.
+    #[serde(rename = "page_id", skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
 }
 
 /// Compact personalization params for provenance.
@@ -218,6 +240,7 @@ mod tests {
             ranker: None,
             fallback_reason: None,
             follow_seed: None,
+            page_id: None,
         };
         let encoded = ctx.encode().expect("encode");
         let decoded = FeedContextProvenance::decode(&encoded).expect("decode");
@@ -263,6 +286,7 @@ mod tests {
             ranker: None,
             fallback_reason: None,
             follow_seed: None,
+            page_id: None,
         };
         let json_absent = serde_json::to_string(&ctx).expect("serialize");
         assert!(
@@ -311,6 +335,7 @@ mod tests {
             ranker: None,
             fallback_reason: None,
             follow_seed: None,
+            page_id: None,
         };
         let json_absent = serde_json::to_string(&ctx).expect("serialize");
         assert!(
@@ -335,5 +360,77 @@ mod tests {
         let ctx: FeedContextProvenance = serde_json::from_str(legacy).expect("legacy decode");
         assert_eq!(ctx.fallback_reason, None);
         assert_eq!(ctx.source, "fallback");
+    }
+}
+
+#[cfg(test)]
+mod page_id_tests {
+    use super::*;
+
+    fn ctx() -> FeedContextProvenance {
+        FeedContextProvenance {
+            feed_uri: "at://x".to_string(),
+            algo_id: 1,
+            depth: 0,
+            personalized: false,
+            source: "fallback".to_string(),
+            personalization_type: None,
+            fallback_tranche: None,
+            total: 30,
+            personalized_count: 0,
+            attribution: None,
+            params: None,
+            response_time_ms: None,
+            is_holdout: None,
+            is_personalization_holdout: None,
+            ranker: None,
+            fallback_reason: None,
+            follow_seed: None,
+            page_id: None,
+        }
+    }
+
+    #[test]
+    fn page_id_is_omitted_when_unset_and_round_trips_when_set() {
+        let mut c = ctx();
+        assert!(
+            !serde_json::to_string(&c).unwrap().contains("page_id"),
+            "an unset page_id must not bloat every item's feedContext"
+        );
+        c.page_id = Some("0198fb2c4a1d7e33".to_string());
+        let decoded = FeedContextProvenance::decode(&c.encode().unwrap()).unwrap();
+        assert_eq!(decoded.page_id.as_deref(), Some("0198fb2c4a1d7e33"));
+    }
+
+    /// Migration-free, same as every other field added to this blob.
+    #[test]
+    fn a_blob_without_page_id_still_decodes() {
+        let legacy = r#"{"feed_uri":"at://x","algo_id":1,"depth":0,"personalized":false,"source":"fallback","total":1,"personalized_count":0}"#;
+        let c: FeedContextProvenance = serde_json::from_str(legacy).expect("legacy decode");
+        assert_eq!(c.page_id, None);
+    }
+
+    /// The whole point: every item of one response shares a page id, so counting distinct ids per
+    /// user counts pages -- unlike `depth = 0`, which 52% of users never report because they did
+    /// not scroll to the top item.
+    #[test]
+    fn items_of_one_response_share_a_page_id() {
+        let page = Some("0198fb2c4a1d7e33".to_string());
+        let items: Vec<FeedContextProvenance> = (0..30)
+            .map(|d| FeedContextProvenance {
+                depth: d,
+                page_id: page.clone(),
+                ..ctx()
+            })
+            .collect();
+        let distinct: std::collections::HashSet<_> =
+            items.iter().map(|i| i.page_id.clone()).collect();
+        assert_eq!(
+            distinct.len(),
+            1,
+            "one response must yield exactly one page id"
+        );
+        // And an item deep in the response still carries it, which is what fixes the undercount.
+        assert_eq!(items[29].page_id, page);
     }
 }

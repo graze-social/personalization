@@ -24,9 +24,11 @@
 //! (follower, rkey, seq) tuples and ReplacingMergeTree collapses them.
 
 pub mod backfill;
+pub mod completeness;
 pub mod config;
 pub mod resolve;
 
-pub use backfill::Backfiller;
+pub use backfill::{Backfilled, Backfiller};
+pub use completeness::{CompletenessStore, SOURCE_BOOTSTRAP, SOURCE_PDS};
 pub use config::Config;
 pub use resolve::Resolver;

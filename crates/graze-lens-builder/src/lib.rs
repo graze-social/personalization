@@ -6,7 +6,6 @@
 //! for an hour and feeds keep serving, unlensed.
 
 pub mod builder;
-pub mod completeness;
 pub mod config;
 pub mod interner;
 pub mod queue;
@@ -14,7 +13,8 @@ pub mod scored;
 pub mod second_degree;
 
 pub use builder::{BuildOutcome, Builder};
-pub use completeness::CompletenessStore;
+// Re-exported from graze-lens-bootstrap, where the backfill it records lives.
 pub use config::Config;
+pub use graze_lens_bootstrap::CompletenessStore;
 pub use interner::Interner;
 pub use queue::{BuildRequest, Delivery, Queue};

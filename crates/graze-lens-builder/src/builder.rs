@@ -17,10 +17,10 @@ use graze_common::ClickHouseConfig;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::completeness::CompletenessStore;
 use crate::config::Config;
 use crate::interner::Interner;
 use crate::second_degree;
+use graze_lens_bootstrap::CompletenessStore;
 use graze_lens_bootstrap::{Backfiller, Resolver};
 use graze_lens_fold::Sink;
 
@@ -167,6 +167,7 @@ impl Builder {
             cfg.backfill_request_timeout,
             cfg.backfill_page_delay,
             cfg.backfill_max_pages,
+            cfg.backfill_max_retries,
         ));
         // Straight to the base table, NOT through follow_edges_buffer.
         //
@@ -412,9 +413,15 @@ impl Builder {
             }
         };
 
-        let edges = backfiller.edges_for(viewer).await?;
+        let backfilled = backfiller.edges_for(viewer).await?;
+        let edges = backfilled.edges;
         let count = edges.len();
-        info!(viewer, count, "backfilled follow history");
+        info!(
+            viewer,
+            count,
+            truncated = backfilled.truncated,
+            "backfilled follow history"
+        );
 
         if !edges.is_empty() {
             sink.insert(&edges).await?;
@@ -423,7 +430,23 @@ impl Builder {
         // Marked before publishing: if the process dies between the two, the
         // next build finds the marker, skips the (already persisted) backfill,
         // and builds from ClickHouse. Marking after would re-walk the PDS.
-        store.mark_complete(viewer, count).await?;
+        //
+        // Except when the backfill was truncated. These edges are a prefix of
+        // the account's follows, not their graph, and a marker would make that
+        // prefix permanent: every later build would trust it and skip the walk.
+        // Leaving the marker off costs a re-walk per request for a handful of
+        // very large accounts, and buys the chance to get them whole once
+        // `backfill_max_pages` is raised. The lens still publishes meanwhile —
+        // a wide-but-partial lens is a reasonable feed, an invisibly frozen one
+        // is not.
+        if backfilled.truncated {
+            warn!(
+                viewer,
+                count, "backfill truncated; not recording completeness"
+            );
+        } else {
+            store.mark_complete(viewer, count).await?;
+        }
 
         if count == 0 {
             self.mark_state(viewer, "ready").await?;

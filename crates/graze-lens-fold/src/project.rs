@@ -291,6 +291,14 @@ impl Projector {
         // Joins are INNER, so an account still lacking an id drops out rather
         // than projecting to 0 and colliding with a real account.
         self.exec(&format!(
+            // GROUP BY, because a follow graph is a set of edges and not a
+            // multiset. `follow_edges` is keyed on (follower, rkey), and a
+            // follow → unfollow → refollow cycle issues a new rkey each time —
+            // so if any one of those deletes was never witnessed, two create
+            // rows survive for the same pair. Left in, they inflate every
+            // count() built on the projection: second-degree reach counts how
+            // many of your follows reach an author, and a duplicated edge makes
+            // one follow count twice.
             "INSERT INTO {db}.{STAGING_TABLE} (follower_int, followee_int)
              SELECT m1.id, m2.id
              FROM (
@@ -299,7 +307,8 @@ impl Projector {
                  ) WHERE op = 'create' AND followee != ''
              ) AS e
              INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
-             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did"
+             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
+             GROUP BY m1.id, m2.id"
         ))
         .await?;
 

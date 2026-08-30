@@ -300,6 +300,13 @@ impl Projector {
         // Joins are INNER, so an account still lacking an id drops out rather
         // than projecting to 0 and colliding with a real account.
         self.exec(&format!(
+            // grace_hash, because the default hash join builds both 42M-row
+            // sides in memory while streaming 2.79 billion rows through them
+            // and ClickHouse refused at 21.6 GiB. grace_hash buckets to disk
+            // and stays bounded; the extra IO is irrelevant for a job that
+            // already runs for twenty minutes. max_threads caps how many
+            // in-flight blocks pile up alongside it.
+            //
             // The map is collapsed by OPTIMIZE before this runs, so no FINAL
             // here. FINAL inside the join looked right and cost 21.7 GiB — it
             // turns the 42M-row side into an aggregating transform feeding a
@@ -326,7 +333,8 @@ impl Projector {
                  ) WHERE op = 'create' AND followee != ''
              ) AS e
              INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
-             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did"
+             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
+             SETTINGS join_algorithm = 'grace_hash', max_threads = 4"
         ))
         .await?;
 

@@ -60,6 +60,10 @@ pub const IDSPACE_LENS: u8 = 1;
 /// built for a different signal rather than silently ranking by the wrong one.
 pub const FACET_FOLLOWS: u8 = 1;
 pub const FACET_FOLLOWS2: u8 = 2;
+pub const FACET_NICHE: u8 = 3;
+pub const FACET_POPULAR: u8 = 4;
+pub const FACET_VELOCITY: u8 = 5;
+pub const FACET_COMMUNITY: u8 = 6;
 
 /// The full-confidence weight. A first-degree follow is exactly this.
 pub const WEIGHT_MAX: u16 = u16::MAX;

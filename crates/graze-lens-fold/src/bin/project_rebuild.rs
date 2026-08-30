@@ -67,6 +67,15 @@ async fn main() -> anyhow::Result<()> {
 
     info!("rebuilding traversal projection");
     let r = projector.run().await.context("rebuild")?;
+
+    // Derived tables, rebuilt from the projection that just swapped in so the
+    // priors and the graph they describe can never be from different nights.
+    let stats_rows = projector.rebuild_stats().await.context("account_stats")?;
+    let recent_rows = projector
+        .rebuild_recent()
+        .await
+        .context("follow_graph_recent")?;
+    info!(stats_rows, recent_rows, "derived tables rebuilt");
     info!(
         interned = r.interned,
         before = r.before,

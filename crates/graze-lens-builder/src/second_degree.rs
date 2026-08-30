@@ -28,6 +28,7 @@
 //!   lookups and partitioned for fold correctness, neither of which helps a
 //!   multi-seed traversal.
 
+pub use graze_lens_fold::project::seed_list as seed_list_of;
 use graze_lens_fold::project::{seed_list, LIVE_TABLE};
 use tracing::{debug, warn};
 
@@ -49,8 +50,17 @@ impl SecondDegree {
 
     /// Encode as a v2 blob: scored top-K plus a bloom over the whole tail.
     pub fn encode(&self, idspace: u8, built_at: u32) -> Vec<u8> {
-        let mut blob =
-            scored::encode_in_space(FACET_FOLLOWS2, idspace, built_at, self.entries.clone());
+        self.encode_as(FACET_FOLLOWS2, idspace, built_at)
+    }
+
+    /// Encode under an explicit facet header id. The header byte is what lets
+    /// the reader reject a blob published under the wrong key, so it must be
+    /// the facet the caller is actually publishing — six facets share this
+    /// struct now, and stamping them all as follows² would have every one of
+    /// them refused at read time (the good failure) or, worse, accepted as a
+    /// signal they are not.
+    pub fn encode_as(&self, facet_id: u8, idspace: u8, built_at: u32) -> Vec<u8> {
+        let mut blob = scored::encode_in_space(facet_id, idspace, built_at, self.entries.clone());
         scored::append_bloom(&mut blob, &self.all_ids);
         blob
     }

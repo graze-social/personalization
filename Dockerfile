@@ -58,6 +58,7 @@ COPY --from=builder /app/target/release/graze-lens-bootstrap /app/graze-lens-boo
 # on a schedule, as an OCI "no such file or directory" nobody is watching for.
 COPY --from=builder /app/target/release/graze-lens-rev-rebuild /app/graze-lens-rev-rebuild
 COPY --from=builder /app/target/release/graze-lens-project /app/graze-lens-project
+COPY --from=builder /app/target/release/graze-lens-lpa /app/graze-lens-lpa
 COPY --from=builder /app/target/release/graze-migrate-tranches /app/graze-migrate-tranches
 COPY --from=builder /app/target/release/graze-migrate-dates /app/graze-migrate-dates
 COPY --from=builder /app/target/release/graze-verify-migration /app/graze-verify-migration

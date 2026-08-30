@@ -53,6 +53,10 @@ pub struct Config {
     /// transfer and the bloom; past this the tail is noise that costs bytes on
     /// every request.
     pub second_degree_cap: usize,
+    /// Window for the velocity facet: "discovered in the last N days".
+    pub velocity_days: u32,
+    /// How many of the viewer's top communities the community facet draws from.
+    pub community_top: usize,
 
     /// Builds allowed to run at once. Almost all of a build is waiting -- on
     /// someone else's PDS during a backfill, or on ClickHouse -- so overlapping
@@ -111,6 +115,8 @@ impl Config {
 
             second_degree_top_k: parse("LENS_SECOND_DEGREE_TOP_K", 20_000)?,
             second_degree_cap: parse("LENS_SECOND_DEGREE_CAP", 500_000)?,
+            velocity_days: parse("LENS_VELOCITY_DAYS", 7)?,
+            community_top: parse("LENS_COMMUNITY_TOP", 3)?,
 
             concurrency: parse("LENS_BUILD_CONCURRENCY", 8)?,
             drain_timeout: Duration::from_secs(parse("LENS_BUILD_DRAIN_SECONDS", 30)?),

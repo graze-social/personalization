@@ -140,6 +140,21 @@ impl Projector {
     async fn extend_interner(&self) -> anyhow::Result<usize> {
         let db = &self.clickhouse.database;
 
+        // The map is a mirror of exactly one interner, never an accumulation
+        // across several. It used to be extended incrementally, with an
+        // anti-join skipping DIDs already present — which is correct only while
+        // the id space never changes. When lenses moved to their own space the
+        // ~2.6M rows already in the map kept their old ids, and since both
+        // spaces number from 1 those stale ids collided with freshly issued
+        // ones: three different accounts all held id 1. The join then fanned
+        // out and mapped edges to the wrong people, which showed up as a
+        // second-degree reach higher than the viewer's own follow count.
+        //
+        // Rebuilding is cheap because interning is get-or-create: accounts that
+        // already have an id in Redis get the same one back.
+        self.exec(&format!("TRUNCATE TABLE IF EXISTS {db}.{MAP_TABLE}"))
+            .await?;
+
         // One pass. Ordered by did so the pager below can walk it with a
         // range scan rather than OFFSET, which would itself become quadratic.
         self.exec(&format!("DROP TABLE IF EXISTS {db}.{PENDING_TABLE}"))
@@ -287,6 +302,26 @@ impl Projector {
              INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did"
         ))
         .await?;
+
+        // Two accounts sharing an id is silent: the join fans out, edges are
+        // attributed to the wrong people, and the projection still looks
+        // plausibly sized. Cheap to check, and it is the failure that actually
+        // happened.
+        let collisions: u64 = self
+            .exec(&format!(
+                "SELECT count() FROM (SELECT id FROM {db}.{MAP_TABLE} \
+                 GROUP BY id HAVING count() > 1) FORMAT TabSeparated"
+            ))
+            .await?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if collisions > 0 {
+            anyhow::bail!(
+                "{collisions} id(s) map to more than one account; refusing to swap in a \
+                 projection built from a corrupt id map"
+            );
+        }
 
         let before = self.count(LIVE_TABLE).await?;
         let after = self.count(STAGING_TABLE).await?;

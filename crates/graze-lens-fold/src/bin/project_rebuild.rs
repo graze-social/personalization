@@ -27,10 +27,11 @@ async fn main() -> anyhow::Result<()> {
         secure: parse("CLICKHOUSE_SECURE", true)?,
     };
 
-    // The interner lives on the CACHE redis, shared with rust-smasher and
-    // membership-service — not on the personalization instance where lens blobs
-    // live. Two different connections on purpose; see project.rs.
-    let redis_url = require("REDIS_URL")?;
+    // The lens id space lives on the LENS redis, beside the blobs whose ids it
+    // issues — not the shared space on the cache redis. Falls back so an unset
+    // LENS_REDIS_URL keeps working, but the two must agree with the builder or
+    // every id in the projection means a different account than the blobs do.
+    let redis_url = require("LENS_REDIS_URL").or_else(|_| require("PERSONALIZATION_REDIS_URL"))?;
     let pool = RedisConfig::from_url(redis_url)
         .builder()?
         .max_size(parse("LENS_PROJECT_REDIS_POOL", 4)?)

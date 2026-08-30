@@ -40,9 +40,20 @@ pub const LIVE_TABLE: &str = "follow_graph_int";
 pub const STAGING_TABLE: &str = "follow_graph_int_next";
 pub const MAP_TABLE: &str = "didint_map";
 
-/// Interner keys — the shared id space. See `graze-lens-builder::interner`.
-const DIDINT_MAP: &str = "didint:{didint}:map";
-const DIDINT_SEQ: &str = "didint:{didint}:seq";
+/// Interner keys — the **lens-owned** id space, on the lens Redis.
+///
+/// Not the shared `didint:{didint}:*` space that rust-smasher and
+/// membership-service use. The full follow graph is ~25M accounts, and the
+/// shared instance is `noeviction`: growing it there does not evict, it makes
+/// other services' writes fail. See `graze-lens-builder::interner` for the
+/// trade-off this accepts.
+///
+/// These ids must match the ones the builder stamps into blobs. Both sides
+/// declare the space, and a reader refuses a blob from the wrong one — ids from
+/// two interners collide silently otherwise, resolving to the wrong accounts
+/// rather than to nothing.
+const DIDINT_MAP: &str = "lensdid:{lensdid}:map";
+const DIDINT_SEQ: &str = "lensdid:{lensdid}:seq";
 const INTERN_CHUNK: usize = 1000;
 
 const LUA_GETSET: &str = r#"
@@ -343,8 +354,15 @@ mod tests {
     }
 
     #[test]
-    fn interner_keys_match_the_shared_space() {
-        assert_eq!(DIDINT_MAP, "didint:{didint}:map");
-        assert_eq!(DIDINT_SEQ, "didint:{didint}:seq");
+    fn interner_keys_match_the_lens_space() {
+        // These must equal `graze-lens-builder::interner`'s LENSDID_* keys, or
+        // the projection and the blobs are interned by two different counters
+        // and every id in one means a different account in the other.
+        assert_eq!(DIDINT_MAP, "lensdid:{lensdid}:map");
+        assert_eq!(DIDINT_SEQ, "lensdid:{lensdid}:seq");
+        // And must NOT be the shared space, which belongs to rust-smasher and
+        // membership-service.
+        assert_ne!(DIDINT_MAP, "didint:{didint}:map");
+        assert_ne!(DIDINT_SEQ, "didint:{didint}:seq");
     }
 }

@@ -48,8 +48,9 @@ impl SecondDegree {
     }
 
     /// Encode as a v2 blob: scored top-K plus a bloom over the whole tail.
-    pub fn encode(&self, built_at: u32) -> Vec<u8> {
-        let mut blob = scored::encode(FACET_FOLLOWS2, built_at, self.entries.clone());
+    pub fn encode(&self, idspace: u8, built_at: u32) -> Vec<u8> {
+        let mut blob =
+            scored::encode_in_space(FACET_FOLLOWS2, idspace, built_at, self.entries.clone());
         scored::append_bloom(&mut blob, &self.all_ids);
         blob
     }
@@ -179,7 +180,7 @@ mod tests {
         assert_eq!(m.entries.len(), 50, "scored entries are capped");
         assert_eq!(m.all_ids.len(), 500, "but the bloom sees everything");
 
-        let blob = m.encode(0);
+        let blob = m.encode(scored::IDSPACE_LENS, 0);
         // An id past the top-K is absent from entries but present in the bloom.
         assert_eq!(scored::weight_of(&blob, 400), None);
         assert_eq!(scored::bloom_contains(&blob, 400), Some(true));
@@ -229,12 +230,24 @@ mod tests {
         assert_eq!(m.all_ids, vec![100, 300]);
     }
 
+    /// Blobs must declare the id space their entries came from. Without it a
+    /// reader cannot tell a lens-space blob from a shared-space one, and the
+    /// two resolve the same u32 to different accounts.
+    #[test]
+    fn encoded_blob_declares_the_lens_id_space() {
+        let m = parse_reach_tsv("100\t5\n", 10);
+        let blob = m.encode(scored::IDSPACE_LENS, 0);
+        let h = scored::header(&blob).expect("valid header");
+        assert_eq!(h.idspace, scored::IDSPACE_LENS);
+        assert_ne!(h.idspace, scored::IDSPACE_SHARED);
+    }
+
     #[test]
     fn empty_result_is_empty_not_a_panic() {
         let m = parse_reach_tsv("", 10);
         assert!(m.is_empty());
         assert_eq!(m.max_reach, 0);
-        let blob = m.encode(0);
+        let blob = m.encode(scored::IDSPACE_LENS, 0);
         assert!(scored::header(&blob).is_some());
     }
 }

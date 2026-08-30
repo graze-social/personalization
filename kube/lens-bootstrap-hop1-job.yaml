@@ -52,7 +52,7 @@ spec:
         - name: bootstrap
           # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
           # the short-SHA tag are mutable on DOCR.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:fba7efdda8fdc929fc5318f3df530ef41ec42d1b127c2d8039faff15fa901b62
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:7dbb7c38aba0e165aebb93d9f0bf0d4d9b8ee8e5a291f5123acf867c18d035f7
           command: ["/app/graze-lens-bootstrap"]
           args: ["--file", "/config/dids.txt"]
           resources:
@@ -78,8 +78,14 @@ spec:
             # hub rather than a person: its follows add reach noise to second
             # degree and cost minutes each to page. Capping is a feature here,
             # not a compromise -- the design wanted hub-capping anyway.
+            # The code default, deliberately not the 50 this job first ran with.
+            # A run that stops at max_pages returns a PREFIX of an account's
+            # follows, and truncated accounts are now left without a completeness
+            # marker on purpose — so a low cap does not just truncate the biggest
+            # graphs, it condemns exactly those accounts to being re-walked from
+            # their PDS on every lens request, forever.
             - name: LENS_BOOTSTRAP_MAX_PAGES
-              value: "50"
+              value: "600"
             - name: RUST_LOG
               value: "info"
           volumeMounts:

@@ -291,7 +291,12 @@ impl Projector {
         // Joins are INNER, so an account still lacking an id drops out rather
         // than projecting to 0 and colliding with a real account.
         self.exec(&format!(
-            // Deliberately NOT deduplicated here. `follow_edges` is keyed on
+            // FINAL on the id map, because it is a ReplacingMergeTree and an
+            // unmerged duplicate row would fan the join out — one edge becoming
+            // two, silently. The map is ~42M rows, small enough for FINAL to be
+            // unremarkable next to the 2.79B-row side.
+            //
+            // The edges themselves are deliberately NOT deduplicated here. `follow_edges` is keyed on
             // (follower, rkey), and a follow → unfollow → refollow cycle issues
             // a new rkey, so an unwitnessed delete leaves two live creates for
             // one pair. Collapsing them with GROUP BY means holding 2.77
@@ -310,19 +315,26 @@ impl Projector {
                      SELECT follower, followee, op FROM {db}.follow_edges FINAL
                  ) WHERE op = 'create' AND followee != ''
              ) AS e
-             INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
-             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did"
+             INNER JOIN (SELECT did, id FROM {db}.{MAP_TABLE} FINAL) AS m1
+                 ON e.follower = m1.did
+             INNER JOIN (SELECT did, id FROM {db}.{MAP_TABLE} FINAL) AS m2
+                 ON e.followee = m2.did"
         ))
         .await?;
 
-        // Two accounts sharing an id is silent: the join fans out, edges are
-        // attributed to the wrong people, and the projection still looks
-        // plausibly sized. Cheap to check, and it is the failure that actually
-        // happened.
+        // Two DIFFERENT accounts sharing an id is silent: the join fans out,
+        // edges are attributed to the wrong people, and the projection still
+        // looks plausibly sized. Cheap to check, and it is the failure that
+        // actually happened.
+        //
+        // `uniqExact(did)`, not `count()`. The map is a ReplacingMergeTree, so
+        // the same (did, id) row appearing twice before a merge is ordinary and
+        // harmless — an earlier version of this guard counted rows and blocked
+        // a perfectly good rebuild on 50,000 of them.
         let collisions: u64 = self
             .exec(&format!(
                 "SELECT count() FROM (SELECT id FROM {db}.{MAP_TABLE} \
-                 GROUP BY id HAVING count() > 1) FORMAT TabSeparated"
+                 GROUP BY id HAVING uniqExact(did) > 1) FORMAT TabSeparated"
             ))
             .await?
             .trim()

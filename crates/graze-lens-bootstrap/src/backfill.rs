@@ -39,6 +39,20 @@ struct FollowValue {
     created_at: Option<String>,
 }
 
+/// The result of backfilling one account.
+///
+/// `truncated` is the field that matters to callers: it means we stopped at
+/// `max_pages` with records still unread, so these edges are a *prefix* of the
+/// account's follows, not their graph. A caller that records completeness must
+/// not do so for a truncated result — that would pin the account to a partial
+/// graph permanently, which is the same silent-wrong-lens failure the
+/// completeness marker exists to prevent, just harder to spot because the
+/// backfill genuinely ran.
+pub struct Backfilled {
+    pub edges: Vec<FollowEdge>,
+    pub truncated: bool,
+}
+
 pub struct Backfiller {
     http: reqwest::Client,
     resolver: Resolver,
@@ -70,13 +84,14 @@ impl Backfiller {
     /// Only creates are produced: listRecords reflects present state, so a
     /// record that is absent was either never created or already deleted, and
     /// in both cases there is nothing to write. Live deletes come from the fold.
-    pub async fn edges_for(&self, did: &str) -> anyhow::Result<Vec<FollowEdge>> {
+    pub async fn edges_for(&self, did: &str) -> anyhow::Result<Backfilled> {
         let pds = self.resolver.pds_for(did).await?;
         let url = format!("{pds}/xrpc/com.atproto.repo.listRecords");
 
         let mut edges = Vec::new();
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
+        let mut truncated = false;
 
         loop {
             let mut query: Vec<(&str, String)> = vec![
@@ -108,7 +123,13 @@ impl Backfiller {
                 // scale, where a slice of anyone's follow list has since left.
                 if is_repo_gone(status, &body) {
                     debug!(did, %status, "repo unavailable; treating as no records");
-                    return Ok(Vec::new());
+                    // Not truncated: this is a complete answer about an account
+                    // with nothing to read, not a partial read of one that has
+                    // records left.
+                    return Ok(Backfilled {
+                        edges: Vec::new(),
+                        truncated: false,
+                    });
                 }
 
                 anyhow::bail!(
@@ -144,6 +165,7 @@ impl Backfiller {
                     edges = edges.len(),
                     "hit max_pages; backfill truncated for this account"
                 );
+                truncated = true;
                 break;
             }
             if !self.page_delay.is_zero() {
@@ -151,7 +173,7 @@ impl Backfiller {
             }
         }
 
-        Ok(edges)
+        Ok(Backfilled { edges, truncated })
     }
 }
 

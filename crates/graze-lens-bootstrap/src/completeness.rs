@@ -21,12 +21,18 @@
 use std::time::Duration;
 
 use graze_common::ClickHouseConfig;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const TABLE: &str = "lens_backfill_state";
 
 /// Where a viewer's backfill came from, for auditing a suspicious lens later.
+///
+/// Both paths write real markers and both count as complete; the distinction is
+/// purely so an audit can tell a lazily-repaired viewer from one warmed in bulk.
+/// `SOURCE_PDS` is the builder repairing a single viewer inline, on their own
+/// first lens request; `SOURCE_BOOTSTRAP` is the bulk Job warming a cohort.
 pub const SOURCE_PDS: &str = "pds";
+pub const SOURCE_BOOTSTRAP: &str = "bootstrap";
 
 pub struct CompletenessStore {
     http: reqwest::Client,
@@ -112,6 +118,76 @@ impl CompletenessStore {
         Ok(())
     }
 
+    /// Record many viewers at once.
+    ///
+    /// The bulk Job backfills thousands of accounts in one run, and one INSERT
+    /// per account is exactly the tiny-insert pattern that drives this cluster's
+    /// cost. Rows go over as TabSeparated in batches, matching the Sink.
+    ///
+    /// Callers must only pass viewers whose edges are already durable. A marker
+    /// written ahead of its edges is worse than no marker: the next build trusts
+    /// it, skips the backfill, and publishes a lens from a graph that was never
+    /// written.
+    pub async fn mark_many(&self, entries: &[(String, usize)], source: &str) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // `backfilled_at` has no DEFAULT and is the ReplacingMergeTree *version*
+        // column, so it has to be sent: an omitted value would write epoch zero,
+        // which both destroys the audit trail the column exists for and loses
+        // every dedup race against any other row for that viewer. Sent as a unix
+        // integer, which TabSeparated accepts for DateTime, and read once per
+        // batch so a batch is internally consistent.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let body = entries
+            .iter()
+            .map(|(viewer, edges)| {
+                format!(
+                    "{}\t{}\t{}\t{}",
+                    escape_tsv(viewer),
+                    now,
+                    edges,
+                    escape_tsv(source)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let query = format!(
+            "INSERT INTO {}.{TABLE} (viewer, backfilled_at, edge_count, source) \
+             FORMAT TabSeparated",
+            self.clickhouse.database
+        );
+
+        let response = self
+            .http
+            .post(self.clickhouse.base_url())
+            .basic_auth(&self.clickhouse.user, Some(&self.clickhouse.password))
+            .header("Content-Type", "text/plain")
+            .timeout(self.timeout)
+            .query(&[("query", query.as_str())])
+            .body(body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "marking {} viewer(s) complete failed ({}): {}",
+                entries.len(),
+                status,
+                &text[..text.len().min(400)]
+            );
+        }
+        Ok(())
+    }
+
     async fn exec(&self, sql: &str, viewer: Option<&str>) -> anyhow::Result<String> {
         let mut query: Vec<(&str, String)> = vec![
             ("max_execution_time", self.max_execution_seconds.to_string()),
@@ -145,6 +221,27 @@ impl CompletenessStore {
     }
 }
 
+/// TabSeparated escaping, matching the Sink's.
+///
+/// A DID should never contain a tab, but this is untrusted network input and one
+/// stray control character would shift every later column silently rather than
+/// failing.
+fn escape_tsv(value: &str) -> String {
+    if !value
+        .as_bytes()
+        .iter()
+        .any(|b| matches!(b, b'\t' | b'\n' | b'\r' | b'\\'))
+    {
+        return value.to_string();
+    }
+    warn!(value, "control characters in a viewer DID; escaping");
+    value
+        .replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,6 +272,67 @@ mod tests {
         );
         assert!(sql.contains("{viewer:String}"));
         assert!(!sql.contains("did:plc:"));
+    }
+
+    /// The batched insert must name columns in the order its rows carry them.
+    /// A silent column shift here would write the timestamp into `edge_count`,
+    /// which the guard reads as "complete" for every viewer forever.
+    #[test]
+    fn batched_insert_columns_match_the_row_order() {
+        let s = store();
+        let query = format!(
+            "INSERT INTO {}.{TABLE} (viewer, backfilled_at, edge_count, source) \
+             FORMAT TabSeparated",
+            s.clickhouse.database
+        );
+        let row = format!(
+            "{}\t{}\t{}\t{}",
+            escape_tsv("did:plc:a"),
+            1788000000,
+            42,
+            escape_tsv(SOURCE_BOOTSTRAP)
+        );
+
+        let cols: Vec<&str> = query
+            .split_once('(')
+            .and_then(|(_, r)| r.split_once(')'))
+            .map(|(c, _)| c.split(',').map(str::trim).collect())
+            .expect("column list");
+        assert_eq!(
+            cols,
+            vec!["viewer", "backfilled_at", "edge_count", "source"]
+        );
+        assert_eq!(row.split('\t').count(), cols.len());
+        assert_eq!(row.split('\t').nth(2), Some("42"), "edge_count is third");
+    }
+
+    /// `backfilled_at` is the ReplacingMergeTree version column and has no
+    /// DEFAULT, so it must be sent. Omitting it writes epoch zero, which both
+    /// destroys the audit trail and loses every dedup race for that viewer.
+    #[test]
+    fn backfilled_at_is_always_sent() {
+        let s = store();
+        let query = format!(
+            "INSERT INTO {}.{TABLE} (viewer, backfilled_at, edge_count, source) FORMAT TabSeparated",
+            s.clickhouse.database
+        );
+        assert!(query.contains("backfilled_at"));
+    }
+
+    /// The two write paths must stay distinguishable, so an audit can tell a
+    /// lazily-repaired viewer from one warmed in bulk.
+    #[test]
+    fn sources_are_distinct() {
+        assert_ne!(SOURCE_PDS, SOURCE_BOOTSTRAP);
+    }
+
+    /// A control character in a DID would shift every later column silently.
+    #[test]
+    fn tsv_escaping_protects_the_column_boundaries() {
+        assert_eq!(escape_tsv("did:plc:ok"), "did:plc:ok");
+        assert_eq!(escape_tsv("did:plc:a\tb"), "did:plc:a\\tb");
+        assert_eq!(escape_tsv("did:plc:a\nb"), "did:plc:a\\nb");
+        assert!(!escape_tsv("did:plc:a\tb").contains('\t'));
     }
 
     /// A row recorded with zero edges is not evidence of a usable backfill —

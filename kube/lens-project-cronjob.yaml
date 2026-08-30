@@ -98,14 +98,17 @@ spec:
                   value: "1800"
                 - name: LENS_PROJECT_MIN_RATIO
                   value: "0.5"
-                # Bounds how many new accounts one pass may add to the shared
-                # interner. That id space lives on a NOEVICTION Redis shared
-                # with rust-smasher and membership-service, so unbounded growth
-                # here is someone else's outage. ~1.5M entries is ~90 MB; the
-                # full network would be ~25M (~1.8 GB), which is the point at
-                # which lenses need their own id space rather than this one.
+                # Bounds how many new accounts one pass may add. The cap was
+                # 2,000,000 when this shared the caching instance with
+                # rust-smasher and membership-service, where overrunning is
+                # someone else's outage. Lenses now own their id space on the
+                # 128 GiB instance, and the graph has ~45M distinct accounts —
+                # at 2M a pass it would take ~23 nightly runs to cover, leaving
+                # the projection incomplete the whole time. Measured cost is
+                # 61.5 bytes/entry, so 60M is ~3.7 GB against 45 GB free.
+                # Still capped: unbounded growth is how an instance fills.
                 - name: LENS_PROJECT_MAX_INTERN
-                  value: "2000000"
+                  value: "60000000"
                 - name: RUST_LOG
                   value: "info"
               securityContext:

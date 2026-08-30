@@ -39,6 +39,8 @@ use tracing::{info, warn};
 pub const LIVE_TABLE: &str = "follow_graph_int";
 pub const STAGING_TABLE: &str = "follow_graph_int_next";
 pub const MAP_TABLE: &str = "didint_map";
+/// Accounts still needing an id, materialised once per run.
+pub const PENDING_TABLE: &str = "didint_pending";
 
 /// Interner keys — the **lens-owned** id space, on the lens Redis.
 ///
@@ -123,31 +125,64 @@ impl Projector {
     /// Without this the projection silently drops edges: a join against the
     /// mirror simply loses rows whose DID was never interned, and a lens built
     /// on the result would be quietly short of members with nothing erroring.
+    /// Give every account in the graph an id in the lens space.
+    ///
+    /// The expensive part is working out *which* accounts still need one. That
+    /// question costs a full pass over `follow_edges` — twice, since an account
+    /// can appear as either endpoint — so it is asked exactly once per run and
+    /// the answer materialised.
+    ///
+    /// It used to be asked once per 50,000-DID batch. At 7M edges that was
+    /// unremarkable; at 2.79 billion it is ~900 iterations each scanning 5.6
+    /// billion rows, and the run never finishes. The batching is still here,
+    /// because the Lua interner should not be handed 45M arguments at once —
+    /// but it now pages through a materialised list instead of re-deriving it.
     async fn extend_interner(&self) -> anyhow::Result<usize> {
         let db = &self.clickhouse.database;
+
+        // One pass. Ordered by did so the pager below can walk it with a
+        // range scan rather than OFFSET, which would itself become quadratic.
+        self.exec(&format!("DROP TABLE IF EXISTS {db}.{PENDING_TABLE}"))
+            .await?;
+        self.exec(&format!(
+            "CREATE TABLE {db}.{PENDING_TABLE} ENGINE = MergeTree ORDER BY did AS
+             SELECT did FROM (
+                 SELECT follower AS did FROM {db}.follow_edges
+                 UNION ALL
+                 SELECT followee AS did FROM {db}.follow_edges WHERE followee != ''
+             ) AS g
+             LEFT ANTI JOIN {db}.{MAP_TABLE} AS m ON g.did = m.did
+             GROUP BY did"
+        ))
+        .await?;
+
+        let pending: u64 = self
+            .exec(&format!(
+                "SELECT count() FROM {db}.{PENDING_TABLE} FORMAT TabSeparated"
+            ))
+            .await?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        info!(pending, "accounts needing an id");
+
         let mut total = 0usize;
+        let mut cursor = String::new();
 
         loop {
             let remaining = self.max_intern_per_run.saturating_sub(total);
             if remaining == 0 {
                 warn!(
                     total,
+                    pending,
                     "hit max_intern_per_run; projection will be incomplete until the next run"
                 );
                 break;
             }
             let batch = remaining.min(50_000);
 
-            let sql = format!(
-                "SELECT did FROM (
-                     SELECT follower AS did FROM {db}.follow_edges
-                     UNION ALL
-                     SELECT followee AS did FROM {db}.follow_edges WHERE followee != ''
-                 ) AS g
-                 LEFT ANTI JOIN {db}.{MAP_TABLE} AS m ON g.did = m.did
-                 GROUP BY did LIMIT {batch}"
-            );
-            let text = self.exec(&sql).await?;
+            // Range scan from where the last batch ended.
+            let text = self.exec(&pending_page_sql(db, &cursor, batch)).await?;
             let dids: Vec<String> = text
                 .lines()
                 .map(str::trim)
@@ -157,12 +192,16 @@ impl Projector {
             if dids.is_empty() {
                 break;
             }
+            cursor = dids.last().cloned().unwrap_or_default();
 
             let pairs = self.intern(&dids).await?;
             self.write_map(&pairs).await?;
             total += pairs.len();
-            info!(interned = total, "interner extended");
+            info!(interned = total, of = pending, "interner extended");
         }
+
+        self.exec(&format!("DROP TABLE IF EXISTS {db}.{PENDING_TABLE}"))
+            .await?;
         Ok(total)
     }
 
@@ -331,6 +370,19 @@ pub fn seed_list(ids: &[u32]) -> String {
         .join(",")
 }
 
+/// One page of the pending list.
+///
+/// Ranges on `did` rather than using OFFSET: OFFSET re-reads every row before
+/// the window, so paging 45M accounts 50k at a time would re-scan the prefix
+/// 900 times and be quadratic in exactly the way this rewrite removed.
+fn pending_page_sql(db: &str, cursor: &str, batch: usize) -> String {
+    format!(
+        "SELECT did FROM {db}.{PENDING_TABLE} WHERE did > '{}' \
+         ORDER BY did LIMIT {batch} FORMAT TabSeparated",
+        cursor.replace('\'', "''")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +403,26 @@ mod tests {
     fn live_and_staging_are_distinct() {
         assert_ne!(LIVE_TABLE, STAGING_TABLE);
         assert!(STAGING_TABLE.starts_with(LIVE_TABLE));
+    }
+
+    /// Paging must range-scan on `did`. OFFSET would re-read the prefix on
+    /// every batch — the same quadratic shape that made the old per-batch
+    /// anti-join unusable at 2.79 billion edges.
+    #[test]
+    fn pending_pager_range_scans_and_escapes() {
+        let sql = pending_page_sql("default", "did:plc:abc", 50_000);
+        assert!(sql.contains("WHERE did > 'did:plc:abc'"));
+        assert!(sql.contains("ORDER BY did LIMIT 50000"));
+        assert!(!sql.to_uppercase().contains("OFFSET"));
+        assert!(sql.contains(PENDING_TABLE));
+
+        // First page starts from the empty cursor, which must still be a valid
+        // range predicate rather than a syntax error.
+        assert!(pending_page_sql("default", "", 10).contains("did > ''"));
+
+        // A quote in a DID must not terminate the literal.
+        let evil = pending_page_sql("default", "did:plc:a'b", 10);
+        assert!(evil.contains("did:plc:a''b"));
     }
 
     #[test]

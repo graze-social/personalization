@@ -291,14 +291,18 @@ impl Projector {
         // Joins are INNER, so an account still lacking an id drops out rather
         // than projecting to 0 and colliding with a real account.
         self.exec(&format!(
-            // GROUP BY, because a follow graph is a set of edges and not a
-            // multiset. `follow_edges` is keyed on (follower, rkey), and a
-            // follow → unfollow → refollow cycle issues a new rkey each time —
-            // so if any one of those deletes was never witnessed, two create
-            // rows survive for the same pair. Left in, they inflate every
-            // count() built on the projection: second-degree reach counts how
-            // many of your follows reach an author, and a duplicated edge makes
-            // one follow count twice.
+            // Deliberately NOT deduplicated here. `follow_edges` is keyed on
+            // (follower, rkey), and a follow → unfollow → refollow cycle issues
+            // a new rkey, so an unwitnessed delete leaves two live creates for
+            // one pair. Collapsing them with GROUP BY means holding 2.77
+            // billion distinct pairs in a hash table, which exceeded
+            // ClickHouse's 21.6 GiB limit outright.
+            //
+            // The duplicates only matter because they would make one follow
+            // count twice in a reach total, so they are counted away where the
+            // working set is small — `second_degree::reach_query` counts
+            // distinct followers over one viewer's seeds, tens of thousands of
+            // rows rather than billions.
             "INSERT INTO {db}.{STAGING_TABLE} (follower_int, followee_int)
              SELECT m1.id, m2.id
              FROM (
@@ -307,8 +311,7 @@ impl Projector {
                  ) WHERE op = 'create' AND followee != ''
              ) AS e
              INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
-             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
-             GROUP BY m1.id, m2.id"
+             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did"
         ))
         .await?;
 

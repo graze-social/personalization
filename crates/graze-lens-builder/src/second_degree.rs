@@ -106,9 +106,15 @@ pub fn parse_reach_tsv(text: &str, top_k: usize) -> SecondDegree {
 /// `cap` bounds both the transfer and the bloom: a viewer with a very wide
 /// network yields hundreds of thousands of rows, and past some point the tail
 /// is noise that costs bytes on the serve path's critical read.
+///
+/// Reach counts DISTINCT followers, not rows. The projection carries one row
+/// per (follower, rkey) edge, and a follow → unfollow → refollow cycle can
+/// leave two live rows for the same pair — counting rows would let one of your
+/// follows contribute twice. It is checkable: reach must never exceed the seed
+/// count, and when it did (2,234 against 1,183 seeds) that was the symptom.
 pub fn reach_query(database: &str, seeds: &[u32], cap: usize) -> String {
     format!(
-        "SELECT followee_int, count() AS reach \
+        "SELECT followee_int, uniqExact(follower_int) AS reach \
          FROM {database}.{LIVE_TABLE} \
          WHERE follower_int IN ({}) \
          GROUP BY followee_int \
@@ -201,6 +207,17 @@ mod tests {
             !q.contains("follow_edges"),
             "must never traverse the fold table"
         );
+    }
+
+    /// Reach must count distinct followers. The projection can hold two rows
+    /// for one (follower, followee) pair, and counting rows lets a single
+    /// follow contribute twice — which produced a reach larger than the
+    /// viewer's entire follow list.
+    #[test]
+    fn reach_counts_distinct_followers_not_rows() {
+        let q = reach_query("default", &[1, 2], 100);
+        assert!(q.contains("uniqExact(follower_int) AS reach"));
+        assert!(!q.contains("count() AS reach"));
     }
 
     /// Ordering must be deterministic. Ties broken only by reach would make the

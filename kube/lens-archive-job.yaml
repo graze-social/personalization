@@ -57,10 +57,18 @@ spec:
         component: archive
     spec:
       restartPolicy: OnFailure
+      # Required: the default service account carries no pull secrets, so
+      # without this the pod fails with ImagePullBackOff against DOCR.
+      imagePullSecrets:
+        - name: docr-graze-social-labs
       containers:
         - name: archive
-          # Digest-pinned: tags are mutable on Docker Hub.
-          image: dgaff/graze-lens-archive@sha256:921c6e5abadad8a5c5ae5f3646101d19c4a04ac288d1d618a683cf3b5b748c89
+          # DOCR, not Docker Hub: a freshly pushed Hub repo is private by
+          # default and the cluster has no credentials for it, which shows up as
+          # ImagePullBackOff. The `docr-graze-social-labs` pull secret below is
+          # the path every other personalization image already uses.
+          # Digest-pinned: both `latest` and version tags are mutable on DOCR.
+          image: registry.digitalocean.com/graze-social-labs/lens-archive@sha256:7d5429c0eb3bb0407c88e0ceb4bfeca3dd92624a23b2450ee2640cfecdddaef8
           resources:
             requests:
               memory: "1Gi"
@@ -69,7 +77,7 @@ spec:
               # Decode is the CPU cost and it parallelises; memory is bounded by
               # the batch buffer and the client's in-flight blocks, not by the
               # archive size.
-              memory: "4Gi"
+              memory: "6Gi"
               cpu: "3000m"
           envFrom:
             - secretRef:
@@ -79,18 +87,24 @@ spec:
           env:
             - name: JETSTREAM_HOST
               value: "jetstream.us-west.bsky.network"
-            # Rows per ClickHouse insert. Large on purpose: this cluster's cost
-            # is driven by part creation, not row count.
+            # Rows per ClickHouse insert. Large on purpose, and tuned against a
+            # real run rather than guessed: at 50k the job sat at 22k rows/s with
+            # 235m of a 3-core limit — not CPU-bound at all, just alternating
+            # between downloading and waiting on an insert. Raising the batch and
+            # the download parallelism together took it to ~65k rows/s and the
+            # projection from 47 hours to 14.
             - name: LENS_ARCHIVE_BATCH_ROWS
-              value: "50000"
+              value: "250000"
             # Parallelism against someone else's service. The PDS backfill's
             # lesson was that raising concurrency without backoff turns into
-            # 2,520 self-inflicted 429s; start moderate and raise only if the
-            # observed rate is disappointing and nothing is complaining.
+            # 2,520 self-inflicted 429s, so this was raised only after a run
+            # showed zero errors at the lower setting. Not raised further: CPU
+            # is still only a third used, so more would buy little, and memory
+            # (not throughput) is now the binding constraint.
             - name: LENS_ARCHIVE_DOWNLOAD_CONCURRENCY
-              value: "8"
+              value: "16"
             - name: LENS_ARCHIVE_SEGMENT_STRIPES
-              value: "4"
+              value: "8"
             - name: LENS_ARCHIVE_PROGRESS_ROWS
               value: "5000000"
           securityContext:

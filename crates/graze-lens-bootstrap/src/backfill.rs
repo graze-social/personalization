@@ -53,6 +53,21 @@ pub struct Backfilled {
     pub truncated: bool,
 }
 
+/// Ceiling on a single backoff wait. A host advertising a multi-minute
+/// Retry-After is telling us to come back in another run, not to hold a worker
+/// slot idle for it while thousands of other accounts wait behind it.
+const MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+
+/// `Retry-After`, as either delta-seconds or an HTTP date we ignore in favour of
+/// the caller's backoff. Only the numeric form is honoured, because the date
+/// form is rare here and mis-parsing it would stall a worker far longer than
+/// backing off would.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    let raw = response.headers().get(reqwest::header::RETRY_AFTER)?;
+    let secs: u64 = raw.to_str().ok()?.trim().parse().ok()?;
+    Some(Duration::from_secs(secs))
+}
+
 pub struct Backfiller {
     http: reqwest::Client,
     resolver: Resolver,
@@ -60,6 +75,8 @@ pub struct Backfiller {
     /// Politeness delay between pages against one PDS.
     page_delay: Duration,
     max_pages: usize,
+    /// How many times one page may be retried after a 429 or 5xx.
+    max_retries: u32,
 }
 
 impl Backfiller {
@@ -69,6 +86,7 @@ impl Backfiller {
         request_timeout: Duration,
         page_delay: Duration,
         max_pages: usize,
+        max_retries: u32,
     ) -> Self {
         Self {
             http,
@@ -76,6 +94,7 @@ impl Backfiller {
             request_timeout,
             page_delay,
             max_pages,
+            max_retries,
         }
     }
 
@@ -103,13 +122,44 @@ impl Backfiller {
                 query.push(("cursor", c.clone()));
             }
 
-            let response = self
-                .http
-                .get(&url)
-                .query(&query)
-                .timeout(self.request_timeout)
-                .send()
-                .await?;
+            // Retried on 429/5xx rather than failing the account.
+            //
+            // A bulk run fans out over shared `*.host.bsky.network` hosts, and
+            // raising max_pages multiplies requests per account, so the job
+            // rate-limits *itself*: one run pushed 2,520 accounts into 429s and
+            // recorded them all as failures. Nothing was wrong with those
+            // accounts — we simply asked too fast, and then remembered our own
+            // impatience as their problem. Backing off is what makes a bulk
+            // warm-up honest about which accounts it actually could not read.
+            let mut attempt = 0u32;
+            let response = loop {
+                let response = self
+                    .http
+                    .get(&url)
+                    .query(&query)
+                    .timeout(self.request_timeout)
+                    .send()
+                    .await?;
+
+                let status = response.status();
+                let retryable =
+                    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
+                if !retryable || attempt >= self.max_retries {
+                    break response;
+                }
+
+                // Honour Retry-After when the host sends one — it knows its own
+                // window better than any backoff curve we invent. Otherwise back
+                // off exponentially from the configured page delay.
+                let wait = retry_after(&response).unwrap_or_else(|| {
+                    let base = self.page_delay.max(Duration::from_millis(200));
+                    base * 2u32.saturating_pow(attempt + 1)
+                });
+                let wait = wait.min(MAX_RETRY_WAIT);
+                attempt += 1;
+                debug!(did, %status, attempt, wait_ms = wait.as_millis(), "backing off");
+                tokio::time::sleep(wait).await;
+            };
 
             if !response.status().is_success() {
                 let status = response.status();

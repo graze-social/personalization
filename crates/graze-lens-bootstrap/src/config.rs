@@ -22,6 +22,8 @@ pub struct Config {
     /// account; beyond that the account is logged and truncated rather than
     /// paging indefinitely.
     pub max_pages: usize,
+    /// Retries for one page after a 429 or 5xx.
+    pub max_retries: u32,
 
     pub plc_directory: Option<String>,
     /// Resolve and fetch, but write nothing.
@@ -51,6 +53,7 @@ impl Config {
             request_timeout: Duration::from_secs(parse("LENS_BOOTSTRAP_REQUEST_TIMEOUT", 20)?),
             page_delay: Duration::from_millis(parse("LENS_BOOTSTRAP_PAGE_DELAY_MS", 150)?),
             max_pages: parse("LENS_BOOTSTRAP_MAX_PAGES", 600)?,
+            max_retries: parse("LENS_BOOTSTRAP_MAX_RETRIES", 4)?,
 
             plc_directory: optional("LENS_BOOTSTRAP_PLC_DIRECTORY"),
             dry_run: parse("LENS_BOOTSTRAP_DRY_RUN", false)?,

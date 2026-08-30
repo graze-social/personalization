@@ -167,6 +167,7 @@ impl Builder {
             cfg.backfill_request_timeout,
             cfg.backfill_page_delay,
             cfg.backfill_max_pages,
+            cfg.backfill_max_retries,
         ));
         // Straight to the base table, NOT through follow_edges_buffer.
         //

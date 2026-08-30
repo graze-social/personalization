@@ -67,6 +67,7 @@ pub struct Config {
     pub backfill_request_timeout: Duration,
     pub backfill_page_delay: Duration,
     pub backfill_max_pages: usize,
+    pub backfill_max_retries: u32,
     pub plc_directory: Option<String>,
 }
 
@@ -120,6 +121,7 @@ impl Config {
             )?),
             backfill_page_delay: Duration::from_millis(parse("LENS_BOOTSTRAP_PAGE_DELAY_MS", 150)?),
             backfill_max_pages: parse("LENS_BOOTSTRAP_MAX_PAGES", 600)?,
+            backfill_max_retries: parse("LENS_BOOTSTRAP_MAX_RETRIES", 4)?,
             plc_directory: optional("LENS_BOOTSTRAP_PLC_DIRECTORY"),
         })
     }

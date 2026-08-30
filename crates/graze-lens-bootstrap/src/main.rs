@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
         config.request_timeout,
         config.page_delay,
         config.max_pages,
+        config.max_retries,
     ));
     let sink =
         Arc::new(Sink::new(config.clickhouse.clone(), config.insert_timeout).context("sink")?);

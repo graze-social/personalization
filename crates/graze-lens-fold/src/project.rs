@@ -217,6 +217,15 @@ impl Projector {
 
         self.exec(&format!("DROP TABLE IF EXISTS {db}.{PENDING_TABLE}"))
             .await?;
+
+        // Collapse the map once, here, where it is 42M rows on its own rather
+        // than one side of a billion-row join. Every DID is written exactly
+        // once per run, so this should be a no-op — but "should" is not a
+        // guarantee across a truncate and a few hundred batched inserts, and an
+        // unmerged duplicate silently doubles an edge in the projection.
+        self.exec(&format!("OPTIMIZE TABLE {db}.{MAP_TABLE} FINAL"))
+            .await?;
+
         Ok(total)
     }
 
@@ -291,10 +300,11 @@ impl Projector {
         // Joins are INNER, so an account still lacking an id drops out rather
         // than projecting to 0 and colliding with a real account.
         self.exec(&format!(
-            // FINAL on the id map, because it is a ReplacingMergeTree and an
-            // unmerged duplicate row would fan the join out — one edge becoming
-            // two, silently. The map is ~42M rows, small enough for FINAL to be
-            // unremarkable next to the 2.79B-row side.
+            // The map is collapsed by OPTIMIZE before this runs, so no FINAL
+            // here. FINAL inside the join looked right and cost 21.7 GiB — it
+            // turns the 42M-row side into an aggregating transform feeding a
+            // 2.79B-row join. Collapsing the small table once beforehand is the
+            // same guarantee for a fraction of the memory.
             //
             // The edges themselves are deliberately NOT deduplicated here. `follow_edges` is keyed on
             // (follower, rkey), and a follow → unfollow → refollow cycle issues
@@ -315,10 +325,8 @@ impl Projector {
                      SELECT follower, followee, op FROM {db}.follow_edges FINAL
                  ) WHERE op = 'create' AND followee != ''
              ) AS e
-             INNER JOIN (SELECT did, id FROM {db}.{MAP_TABLE} FINAL) AS m1
-                 ON e.follower = m1.did
-             INNER JOIN (SELECT did, id FROM {db}.{MAP_TABLE} FINAL) AS m2
-                 ON e.followee = m2.did"
+             INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
+             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did"
         ))
         .await?;
 

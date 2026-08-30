@@ -31,7 +31,21 @@ async fn main() -> anyhow::Result<()> {
     // issues — not the shared space on the cache redis. Falls back so an unset
     // LENS_REDIS_URL keeps working, but the two must agree with the builder or
     // every id in the projection means a different account than the blobs do.
-    let redis_url = require("LENS_REDIS_URL").or_else(|_| require("PERSONALIZATION_REDIS_URL"))?;
+    // Required, with no fallback. A fallback here is not a convenience, it is a
+    // silent corruption: the ids this issues are stamped into blobs as the lens
+    // space, so interning them against a different instance produces a
+    // perfectly healthy-looking run whose ids belong to nobody. That happened —
+    // 50,000 ids landed on the 1.1 GiB instance and the logs said "interner
+    // extended" throughout.
+    let redis_url = require("LENS_REDIS_URL")
+        .context("LENS_REDIS_URL is required: the lens id space must not be built against a fallback instance")?;
+    if let Some(host) = redis_url
+        .split('@')
+        .nth(1)
+        .and_then(|h| h.split(':').next())
+    {
+        info!(redis_host = host, "interning the lens id space");
+    }
     let pool = RedisConfig::from_url(redis_url)
         .builder()?
         .max_size(parse("LENS_PROJECT_REDIS_POOL", 4)?)

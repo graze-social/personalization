@@ -140,15 +140,17 @@ impl Builder {
     /// The production builder: refuses to publish a lens for a viewer whose
     /// follow history has not been backfilled, and backfills them instead.
     ///
-    /// `interner_redis` is the *cache* Redis, where the shared DID id space
-    /// lives — a different instance from the one lens blobs are published to.
+    /// `interner_redis` is the Redis holding the **lens-owned** id space,
+    /// which now lives alongside the blobs rather than in the shared space on
+    /// the cache Redis. See `interner.rs` for why that split was made and what
+    /// it costs.
     pub fn with_backfill(
         redis: Pool,
         interner_redis: Option<Pool>,
         config: Config,
     ) -> anyhow::Result<Self> {
         let mut builder = Self::new(redis, config)?;
-        builder.interner = interner_redis.map(Interner::new);
+        builder.interner = interner_redis.map(Interner::lens);
         let cfg = &builder.config;
 
         let http = reqwest::Client::builder()
@@ -300,7 +302,7 @@ impl Builder {
         }
 
         let built_at = now_secs();
-        let blob = map.encode(built_at);
+        let blob = map.encode(interner.idspace(), built_at);
         info!(
             viewer,
             seeds = seeds.len(),
@@ -332,7 +334,12 @@ impl Builder {
                 .values()
                 .map(|id| (*id, crate::scored::WEIGHT_MAX))
                 .collect();
-            let blob = crate::scored::encode(crate::scored::FACET_FOLLOWS, now_secs(), entries);
+            let blob = crate::scored::encode_in_space(
+                crate::scored::FACET_FOLLOWS,
+                interner.idspace(),
+                now_secs(),
+                entries,
+            );
             self.publish_blob(viewer, facet, &blob).await
         }
         .await;

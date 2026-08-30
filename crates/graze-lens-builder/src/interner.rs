@@ -14,12 +14,24 @@
 //! ~35 bytes per entry; as u32 ids it is 6. At 250k entries that is 8.75 MB
 //! versus 1.5 MB, per viewer, on a Redis the serve path reads.
 //!
-//! # Instance
+//! # Two spaces, and why lenses got their own
 //!
-//! The interner lives on the **cache** Redis (`REDIS_URL`), while lens blobs
-//! live on the **personalization** Redis. That split is deliberate: the interner
-//! is a shared asset of several services and moving it would break them, so the
-//! builder simply holds both connections.
+//! The shared space above is still the default and still what rust-smasher and
+//! membership-service use. Lenses now allocate from a private space
+//! (`IDSPACE_LENS`) on the lens Redis instead, because the full follow graph is
+//! ~25M accounts against the shared instance's remaining headroom, and that
+//! instance is `noeviction` — filling it does not evict, it makes other
+//! services' writes fail.
+//!
+//! The cost is real and worth remembering: a lens map and a membership-service
+//! bitmap no longer speak about accounts by the same ids, so a future
+//! `my-lists` facet that wanted to intersect the two needs a translation step
+//! rather than a direct bitmap operation.
+//!
+//! Ids are only meaningful relative to the interner that issued them, so every
+//! blob stamps its space in the header and readers refuse a mismatch. Without
+//! that, a blob built in one space and read in another resolves every lookup to
+//! the wrong account and looks like a lens with strange taste, not a broken one.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,6 +44,11 @@ use deadpool_redis::Pool;
 pub const DIDINT_MAP: &str = "didint:{didint}:map";
 /// Monotonic id sequence.
 pub const DIDINT_SEQ: &str = "didint:{didint}:seq";
+
+/// The lens-owned space, on the lens Redis. Same hash-tag trick so the
+/// get-or-create script stays on one Cluster slot.
+pub const LENSDID_MAP: &str = "lensdid:{lensdid}:map";
+pub const LENSDID_SEQ: &str = "lensdid:{lensdid}:seq";
 
 /// Bound on DIDs per Lua call, so the script does not hold the Redis slot long.
 const INTERN_CHUNK: usize = 1000;
@@ -54,17 +71,44 @@ return ids
 
 pub struct Interner {
     redis: Pool,
+    map_key: &'static str,
+    seq_key: &'static str,
+    /// Stamped into every blob built from these ids.
+    idspace: u8,
     /// Repeated interning during one rebuild should not re-hit Redis; a
     /// viewer's second-degree map revisits the same accounts constantly.
     cache: Arc<DashMap<String, u32>>,
 }
 
 impl Interner {
-    pub fn new(redis: Pool) -> Self {
+    /// The shared space, as rust-smasher and membership-service use it.
+    pub fn shared(redis: Pool) -> Self {
         Self {
             redis,
+            map_key: DIDINT_MAP,
+            seq_key: DIDINT_SEQ,
+            idspace: crate::scored::IDSPACE_SHARED,
             cache: Arc::new(DashMap::new()),
         }
+    }
+
+    /// The lens-owned space.
+    pub fn lens(redis: Pool) -> Self {
+        Self {
+            redis,
+            map_key: LENSDID_MAP,
+            seq_key: LENSDID_SEQ,
+            idspace: crate::scored::IDSPACE_LENS,
+            cache: Arc::new(DashMap::new()),
+        }
+    }
+
+    pub fn idspace(&self) -> u8 {
+        self.idspace
+    }
+
+    pub fn new(redis: Pool) -> Self {
+        Self::shared(redis)
     }
 
     /// Ids for every DID given, allocating for any that are new.
@@ -93,8 +137,8 @@ impl Interner {
             script
                 .arg(LUA_GETSET)
                 .arg(2)
-                .arg(DIDINT_MAP)
-                .arg(DIDINT_SEQ);
+                .arg(self.map_key)
+                .arg(self.seq_key);
             for did in chunk {
                 script.arg(did);
             }

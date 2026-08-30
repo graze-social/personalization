@@ -59,7 +59,7 @@ spec:
             - name: rev-rebuild
               # Built from commit 1a835eb (feat/lens-completeness-guard). Digest-pinned:
               # both `latest` and the short-SHA tag are mutable on DOCR.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:7dbb7c38aba0e165aebb93d9f0bf0d4d9b8ee8e5a291f5123acf867c18d035f7
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:311dd6e98592a8bb6503806753e530642480b369c84aab7d0becc88929d83a5f
               command: ["/app/graze-lens-rev-rebuild"]
               resources:
                 requests:
@@ -73,6 +73,13 @@ spec:
               envFrom:
                 - secretRef:
                     name: app-secrets
+                # LENS_REDIS_URL. Without this the binary falls back to
+                # PERSONALIZATION_REDIS_URL and interns the lens id space onto
+                # the 1.1 GiB instance instead of the 128 GiB one — which
+                # succeeds, logs normally, and is only visible by checking which
+                # Redis the keys landed on.
+                - secretRef:
+                    name: lens-redis
               env:
                 - name: LENS_REV_MAX_EXECUTION_SECONDS
                   value: "1800"

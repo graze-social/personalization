@@ -13,7 +13,8 @@
 //!   0..4    magic  b"GLZ2"
 //!   4       version = 2
 //!   5       facet id
-//!   6..8    reserved (zero)
+//!   6       id space (0 = the shared didint space, 1 = the lens-owned one)
+//!   7       reserved (zero)
 //!   8..12   entry count, u32 LE
 //!   12..16  built_at, u32 LE unix seconds
 //! entries, 6 bytes each, SORTED ASCENDING BY ID
@@ -44,6 +45,17 @@ pub const VERSION: u8 = 2;
 pub const HEADER_LEN: usize = 16;
 pub const ENTRY_LEN: usize = 6;
 
+/// Which u32 id space this blob's entries belong to.
+///
+/// Ids are only meaningful relative to the interner that issued them, and two
+/// interners will happily assign the same u32 to different accounts. A blob
+/// built against one space and read against another does not error — every
+/// lookup simply resolves to the wrong person, which reads as a lens that
+/// filters strangely rather than one that is broken. Stamping the space here
+/// turns that into a blob the reader refuses.
+pub const IDSPACE_SHARED: u8 = 0;
+pub const IDSPACE_LENS: u8 = 1;
+
 /// Facet ids. Stored as one byte in the header so a reader can reject a blob
 /// built for a different signal rather than silently ranking by the wrong one.
 pub const FACET_FOLLOWS: u8 = 1;
@@ -62,7 +74,17 @@ pub fn weight_from_f32(v: f32) -> u16 {
 }
 
 /// Encode entries into a blob. Input need not be sorted; output always is.
-pub fn encode(facet: u8, built_at: u32, mut entries: Vec<(u32, u16)>) -> Vec<u8> {
+pub fn encode(facet: u8, built_at: u32, entries: Vec<(u32, u16)>) -> Vec<u8> {
+    encode_in_space(facet, IDSPACE_SHARED, built_at, entries)
+}
+
+/// Encode, stamping the id space the entries were interned against.
+pub fn encode_in_space(
+    facet: u8,
+    idspace: u8,
+    built_at: u32,
+    mut entries: Vec<(u32, u16)>,
+) -> Vec<u8> {
     entries.sort_unstable_by_key(|(id, _)| *id);
     entries.dedup_by_key(|(id, _)| *id);
 
@@ -70,7 +92,8 @@ pub fn encode(facet: u8, built_at: u32, mut entries: Vec<(u32, u16)>) -> Vec<u8>
     out.extend_from_slice(MAGIC);
     out.push(VERSION);
     out.push(facet);
-    out.extend_from_slice(&[0u8, 0u8]);
+    out.push(idspace);
+    out.push(0u8);
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     out.extend_from_slice(&built_at.to_le_bytes());
     for (id, weight) in entries {
@@ -84,6 +107,7 @@ pub fn encode(facet: u8, built_at: u32, mut entries: Vec<(u32, u16)>) -> Vec<u8>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Header {
     pub facet: u8,
+    pub idspace: u8,
     pub count: u32,
     pub built_at: u32,
 }
@@ -106,6 +130,7 @@ pub fn header(blob: &[u8]) -> Option<Header> {
     }
     Some(Header {
         facet: blob[5],
+        idspace: blob[6],
         count,
         built_at: u32::from_le_bytes(blob[12..16].try_into().ok()?),
     })

@@ -27,10 +27,25 @@ async fn main() -> anyhow::Result<()> {
         secure: parse("CLICKHOUSE_SECURE", true)?,
     };
 
-    // The interner lives on the CACHE redis, shared with rust-smasher and
-    // membership-service — not on the personalization instance where lens blobs
-    // live. Two different connections on purpose; see project.rs.
-    let redis_url = require("REDIS_URL")?;
+    // The lens id space lives on the LENS redis, beside the blobs whose ids it
+    // issues — not the shared space on the cache redis. Falls back so an unset
+    // LENS_REDIS_URL keeps working, but the two must agree with the builder or
+    // every id in the projection means a different account than the blobs do.
+    // Required, with no fallback. A fallback here is not a convenience, it is a
+    // silent corruption: the ids this issues are stamped into blobs as the lens
+    // space, so interning them against a different instance produces a
+    // perfectly healthy-looking run whose ids belong to nobody. That happened —
+    // 50,000 ids landed on the 1.1 GiB instance and the logs said "interner
+    // extended" throughout.
+    let redis_url = require("LENS_REDIS_URL")
+        .context("LENS_REDIS_URL is required: the lens id space must not be built against a fallback instance")?;
+    if let Some(host) = redis_url
+        .split('@')
+        .nth(1)
+        .and_then(|h| h.split(':').next())
+    {
+        info!(redis_host = host, "interning the lens id space");
+    }
     let pool = RedisConfig::from_url(redis_url)
         .builder()?
         .max_size(parse("LENS_PROJECT_REDIS_POOL", 4)?)

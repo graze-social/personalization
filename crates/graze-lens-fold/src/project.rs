@@ -39,10 +39,23 @@ use tracing::{info, warn};
 pub const LIVE_TABLE: &str = "follow_graph_int";
 pub const STAGING_TABLE: &str = "follow_graph_int_next";
 pub const MAP_TABLE: &str = "didint_map";
+/// Accounts still needing an id, materialised once per run.
+pub const PENDING_TABLE: &str = "didint_pending";
 
-/// Interner keys — the shared id space. See `graze-lens-builder::interner`.
-const DIDINT_MAP: &str = "didint:{didint}:map";
-const DIDINT_SEQ: &str = "didint:{didint}:seq";
+/// Interner keys — the **lens-owned** id space, on the lens Redis.
+///
+/// Not the shared `didint:{didint}:*` space that rust-smasher and
+/// membership-service use. The full follow graph is ~25M accounts, and the
+/// shared instance is `noeviction`: growing it there does not evict, it makes
+/// other services' writes fail. See `graze-lens-builder::interner` for the
+/// trade-off this accepts.
+///
+/// These ids must match the ones the builder stamps into blobs. Both sides
+/// declare the space, and a reader refuses a blob from the wrong one — ids from
+/// two interners collide silently otherwise, resolving to the wrong accounts
+/// rather than to nothing.
+const DIDINT_MAP: &str = "lensdid:{lensdid}:map";
+const DIDINT_SEQ: &str = "lensdid:{lensdid}:seq";
 const INTERN_CHUNK: usize = 1000;
 
 const LUA_GETSET: &str = r#"
@@ -112,31 +125,79 @@ impl Projector {
     /// Without this the projection silently drops edges: a join against the
     /// mirror simply loses rows whose DID was never interned, and a lens built
     /// on the result would be quietly short of members with nothing erroring.
+    /// Give every account in the graph an id in the lens space.
+    ///
+    /// The expensive part is working out *which* accounts still need one. That
+    /// question costs a full pass over `follow_edges` — twice, since an account
+    /// can appear as either endpoint — so it is asked exactly once per run and
+    /// the answer materialised.
+    ///
+    /// It used to be asked once per 50,000-DID batch. At 7M edges that was
+    /// unremarkable; at 2.79 billion it is ~900 iterations each scanning 5.6
+    /// billion rows, and the run never finishes. The batching is still here,
+    /// because the Lua interner should not be handed 45M arguments at once —
+    /// but it now pages through a materialised list instead of re-deriving it.
     async fn extend_interner(&self) -> anyhow::Result<usize> {
         let db = &self.clickhouse.database;
+
+        // The map is a mirror of exactly one interner, never an accumulation
+        // across several. It used to be extended incrementally, with an
+        // anti-join skipping DIDs already present — which is correct only while
+        // the id space never changes. When lenses moved to their own space the
+        // ~2.6M rows already in the map kept their old ids, and since both
+        // spaces number from 1 those stale ids collided with freshly issued
+        // ones: three different accounts all held id 1. The join then fanned
+        // out and mapped edges to the wrong people, which showed up as a
+        // second-degree reach higher than the viewer's own follow count.
+        //
+        // Rebuilding is cheap because interning is get-or-create: accounts that
+        // already have an id in Redis get the same one back.
+        self.exec(&format!("TRUNCATE TABLE IF EXISTS {db}.{MAP_TABLE}"))
+            .await?;
+
+        // One pass. Ordered by did so the pager below can walk it with a
+        // range scan rather than OFFSET, which would itself become quadratic.
+        self.exec(&format!("DROP TABLE IF EXISTS {db}.{PENDING_TABLE}"))
+            .await?;
+        self.exec(&format!(
+            "CREATE TABLE {db}.{PENDING_TABLE} ENGINE = MergeTree ORDER BY did AS
+             SELECT did FROM (
+                 SELECT follower AS did FROM {db}.follow_edges
+                 UNION ALL
+                 SELECT followee AS did FROM {db}.follow_edges WHERE followee != ''
+             ) AS g
+             LEFT ANTI JOIN {db}.{MAP_TABLE} AS m ON g.did = m.did
+             GROUP BY did"
+        ))
+        .await?;
+
+        let pending: u64 = self
+            .exec(&format!(
+                "SELECT count() FROM {db}.{PENDING_TABLE} FORMAT TabSeparated"
+            ))
+            .await?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        info!(pending, "accounts needing an id");
+
         let mut total = 0usize;
+        let mut cursor = String::new();
 
         loop {
             let remaining = self.max_intern_per_run.saturating_sub(total);
             if remaining == 0 {
                 warn!(
                     total,
+                    pending,
                     "hit max_intern_per_run; projection will be incomplete until the next run"
                 );
                 break;
             }
             let batch = remaining.min(50_000);
 
-            let sql = format!(
-                "SELECT did FROM (
-                     SELECT follower AS did FROM {db}.follow_edges
-                     UNION ALL
-                     SELECT followee AS did FROM {db}.follow_edges WHERE followee != ''
-                 ) AS g
-                 LEFT ANTI JOIN {db}.{MAP_TABLE} AS m ON g.did = m.did
-                 GROUP BY did LIMIT {batch}"
-            );
-            let text = self.exec(&sql).await?;
+            // Range scan from where the last batch ended.
+            let text = self.exec(&pending_page_sql(db, &cursor, batch)).await?;
             let dids: Vec<String> = text
                 .lines()
                 .map(str::trim)
@@ -146,12 +207,25 @@ impl Projector {
             if dids.is_empty() {
                 break;
             }
+            cursor = dids.last().cloned().unwrap_or_default();
 
             let pairs = self.intern(&dids).await?;
             self.write_map(&pairs).await?;
             total += pairs.len();
-            info!(interned = total, "interner extended");
+            info!(interned = total, of = pending, "interner extended");
         }
+
+        self.exec(&format!("DROP TABLE IF EXISTS {db}.{PENDING_TABLE}"))
+            .await?;
+
+        // Collapse the map once, here, where it is 42M rows on its own rather
+        // than one side of a billion-row join. Every DID is written exactly
+        // once per run, so this should be a no-op — but "should" is not a
+        // guarantee across a truncate and a few hundred batched inserts, and an
+        // unmerged duplicate silently doubles an edge in the projection.
+        self.exec(&format!("OPTIMIZE TABLE {db}.{MAP_TABLE} FINAL"))
+            .await?;
+
         Ok(total)
     }
 
@@ -226,6 +300,31 @@ impl Projector {
         // Joins are INNER, so an account still lacking an id drops out rather
         // than projecting to 0 and colliding with a real account.
         self.exec(&format!(
+            // grace_hash, because the default hash join builds both 42M-row
+            // sides in memory while streaming 2.79 billion rows through them
+            // and ClickHouse refused at 21.6 GiB. grace_hash buckets to disk
+            // and stays bounded; the extra IO is irrelevant for a job that
+            // already runs for twenty minutes. max_threads caps how many
+            // in-flight blocks pile up alongside it.
+            //
+            // The map is collapsed by OPTIMIZE before this runs, so no FINAL
+            // here. FINAL inside the join looked right and cost 21.7 GiB — it
+            // turns the 42M-row side into an aggregating transform feeding a
+            // 2.79B-row join. Collapsing the small table once beforehand is the
+            // same guarantee for a fraction of the memory.
+            //
+            // The edges themselves are deliberately NOT deduplicated here. `follow_edges` is keyed on
+            // (follower, rkey), and a follow → unfollow → refollow cycle issues
+            // a new rkey, so an unwitnessed delete leaves two live creates for
+            // one pair. Collapsing them with GROUP BY means holding 2.77
+            // billion distinct pairs in a hash table, which exceeded
+            // ClickHouse's 21.6 GiB limit outright.
+            //
+            // The duplicates only matter because they would make one follow
+            // count twice in a reach total, so they are counted away where the
+            // working set is small — `second_degree::reach_query` counts
+            // distinct followers over one viewer's seeds, tens of thousands of
+            // rows rather than billions.
             "INSERT INTO {db}.{STAGING_TABLE} (follower_int, followee_int)
              SELECT m1.id, m2.id
              FROM (
@@ -234,9 +333,35 @@ impl Projector {
                  ) WHERE op = 'create' AND followee != ''
              ) AS e
              INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
-             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did"
+             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
+             SETTINGS join_algorithm = 'grace_hash', max_threads = 4"
         ))
         .await?;
+
+        // Two DIFFERENT accounts sharing an id is silent: the join fans out,
+        // edges are attributed to the wrong people, and the projection still
+        // looks plausibly sized. Cheap to check, and it is the failure that
+        // actually happened.
+        //
+        // `uniqExact(did)`, not `count()`. The map is a ReplacingMergeTree, so
+        // the same (did, id) row appearing twice before a merge is ordinary and
+        // harmless — an earlier version of this guard counted rows and blocked
+        // a perfectly good rebuild on 50,000 of them.
+        let collisions: u64 = self
+            .exec(&format!(
+                "SELECT count() FROM (SELECT id FROM {db}.{MAP_TABLE} \
+                 GROUP BY id HAVING uniqExact(did) > 1) FORMAT TabSeparated"
+            ))
+            .await?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if collisions > 0 {
+            anyhow::bail!(
+                "{collisions} id(s) map to more than one account; refusing to swap in a \
+                 projection built from a corrupt id map"
+            );
+        }
 
         let before = self.count(LIVE_TABLE).await?;
         let after = self.count(STAGING_TABLE).await?;
@@ -320,6 +445,19 @@ pub fn seed_list(ids: &[u32]) -> String {
         .join(",")
 }
 
+/// One page of the pending list.
+///
+/// Ranges on `did` rather than using OFFSET: OFFSET re-reads every row before
+/// the window, so paging 45M accounts 50k at a time would re-scan the prefix
+/// 900 times and be quadratic in exactly the way this rewrite removed.
+fn pending_page_sql(db: &str, cursor: &str, batch: usize) -> String {
+    format!(
+        "SELECT did FROM {db}.{PENDING_TABLE} WHERE did > '{}' \
+         ORDER BY did LIMIT {batch} FORMAT TabSeparated",
+        cursor.replace('\'', "''")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,9 +480,36 @@ mod tests {
         assert!(STAGING_TABLE.starts_with(LIVE_TABLE));
     }
 
+    /// Paging must range-scan on `did`. OFFSET would re-read the prefix on
+    /// every batch — the same quadratic shape that made the old per-batch
+    /// anti-join unusable at 2.79 billion edges.
     #[test]
-    fn interner_keys_match_the_shared_space() {
-        assert_eq!(DIDINT_MAP, "didint:{didint}:map");
-        assert_eq!(DIDINT_SEQ, "didint:{didint}:seq");
+    fn pending_pager_range_scans_and_escapes() {
+        let sql = pending_page_sql("default", "did:plc:abc", 50_000);
+        assert!(sql.contains("WHERE did > 'did:plc:abc'"));
+        assert!(sql.contains("ORDER BY did LIMIT 50000"));
+        assert!(!sql.to_uppercase().contains("OFFSET"));
+        assert!(sql.contains(PENDING_TABLE));
+
+        // First page starts from the empty cursor, which must still be a valid
+        // range predicate rather than a syntax error.
+        assert!(pending_page_sql("default", "", 10).contains("did > ''"));
+
+        // A quote in a DID must not terminate the literal.
+        let evil = pending_page_sql("default", "did:plc:a'b", 10);
+        assert!(evil.contains("did:plc:a''b"));
+    }
+
+    #[test]
+    fn interner_keys_match_the_lens_space() {
+        // These must equal `graze-lens-builder::interner`'s LENSDID_* keys, or
+        // the projection and the blobs are interned by two different counters
+        // and every id in one means a different account in the other.
+        assert_eq!(DIDINT_MAP, "lensdid:{lensdid}:map");
+        assert_eq!(DIDINT_SEQ, "lensdid:{lensdid}:seq");
+        // And must NOT be the shared space, which belongs to rust-smasher and
+        // membership-service.
+        assert_ne!(DIDINT_MAP, "didint:{didint}:map");
+        assert_ne!(DIDINT_SEQ, "didint:{didint}:seq");
     }
 }

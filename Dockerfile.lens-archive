@@ -1,0 +1,26 @@
+# graze-lens-archive: the Jetstream v2 archive replay job.
+#
+# Its own image rather than a stage in the main Dockerfile. That file builds the
+# Rust workspace that ships on every deploy, and bolting a Go toolchain onto it
+# would slow every one of those builds for a binary that runs during a bootstrap
+# and then sits idle. The Rust services keep their build path untouched.
+FROM golang:1.26 AS builder
+
+WORKDIR /src
+# Dependencies first, so a code-only change does not re-download the module
+# graph — which for the jetstream client pulls in pebble and its dependents.
+COPY go/lens-archive/go.mod go/lens-archive/go.sum ./
+RUN go mod download
+
+COPY go/lens-archive/ ./
+RUN go vet ./... && go test ./...
+# Static, because the runtime image below has no libc to link against.
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/graze-lens-archive .
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /out/graze-lens-archive /app/graze-lens-archive
+# Needed for TLS to bsky.network and ClickHouse Cloud; the static base carries
+# no root store of its own.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+USER 65532:65532
+ENTRYPOINT ["/app/graze-lens-archive"]

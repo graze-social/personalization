@@ -72,7 +72,7 @@ spec:
               # Built from commit 1a835eb (feat/lens-completeness-guard).
               # Digest-pinned: both `latest` and the short-SHA tag are mutable
               # on DOCR.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:7dbb7c38aba0e165aebb93d9f0bf0d4d9b8ee8e5a291f5123acf867c18d035f7
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:311dd6e98592a8bb6503806753e530642480b369c84aab7d0becc88929d83a5f
               command: ["/app/graze-lens-project"]
               resources:
                 requests:
@@ -86,19 +86,29 @@ spec:
               envFrom:
                 - secretRef:
                     name: app-secrets
+                # LENS_REDIS_URL. Without this the binary falls back to
+                # PERSONALIZATION_REDIS_URL and interns the lens id space onto
+                # the 1.1 GiB instance instead of the 128 GiB one — which
+                # succeeds, logs normally, and is only visible by checking which
+                # Redis the keys landed on.
+                - secretRef:
+                    name: lens-redis
               env:
                 - name: LENS_PROJECT_MAX_EXECUTION_SECONDS
                   value: "1800"
                 - name: LENS_PROJECT_MIN_RATIO
                   value: "0.5"
-                # Bounds how many new accounts one pass may add to the shared
-                # interner. That id space lives on a NOEVICTION Redis shared
-                # with rust-smasher and membership-service, so unbounded growth
-                # here is someone else's outage. ~1.5M entries is ~90 MB; the
-                # full network would be ~25M (~1.8 GB), which is the point at
-                # which lenses need their own id space rather than this one.
+                # Bounds how many new accounts one pass may add. The cap was
+                # 2,000,000 when this shared the caching instance with
+                # rust-smasher and membership-service, where overrunning is
+                # someone else's outage. Lenses now own their id space on the
+                # 128 GiB instance, and the graph has ~45M distinct accounts —
+                # at 2M a pass it would take ~23 nightly runs to cover, leaving
+                # the projection incomplete the whole time. Measured cost is
+                # 61.5 bytes/entry, so 60M is ~3.7 GB against 45 GB free.
+                # Still capped: unbounded growth is how an instance fills.
                 - name: LENS_PROJECT_MAX_INTERN
-                  value: "2000000"
+                  value: "60000000"
                 - name: RUST_LOG
                   value: "info"
               securityContext:

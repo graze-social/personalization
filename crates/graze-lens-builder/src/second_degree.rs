@@ -48,8 +48,9 @@ impl SecondDegree {
     }
 
     /// Encode as a v2 blob: scored top-K plus a bloom over the whole tail.
-    pub fn encode(&self, built_at: u32) -> Vec<u8> {
-        let mut blob = scored::encode(FACET_FOLLOWS2, built_at, self.entries.clone());
+    pub fn encode(&self, idspace: u8, built_at: u32) -> Vec<u8> {
+        let mut blob =
+            scored::encode_in_space(FACET_FOLLOWS2, idspace, built_at, self.entries.clone());
         scored::append_bloom(&mut blob, &self.all_ids);
         blob
     }
@@ -105,9 +106,15 @@ pub fn parse_reach_tsv(text: &str, top_k: usize) -> SecondDegree {
 /// `cap` bounds both the transfer and the bloom: a viewer with a very wide
 /// network yields hundreds of thousands of rows, and past some point the tail
 /// is noise that costs bytes on the serve path's critical read.
+///
+/// Reach counts DISTINCT followers, not rows. The projection carries one row
+/// per (follower, rkey) edge, and a follow → unfollow → refollow cycle can
+/// leave two live rows for the same pair — counting rows would let one of your
+/// follows contribute twice. It is checkable: reach must never exceed the seed
+/// count, and when it did (2,234 against 1,183 seeds) that was the symptom.
 pub fn reach_query(database: &str, seeds: &[u32], cap: usize) -> String {
     format!(
-        "SELECT followee_int, count() AS reach \
+        "SELECT followee_int, uniqExact(follower_int) AS reach \
          FROM {database}.{LIVE_TABLE} \
          WHERE follower_int IN ({}) \
          GROUP BY followee_int \
@@ -179,7 +186,7 @@ mod tests {
         assert_eq!(m.entries.len(), 50, "scored entries are capped");
         assert_eq!(m.all_ids.len(), 500, "but the bloom sees everything");
 
-        let blob = m.encode(0);
+        let blob = m.encode(scored::IDSPACE_LENS, 0);
         // An id past the top-K is absent from entries but present in the bloom.
         assert_eq!(scored::weight_of(&blob, 400), None);
         assert_eq!(scored::bloom_contains(&blob, 400), Some(true));
@@ -200,6 +207,17 @@ mod tests {
             !q.contains("follow_edges"),
             "must never traverse the fold table"
         );
+    }
+
+    /// Reach must count distinct followers. The projection can hold two rows
+    /// for one (follower, followee) pair, and counting rows lets a single
+    /// follow contribute twice — which produced a reach larger than the
+    /// viewer's entire follow list.
+    #[test]
+    fn reach_counts_distinct_followers_not_rows() {
+        let q = reach_query("default", &[1, 2], 100);
+        assert!(q.contains("uniqExact(follower_int) AS reach"));
+        assert!(!q.contains("count() AS reach"));
     }
 
     /// Ordering must be deterministic. Ties broken only by reach would make the
@@ -229,12 +247,24 @@ mod tests {
         assert_eq!(m.all_ids, vec![100, 300]);
     }
 
+    /// Blobs must declare the id space their entries came from. Without it a
+    /// reader cannot tell a lens-space blob from a shared-space one, and the
+    /// two resolve the same u32 to different accounts.
+    #[test]
+    fn encoded_blob_declares_the_lens_id_space() {
+        let m = parse_reach_tsv("100\t5\n", 10);
+        let blob = m.encode(scored::IDSPACE_LENS, 0);
+        let h = scored::header(&blob).expect("valid header");
+        assert_eq!(h.idspace, scored::IDSPACE_LENS);
+        assert_ne!(h.idspace, scored::IDSPACE_SHARED);
+    }
+
     #[test]
     fn empty_result_is_empty_not_a_panic() {
         let m = parse_reach_tsv("", 10);
         assert!(m.is_empty());
         assert_eq!(m.max_reach, 0);
-        let blob = m.encode(0);
+        let blob = m.encode(scored::IDSPACE_LENS, 0);
         assert!(scored::header(&blob).is_some());
     }
 }

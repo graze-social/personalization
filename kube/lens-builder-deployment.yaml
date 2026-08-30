@@ -52,7 +52,7 @@ spec:
         - name: builder
           # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
           # the short-SHA tag are mutable on DOCR.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:7dbb7c38aba0e165aebb93d9f0bf0d4d9b8ee8e5a291f5123acf867c18d035f7
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:311dd6e98592a8bb6503806753e530642480b369c84aab7d0becc88929d83a5f
           command: ["/app/graze-lens-builder"]
           resources:
             requests:
@@ -64,6 +64,13 @@ spec:
           envFrom:
             - secretRef:
                 name: app-secrets
+            # LENS_REDIS_URL: lens blobs and the fold's cursor live on the
+            # 128 GiB `personalization` valkey, not the 1.1 GiB
+            # `user-personalization` one the name suggests. One viewer's
+            # second-degree blob is ~640 KB, so a real cohort is gigabytes
+            # against a 1.1 GiB ceiling on a noeviction instance.
+            - secretRef:
+                name: lens-redis
           env:
             # Consumer identity within the group. Must differ per replica, so it
             # comes from the pod name rather than a literal.

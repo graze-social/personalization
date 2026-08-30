@@ -1,0 +1,124 @@
+# graze-lens-archive — one filtered pass over Jetstream v2's sealed archive.
+#
+# This is what makes the lens graph *global*. Walking accounts' own PDSes got a
+# complete follow list for 8,868 of them and then hit rate limits; everything
+# else in `follow_edges` is incidental edges that happened to stream past since
+# the fold connected. Second degree over that is noise; over the real graph it
+# is the feature.
+#
+# # Sizing, measured rather than assumed
+#
+# The plan for `app.bsky.graph.follow` is 7,297 segments, 7,173 of which need
+# whole-file download at ~265 MB each: **~1.9 TB**. Filtering by collection
+# barely narrows it, because follows land in nearly every compressed block — a
+# rare collection like `app.bsky.labeler.service` collapses to 589 segments,
+# follows do not. DID-scoped plans are cheaper only for small sets (10 DIDs
+# ≈ 5 GB, 1,000 ≈ 137 GB, and ~9,400 times out server-side), crossing over
+# against the full pull at roughly 14,000 accounts.
+#
+# So this is a long job: hours, not minutes. It is built to be interrupted.
+#
+# # Resumability is the whole design
+#
+# The cursor is checkpointed to Redis after each batch is durable in ClickHouse,
+# never before — a checkpoint ahead of its rows would let a restart skip a batch
+# permanently, leaving a hole nothing downstream reports. Deleting the Job and
+# re-applying it resumes where it stopped. To restart from scratch, clear
+# `lens:archive:cursor` deliberately.
+#
+# # Verified before it ran
+#
+# Three accounts whose follow counts were already known from the PDS backfill
+# were replayed from the archive in dry-run: 2,996 / 2,993 / 2,980, matching
+# exactly, with 5 unfollows correctly excluded on the middle one. Two entirely
+# independent paths agreeing is the evidence that the decode is right, not just
+# plausible.
+#
+# Prereqs (created out of band):
+#   * secret `lens-secrets` — JETSTREAM_ARCHIVE_TOKEN
+#   * secret `app-secrets`  — CLICKHOUSE_*, PERSONALIZATION_REDIS_URL
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: graze-lens-archive
+  labels:
+    app: graze-lens
+    component: archive
+spec:
+  backoffLimit: 6
+  # 24h. The measured single-stream rate was ~26 MB/s; parallel download from a
+  # cluster node should be well inside this, but a job that dies at the deadline
+  # resumes from its checkpoint rather than starting over.
+  activeDeadlineSeconds: 86400
+  template:
+    metadata:
+      labels:
+        app: graze-lens
+        component: archive
+    spec:
+      restartPolicy: OnFailure
+      # Required: the default service account carries no pull secrets, so
+      # without this the pod fails with ImagePullBackOff against DOCR.
+      imagePullSecrets:
+        - name: docr-graze-social-labs
+      containers:
+        - name: archive
+          # DOCR, not Docker Hub: a freshly pushed Hub repo is private by
+          # default and the cluster has no credentials for it, which shows up as
+          # ImagePullBackOff. The `docr-graze-social-labs` pull secret below is
+          # the path every other personalization image already uses.
+          # Digest-pinned: both `latest` and version tags are mutable on DOCR.
+          image: registry.digitalocean.com/graze-social-labs/lens-archive@sha256:eef5653b6662513ff5de8ac36ed90d57cb357ab8ede9a539117c6a827de2e161
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "1000m"
+            limits:
+              # Decode is the CPU cost and it parallelises; memory is bounded by
+              # the batch buffer and the client's in-flight blocks, not by the
+              # archive size.
+              memory: "6Gi"
+              cpu: "3000m"
+          envFrom:
+            - secretRef:
+                name: app-secrets
+            - secretRef:
+                name: lens-secrets
+          env:
+            - name: JETSTREAM_HOST
+              value: "jetstream.us-west.bsky.network"
+            # Rows per ClickHouse insert. Large on purpose, and tuned against a
+            # real run rather than guessed: at 50k the job sat at 22k rows/s with
+            # 235m of a 3-core limit — not CPU-bound at all, just alternating
+            # between downloading and waiting on an insert. Raising the batch and
+            # the download parallelism together took it to ~65k rows/s and the
+            # projection from 47 hours to 14.
+            - name: LENS_ARCHIVE_BATCH_ROWS
+              value: "250000"
+            # Parallelism against someone else's service. The PDS backfill's
+            # lesson was that raising concurrency without backoff turns into
+            # 2,520 self-inflicted 429s, so this was raised only after a run
+            # showed zero errors at the lower setting. Not raised further: CPU
+            # is still only a third used, so more would buy little, and memory
+            # (not throughput) is now the binding constraint.
+            - name: LENS_ARCHIVE_DOWNLOAD_CONCURRENCY
+              value: "16"
+            - name: LENS_ARCHIVE_SEGMENT_STRIPES
+              value: "8"
+            - name: LENS_ARCHIVE_PROGRESS_ROWS
+              value: "5000000"
+            # Transient ClickHouse failures are absorbed here rather than
+            # escalated to a pod restart. A run died at 5h35m on a single
+            # "use of closed network connection"; the checkpoint saved the data,
+            # but the Job spent one of its six restarts on a blip.
+            - name: LENS_ARCHIVE_INSERT_RETRIES
+              value: "6"
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532

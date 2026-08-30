@@ -237,3 +237,56 @@ def test_contract_handles_nested_params_paths():
     assert not field_is_present("params.not_written", top, nested)
     # A nested path under anything other than `params` is a spec error, not a lookup.
     assert not field_is_present("source.nope", {"source"}, {"nope"})
+
+
+def _scroll_spec(**over):
+    return _spec(scroll_depth={"winsorize_quantile": 0.9}, **over)
+
+
+def _scroll_spec_from(sd):
+    """Same base spec, with an arbitrary scroll_depth block."""
+    return _spec(scroll_depth=sd)
+
+
+def test_scroll_depth_is_parsed_and_defaults_are_explicit():
+    s = _scroll_spec()
+    assert s.scroll_depth is not None
+    assert s.scroll_depth.winsorize_quantile == 0.9
+    # Absent means absent -- it must not silently default to being on.
+    assert _spec().scroll_depth is None
+    # An empty dict still gets the documented default rather than crashing.
+    assert _scroll_spec_from(dict()).scroll_depth.winsorize_quantile == 0.9
+
+
+def test_scroll_depth_sql_pools_the_cap_across_arms():
+    """A per-arm cap would itself be an outcome of the treatment and bias the comparison."""
+    from graze_analysis.data import scroll_depth_sql
+
+    sql = scroll_depth_sql(_scroll_spec(), 0.9)
+    cap = sql[sql.index("cap AS ("): sql.index("SELECT\n  unit_id")]
+    assert "quantile(0.9)" in cap
+    assert "arm_value IN (10000, 250)" in cap, "cap must be computed over BOTH arms"
+    # The cast matters: least() on UInt64 and Float64 is an illegal-type error in ClickHouse.
+    assert "least(toFloat64(impressions)" in sql
+    # One row per unit, so the clustered SE reduces to the ordinary one.
+    assert "1 AS seen" in sql
+
+
+def test_scroll_depth_is_reported_but_never_replaces_the_primary():
+    primary = _rows(150, 1, 20, 10000) + _rows(150, 3, 20, 250)
+    control = _rows(150, 1, 20, 10000) + _rows(150, 1, 20, 250)
+    scroll = _rows(150, 8, 1, 10000) + _rows(150, 14, 1, 250)
+
+    class R:
+        def query(self, sql):
+            if "cap AS (" in sql:
+                return scroll
+            return primary if "source = 'fallback'" not in sql else control
+
+    readout = analyse_ab(_scroll_spec(), R())
+    joined = "\n".join(readout.lines)
+    assert "scroll_depth (winsorized p90" in joined, joined
+    assert "secondary outcome" in joined, joined
+    # The primary must still be present and still first.
+    assert any("primary" in line for line in readout.lines)
+    assert readout.lines[0].strip().startswith("primary")

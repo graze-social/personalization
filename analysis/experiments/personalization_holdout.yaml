@@ -76,6 +76,21 @@ guardrails:
   - metric: request_less_rate
     max: 0.0
 
+# Denser secondary outcome. The primary is starved -- ~1,065 likes against 31,182 impressions -- so
+# impressions-per-user is reported alongside it. Density alone does not buy power here: raw, its MDE
+# is ~31% of the mean, because 3.3% of users carry 36% of all impressions. Winsorizing at p90 takes
+# that to ~14%.
+#
+# The quantile is declared HERE, up front. It changes the estimand to a capped mean and must not be
+# tuned after seeing a result. The cap is pooled across both arms; a per-arm cap would itself be an
+# outcome of the treatment.
+#
+# SECONDARY, deliberately: more scrolling is not unambiguously better. Zero-seed users were measured
+# paginating at a ~1s cadence, which is scanning, not reading. Treat a move here as a prompt to
+# investigate rather than a result.
+scroll_depth:
+  winsorize_quantile: 0.90
+
 cuped_covariate: pre_period_like_rate
 
 population: "JSONHas(tryBase64Decode(interaction_feed_context), 'algo_id')"

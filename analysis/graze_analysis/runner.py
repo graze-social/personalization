@@ -17,6 +17,7 @@ import numpy as np
 
 from .data import (
     METRIC_EVENTS,
+    scroll_depth_sql,
     ClickHouseReader,
     ab_rows_sql,
     cuped_covariate_sql,
@@ -110,6 +111,7 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
         _, reduction = cuped_adjust(per_unit_rate, cov)
         lines.append(f"  CUPED variance reduction: {reduction:.1%}")
 
+    lines.extend(_scroll_depth_lines(spec, reader))
     lines.extend(_guardrail_lines(spec, reader))
 
     agree = primary.significant == (perm.p_value < 0.05)
@@ -119,6 +121,32 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
         "NOT SIGNIFICANT"
     )
     return Readout(spec.id, verdict, lines)
+
+
+def _scroll_depth_lines(spec: ExperimentSpec, reader: ClickHouseReader) -> list[str]:
+    """Winsorized impressions-per-user, reported ALONGSIDE the primary and never in place of it.
+
+    It exists because the primary is starved: ~1,065 likes against 31,182 impressions. But density
+    is not power on its own -- raw impressions/user has an MDE of ~31% of the mean because 3.3% of
+    users carry 36% of the impressions. Winsorizing at the declared quantile is what makes it
+    usable, taking the MDE to roughly 14-18%.
+
+    This is a SECONDARY outcome. More scrolling is not unambiguously better: this codebase already
+    measured zero-seed users paginating at a ~1s cadence, which is scanning rather than reading. A
+    move here is a prompt to investigate, not a result on its own.
+    """
+    if spec.scroll_depth is None:
+        return []
+    q = spec.scroll_depth.winsorize_quantile
+    rows = rows_from_ab_result(reader.query(scroll_depth_sql(spec, q)), spec)
+    if len(rows) == 0:
+        return [f"  scroll_depth (winsorized p{int(q * 100)}): no rows"]
+    est = cluster_robust_rate_diff(rows.unit_ids, rows.arm, rows.numerator, rows.denominator)
+    return [
+        f"  scroll_depth (winsorized p{int(q * 100)}, impressions/user): {est.describe()}",
+        f"    (secondary outcome; cap declared in the spec, pooled across arms, "
+        f"units={len(rows):,})",
+    ]
 
 
 def _guardrail_lines(spec: ExperimentSpec, reader: ClickHouseReader) -> list[str]:

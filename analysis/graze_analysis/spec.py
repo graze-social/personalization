@@ -72,6 +72,28 @@ class NegativeControl:
 
 
 @dataclass(frozen=True)
+class ScrollDepth:
+    """Winsorized impressions-per-user: a denser secondary outcome than a like rate.
+
+    Measured 2026-08-30: impressions are ~29x denser than likes (31,182 against 1,065), but density
+    alone buys almost nothing here because the variance scales with it -- sd 41 on a mean of 19 with
+    a median of 7, and 3.3% of users carrying 36% of all impressions. Raw, its minimum detectable
+    effect is ~31% of the mean.
+
+    Winsorizing caps how much any single user can move the estimate. Measured on the same data:
+    p95 takes the MDE to 18%, p90 to 14%. That is legitimate variance reduction, not a trick -- but
+    it changes the estimand to a *capped* mean, so the quantile is declared here in the spec and must
+    NOT be tuned after seeing a result.
+
+    The cap is computed across BOTH arms pooled. A per-arm cap would differ between arms and bias
+    the comparison by construction.
+    """
+
+    #: Quantile at which per-user impressions are capped. 0.90 was the measured sweet spot.
+    winsorize_quantile: float = 0.90
+
+
+@dataclass(frozen=True)
 class Guardrail:
     """A metric that must not regress, independent of the primary outcome."""
 
@@ -93,6 +115,8 @@ class ExperimentSpec:
     negative_controls: tuple[NegativeControl, ...]
     end: _dt.datetime | None = None
     guardrails: tuple[Guardrail, ...] = ()
+    #: Optional denser secondary outcome. Reported alongside the primary, never in place of it.
+    scroll_depth: ScrollDepth | None = None
     cuped_covariate: str | None = None
     post_treatment_fields: tuple[str, ...] = DEFAULT_POST_TREATMENT_FIELDS
     #: SQL restricting rows to the population the experiment can possibly apply to.
@@ -192,6 +216,15 @@ def spec_from_dict(raw: dict[str, Any], source: str = "<dict>") -> ExperimentSpe
         Guardrail(metric=g["metric"], max=g.get("max"), min=g.get("min"))
         for g in raw.get("guardrails", [])
     )
+    # `is not None`, not truthiness: an empty `scroll_depth:` block in YAML parses to `{}`, which is
+    # falsy, so a truthiness check would silently disable the metric for someone who had explicitly
+    # asked for it with defaults. Declaring the key means on.
+    sd_raw = raw.get("scroll_depth")
+    scroll_depth = (
+        ScrollDepth(winsorize_quantile=float((sd_raw or {}).get("winsorize_quantile", 0.90)))
+        if sd_raw is not None
+        else None
+    )
 
     return ExperimentSpec(
         id=str(require("id")),
@@ -203,6 +236,7 @@ def spec_from_dict(raw: dict[str, Any], source: str = "<dict>") -> ExperimentSpe
         arms=arms,
         negative_controls=controls,
         guardrails=guardrails,
+        scroll_depth=scroll_depth,
         cuped_covariate=raw.get("cuped_covariate"),
         population=raw.get("population"),
         post_treatment_fields=tuple(

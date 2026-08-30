@@ -237,3 +237,52 @@ def rows_from_ab_result(
         numerator=np.array(num, dtype=float),
         denominator=np.array(den, dtype=float),
     )
+
+
+def scroll_depth_sql(spec: ExperimentSpec, quantile: float) -> str:
+    """One row per (unit, arm) carrying that unit's winsorized impression count.
+
+    Shaped as numerator/denominator with a denominator of 1 so the same cluster-robust estimator can
+    consume it: with one row per unit the "rate" is simply the capped count, and the clustered SE
+    reduces to the ordinary one.
+
+    The cap is a POOLED quantile across both arms. Capping per arm would make the cap itself an
+    outcome of the treatment and bias the comparison by construction.
+    """
+    control = spec.arms["control"]
+    treatment = next(a for n, a in spec.arms.items() if n != "control")
+    decoded = "tryBase64Decode(interaction_feed_context)"
+    kind = "Bool" if isinstance(control.value, bool) else "Int"
+    arm_expr = _json_path_expr(decoded, control.field, kind)
+    unit_col = "did" if spec.unit == "user" else "concat(did, '|', toString(occurred))"
+    end_clause = f"AND occurred <= toDateTime('{spec.end:%Y-%m-%d %H:%M:%S}')" if spec.end else ""
+    population = f"AND ({spec.population})" if spec.population else ""
+
+    return f"""
+WITH u AS (
+  SELECT
+    {unit_col} AS unit_id,
+    {arm_expr} AS arm_value,
+    count() AS impressions
+  FROM default.feed_interactions
+  WHERE occurred >= toDateTime('{spec.start:%Y-%m-%d %H:%M:%S}')
+    {end_clause}
+    AND interaction_feed_context != ''
+    {population}
+    AND interaction_event = '{SEEN}'
+  GROUP BY unit_id, arm_value
+  HAVING impressions > 0
+),
+cap AS (
+  SELECT quantile({quantile})(impressions) AS c
+  FROM u
+  WHERE arm_value IN ({_sql_literal(control.value)}, {_sql_literal(treatment.value)})
+)
+SELECT
+  unit_id,
+  arm_value,
+  least(toFloat64(impressions), (SELECT c FROM cap)) AS likes,
+  1 AS seen
+FROM u
+WHERE arm_value IN ({_sql_literal(control.value)}, {_sql_literal(treatment.value)})
+"""

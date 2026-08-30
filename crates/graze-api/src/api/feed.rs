@@ -128,6 +128,8 @@ fn encode_feed_context(
     // Follow-seed experiment arm. Passed alongside fallback_reason rather than inside
     // thompson_meta, so it is recorded on responses where personalization never ran.
     follow_seed: Option<bool>,
+    // Identifies the response, so pages can be counted per user.
+    page_id: Option<String>,
 ) -> Option<String> {
     let (source, personalization_type, fallback_tranche, attribution, personalized) = match prov {
         ItemProvenance::Base(BlendedSource::PostLevelPersonalization) => (
@@ -198,6 +200,7 @@ fn encode_feed_context(
         ranker,
         fallback_reason,
         follow_seed,
+        page_id,
     };
     ctx.encode()
 }
@@ -396,6 +399,16 @@ pub async fn get_feed_skeleton(
 ) -> Response {
     let request_start = std::time::Instant::now();
     let request_id = request_id.to_string();
+    // 16 hex chars of the request's UUIDv7: keeps the leading timestamp so values stay time-ordered,
+    // and 64 bits is far more than enough to separate one user's pages, which is the only scope it
+    // is grouped within. Kept short because it rides in every item's feedContext.
+    let page_id: Option<String> = Some(
+        request_id
+            .chars()
+            .filter(|c| *c != '-')
+            .take(16)
+            .collect::<String>(),
+    );
     let limit = query.limit.min(100);
 
     debug!(
@@ -598,6 +611,7 @@ pub async fn get_feed_skeleton(
                         // above records the same reason.
                         Some("no_algo_posts".to_string()),
                         None,
+                        page_id.clone(),
                     );
                     SkeletonFeedPost {
                         post: uri,
@@ -662,6 +676,7 @@ pub async fn get_feed_skeleton(
             // Same reason the debug! above records: no candidate pool and no fallback either.
             fallback_reason: Some("no_algo_posts".to_string()),
             follow_seed: None,
+            page_id: None,
         }
         .encode();
         let response = FeedSkeletonResponse {
@@ -1376,6 +1391,7 @@ pub async fn get_feed_skeleton(
                 ranker_by_uri.get(uri).cloned(),
                 fallback_reason.map(str::to_string),
                 follow_seed_arm,
+                page_id.clone(),
             );
             SkeletonFeedPost {
                 post: uri.clone(),

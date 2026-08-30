@@ -68,7 +68,7 @@ spec:
           # ImagePullBackOff. The `docr-graze-social-labs` pull secret below is
           # the path every other personalization image already uses.
           # Digest-pinned: both `latest` and version tags are mutable on DOCR.
-          image: registry.digitalocean.com/graze-social-labs/lens-archive@sha256:7d5429c0eb3bb0407c88e0ceb4bfeca3dd92624a23b2450ee2640cfecdddaef8
+          image: registry.digitalocean.com/graze-social-labs/lens-archive@sha256:eef5653b6662513ff5de8ac36ed90d57cb357ab8ede9a539117c6a827de2e161
           resources:
             requests:
               memory: "1Gi"
@@ -107,6 +107,12 @@ spec:
               value: "8"
             - name: LENS_ARCHIVE_PROGRESS_ROWS
               value: "5000000"
+            # Transient ClickHouse failures are absorbed here rather than
+            # escalated to a pod restart. A run died at 5h35m on a single
+            # "use of closed network connection"; the checkpoint saved the data,
+            # but the Job spent one of its six restarts on a blip.
+            - name: LENS_ARCHIVE_INSERT_RETRIES
+              value: "6"
           securityContext:
             runAsNonRoot: true
             readOnlyRootFilesystem: true

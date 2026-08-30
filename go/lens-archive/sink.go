@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -46,16 +47,27 @@ func (c clickhouseConfig) baseURL() string {
 }
 
 type sink struct {
-	cfg  clickhouseConfig
-	http *http.Client
+	cfg        clickhouseConfig
+	http       *http.Client
+	maxRetries int
+	// Set only by tests, to point the sink at an httptest server.
+	baseOverride string
 }
 
-func newSink(cfg clickhouseConfig) *sink {
+func newSink(cfg clickhouseConfig, maxRetries int) *sink {
 	return &sink{
-		cfg:  cfg,
-		http: &http.Client{Timeout: cfg.timeout},
+		cfg:        cfg,
+		http:       &http.Client{Timeout: cfg.timeout},
+		maxRetries: maxRetries,
 	}
 }
+
+// permanentErr marks a response the server will reject the same way forever —
+// a schema mismatch, bad credentials, malformed rows. Retrying those just burns
+// the budget that transient failures need.
+type permanentErr struct{ err error }
+
+func (e permanentErr) Error() string { return e.err.Error() }
 
 // insert writes one batch, straight to the base table.
 //
@@ -86,6 +98,8 @@ func (s *sink) insert(ctx context.Context, rows []edge) error {
 		body.WriteByte('\n')
 	}
 
+	payload := body.Bytes()
+
 	q := url.Values{}
 	q.Set("query", fmt.Sprintf("INSERT INTO %s.%s (%s) FORMAT TabSeparated",
 		s.cfg.database, s.cfg.table, columns))
@@ -95,11 +109,48 @@ func (s *sink) insert(ctx context.Context, rows []edge) error {
 	q.Set("async_insert", "1")
 	q.Set("wait_for_async_insert", "1")
 
-	return s.post(ctx, q, &body)
+	// Retried in process rather than escalated to a pod restart.
+	//
+	// A ~14-hour job over someone else's network will see transient TCP drops;
+	// one did kill an earlier run after 5h35m with "use of closed network
+	// connection". The checkpoint meant nothing was lost, but the Job spent one
+	// of six restarts on a blip, and six of those would fail the whole archive
+	// pass part-way through. A connection reset is not news, so it should not
+	// reach the process boundary.
+	var last error
+	for attempt := 0; ; attempt++ {
+		err := s.post(ctx, q, bytes.NewReader(payload))
+		if err == nil {
+			return nil
+		}
+		last = err
+
+		var perm permanentErr
+		if errors.As(err, &perm) || attempt >= s.maxRetries || ctx.Err() != nil {
+			return last
+		}
+
+		wait := time.Duration(1<<attempt) * time.Second
+		if wait > 30*time.Second {
+			wait = 30 * time.Second
+		}
+		logf("insert failed (attempt %d/%d), retrying in %s: %v",
+			attempt+1, s.maxRetries, wait, err)
+
+		select {
+		case <-ctx.Done():
+			return last
+		case <-time.After(wait):
+		}
+	}
 }
 
 func (s *sink) post(ctx context.Context, q url.Values, body io.Reader) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.cfg.baseURL()+"?"+q.Encode(), body)
+	base := s.cfg.baseURL()
+	if s.baseOverride != "" {
+		base = s.baseOverride
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"?"+q.Encode(), body)
 	if err != nil {
 		return err
 	}
@@ -114,7 +165,13 @@ func (s *sink) post(ctx context.Context, q url.Values, body io.Reader) error {
 
 	if resp.StatusCode/100 != 2 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 600))
-		return fmt.Errorf("clickhouse insert failed (%s): %s", resp.Status, strings.TrimSpace(string(msg)))
+		err := fmt.Errorf("clickhouse insert failed (%s): %s", resp.Status, strings.TrimSpace(string(msg)))
+		// 429 and 5xx are the server asking for time. Other 4xx mean the
+		// request itself is wrong and will be wrong again next time.
+		if resp.StatusCode/100 == 4 && resp.StatusCode != http.StatusTooManyRequests {
+			return permanentErr{err}
+		}
+		return err
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil

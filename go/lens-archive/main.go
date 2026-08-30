@@ -126,7 +126,7 @@ func run() error {
 	}
 	defer client.Close()
 
-	sink := newSink(cfg.clickhouse)
+	sink := newSink(cfg.clickhouse, envInt("LENS_ARCHIVE_INSERT_RETRIES", 6))
 	logf("archive replay starting host=%s afterSeq=%d dryRun=%t", cfg.host, cfg.afterSeq, cfg.dryRun)
 
 	// In dry-run over a DID set, fold the events the way ClickHouse will and

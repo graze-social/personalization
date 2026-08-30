@@ -1,0 +1,133 @@
+# graze-lens-bootstrap-hop1-remaining — the repair pass over accounts the full
+# cohort run could not read.
+#
+# Split out from the full-cohort Job rather than re-running that one, for two
+# reasons. Re-walking 9,423 accounts to reach ~2,800 puts thousands of pointless
+# requests on other people's PDS hosts. And the accounts that need this pass are
+# precisely the ones that rate-limited us last time, so hitting them alongside
+# everything else is how they got starved in the first place.
+#
+# Concurrency is halved and the page delay raised against the full-cohort
+# settings: that run pushed 2,520 accounts into 429s and recorded them all as
+# failures, when nothing was wrong with the accounts and we had simply asked too
+# fast. Paired with the retry/backoff in the backfiller, this pass saw 181.
+#
+# The DID list is generated, not hand-maintained:
+#   cohort DIDs  MINUS  viewers in lens_backfill_state with edge_count > 0
+# then loaded with `kubectl create configmap --from-file` — NOT `apply`, whose
+# last-applied annotation runs into the 256KB annotation limit on a list this
+# size.
+# graze-lens-bootstrap — backfills historical follow edges for a set of accounts.
+#
+# `graze-lens-fold` only sees follows from the moment it connects; this fills in
+# the history behind it, reading each account's follow records from its PDS.
+#
+# IDEMPOTENT. Rows are versioned by the record's own TID, so re-running writes
+# identical (follower, rkey, seq) tuples and ReplacingMergeTree collapses them.
+# Re-run freely — that is also the recovery procedure.
+#
+# Prereqs (created out of band):
+#   * secret `app-secrets` — CLICKHOUSE_{HOST,USER,PASSWORD}
+#   * ClickHouse tables — `feed-processor/scripts/create_follow_edges_tables.py`
+#   * ConfigMap `graze-beta-cohort` (key `dids.txt`) — the shared beta cohort,
+#     not a lens-specific list. Source of truth is `cohorts/beta.txt`; see its
+#     header for how to regenerate the ConfigMap after editing.
+#
+# Scope note: this is the per-account path, and it is what M0 needs — it covers
+# exactly the accounts that asked for a lens, over public unauthenticated
+# endpoints. Warming the *global* graph is a different job, blocked on a
+# bsky.network archive token plus a decoder for the .jss segment format; when
+# that lands, this remains the repair path for history the archive predates.
+#
+# Dry run first on a new DID list:
+#   kubectl set env job/graze-lens-bootstrap LENS_BOOTSTRAP_DRY_RUN=true
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: graze-lens-bootstrap-hop1-remaining
+  labels:
+    app: graze-lens
+    component: bootstrap
+spec:
+  # No retries. The job is re-runnable by hand, and an automatic retry of a
+  # partially-succeeded backfill just re-walks every PDS for no benefit.
+  backoffLimit: 0
+  # ~4h ceiling: a 50k-follow account is ~500 paged requests, and the default
+  # concurrency of 4 is deliberately polite to other people's servers.
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: graze-lens
+        component: bootstrap
+    spec:
+      restartPolicy: Never
+      # Required: the default service account carries no pull secrets, so
+      # without this the pod fails with ImagePullBackOff against DOCR.
+      imagePullSecrets:
+        - name: docr-graze-social-labs
+      containers:
+        - name: bootstrap
+          # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
+          # the short-SHA tag are mutable on DOCR.
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:a2323c023a77806943dd99379932e363829cb276eb9338e3770261d5d67133f0
+          command: ["/app/graze-lens-bootstrap"]
+          args: ["--file", "/config/dids.txt"]
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              # Edges buffer in memory until a batch fills; a very large DID list
+              # of whales is the case that needs the headroom.
+              memory: "2Gi"
+              cpu: "1"
+          envFrom:
+            - secretRef:
+                name: app-secrets
+          env:
+            # Halved, and paired with retry/backoff. The full-cohort run at 12
+            # rate-limited itself into 2,520 self-inflicted 429s.
+            - name: LENS_BOOTSTRAP_CONCURRENCY
+              value: "6"
+            - name: LENS_BOOTSTRAP_PAGE_DELAY_MS
+              value: "250"
+            - name: LENS_BOOTSTRAP_MAX_RETRIES
+              value: "5"
+            - name: LENS_BOOTSTRAP_INSERT_BATCH
+              value: "20000"
+            # Hub cap. 50 pages = 5,000 follows, past which an account is a
+            # hub rather than a person: its follows add reach noise to second
+            # degree and cost minutes each to page. Capping is a feature here,
+            # not a compromise -- the design wanted hub-capping anyway.
+            # The code default, deliberately not the 50 this job first ran with.
+            # A run that stops at max_pages returns a PREFIX of an account's
+            # follows, and truncated accounts are now left without a completeness
+            # marker on purpose — so a low cap does not just truncate the biggest
+            # graphs, it condemns exactly those accounts to being re-walked from
+            # their PDS on every lens request, forever.
+            - name: LENS_BOOTSTRAP_MAX_PAGES
+              value: "600"
+            - name: RUST_LOG
+              value: "info"
+          volumeMounts:
+            - name: dids
+              mountPath: /config
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      securityContext:
+        # Numeric, not a name: distroless nonroot has no /etc/passwd entry.
+        runAsUser: 65532
+        runAsGroup: 65532
+      volumes:
+        - name: dids
+          configMap:
+            # The shared beta cohort, so "who is in the beta" stays one decision
+            # in one place rather than a per-feature allowlist.
+            name: lens-hop1-remaining

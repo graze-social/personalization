@@ -42,18 +42,37 @@ use tracing::warn;
 pub enum Prior {
     /// `reach × ln(2 + followers)` — nearby and widely known.
     Popular,
-    /// `reach / log2(2 + followers)` — nearby and *not* widely known.
+    /// `reach / (100 + followers)` — the fraction of an account's audience
+    /// that is *your network*, smoothed.
+    ///
+    /// The first version divided by `log2(fame)`, which reads as the obvious
+    /// TF-IDF move and is wrong here: a logarithm compresses a 35,000× fame
+    /// difference into a factor of ~2.5, so raw reach still dominated and the
+    /// "niche" ranking came out identical to the popular one, crowned by a
+    /// 32M-follower account. Verified against real output, not the invariants —
+    /// every invariant passed on the broken version. Linear fame in the
+    /// denominator makes the score a smoothed audience fraction: an account
+    /// with 200 followers, 150 of them your network, scores ~0.5; the
+    /// 32M-follower account scores ~0.00003.
     Niche,
 }
+
+/// Below this, a "niche" signal is one person's follow, which is just
+/// follows² wearing a costume. Two independent confirmations is the floor for
+/// claiming *the network* is close to an account.
+const NICHE_MIN_REACH: u32 = 2;
 
 /// Reach reweighted by global fame, top `cap` by the blended score.
 ///
 /// Three output columns: id, raw reach (kept so the `reach ≤ seeds` invariant
 /// stays checkable — it is the tell that caught a corrupt id map), and score.
 pub fn prior_reach_query(database: &str, seeds: &[u32], cap: usize, prior: Prior) -> String {
-    let weight = match prior {
-        Prior::Popular => "r.reach * ln(2 + s.followers)",
-        Prior::Niche => "r.reach / log2(2 + s.followers)",
+    let (weight, having) = match prior {
+        Prior::Popular => ("r.reach * ln(2 + s.followers)", String::new()),
+        Prior::Niche => (
+            "r.reach / (100 + s.followers)",
+            format!("HAVING uniqExact(follower_int) >= {NICHE_MIN_REACH} "),
+        ),
     };
     format!(
         "SELECT r.followee_int, r.reach, {weight} AS score \
@@ -63,6 +82,7 @@ pub fn prior_reach_query(database: &str, seeds: &[u32], cap: usize, prior: Prior
              FROM {database}.follow_graph_int \
              WHERE follower_int IN ({seeds}) \
              GROUP BY followee_int \
+             {having}\
          ) AS r ON s.account_int = r.followee_int \
          ORDER BY score DESC, r.followee_int ASC \
          LIMIT {cap} \
@@ -252,12 +272,23 @@ mod tests {
         }
     }
 
+    /// Niche must divide by LINEAR fame, not a logarithm. The log version
+    /// passed every structural test and produced a ranking identical to
+    /// popular's, topped by a 32M-follower account — a log compresses fame
+    /// differences until reach dominates. Linear fame makes the score an
+    /// audience fraction, which is the actual definition of "niche to me".
     #[test]
-    fn niche_divides_and_popular_multiplies() {
+    fn niche_divides_by_linear_fame_and_floors_reach() {
         let n = prior_reach_query("default", &[1], 10, Prior::Niche);
         let p = prior_reach_query("default", &[1], 10, Prior::Popular);
-        assert!(n.contains("r.reach / log2(2 + s.followers)"));
+        assert!(n.contains("r.reach / (100 + s.followers)"));
+        assert!(!n.contains("log2"), "log fame is the bug, not the feature");
+        assert!(
+            n.contains("HAVING uniqExact(follower_int) >= 2"),
+            "one person's follow is follows2, not a network signal"
+        );
         assert!(p.contains("r.reach * ln(2 + s.followers)"));
+        assert!(!p.contains("HAVING"), "popular keeps single-reach rows");
     }
 
     /// Velocity must read the recency slice, bound by day, and count distinct

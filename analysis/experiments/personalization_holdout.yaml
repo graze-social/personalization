@@ -33,6 +33,13 @@ design: ab
 # and NOT converging -- p had risen from 0.0952 as the sample grew -- so nothing that was going to
 # resolve was lost. The reason it could not resolve is the reason for the flip: ~39% of the treated
 # arm received no personalized content at all.
+# NOT reset for the 2026-08-31T16:49:48Z eligibility-gating change, deliberately.
+#
+# That change did alter which users receive follow-seeding, so a strict reading argues for a reset.
+# But it only affects the ~749 eligible users, a small fraction of this experiment's treated arm,
+# and this window is finally accruing real signal -- p has been falling as units grow rather than
+# rising as it did across 13 days of the previous window. Resetting a fourth time would cost more
+# than the contamination it removes. Judgment call, recorded rather than silent.
 start: "2026-08-28T13:41:26Z"
 unit: user
 primary_metric: like_rate

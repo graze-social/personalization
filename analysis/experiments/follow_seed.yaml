@@ -16,17 +16,23 @@ design: ab
 # ⚠️ MUST be set to the moment FOLLOW_SEED_EXPERIMENT_ENABLED goes live, and re-set on any change to
 # traffic_pct or salt — both move the hash boundary and reassign users, which starts a different
 # experiment. The holdout spec has already been reset twice for exactly this reason.
-# START. This is the FOURTH start for this experiment and the first that measures anything.
-# Three earlier windows contained no valid contrast because the treatment was inert:
-#   - the arm was threaded through `apply_thompson_params`, which is never called
-#   - the arm was nested under `params`, written only on the personalization-success path
-#   - the read path hung off the author-affinity branch, and AUTHOR_AFFINITY_ENABLED=false
-#   - the seed gate turned these users away BEFORE personalization was attempted, so no hook
-#     inside compute_personalization could reach them
+# START, 2026-08-31T16:49:48Z. Fifth start, and the first with a population the treatment can
+# actually reach.
 #
-# Set to the moment the gate fix finished rolling out. First confirmed engagement was 13:46:23Z:
-# follow_seed_fallback_engaged, algo 2323, 300 sources, seed_kind=follows.
-start: "2026-08-28T13:41:26Z"
+# Enrolment was traffic_pct=100 over all non-holdout users until now, and measured on 2026-08-31 only
+# 276 of 1,031 treated users had a `uf:` seed -- 73% of the treatment arm was untreatable and diluted
+# the ITT ~3.7x. Enrolment is now eligibility-gated (no like seed AND has a uf: seed), which trades N
+# (~2,062 units -> ~749) for effect size and nets roughly 2.2x on z.
+#
+# The estimand changes with it, deliberately: this now measures the effect on users follow-seeding
+# CAN reach, not a diluted average over people it never touches. The earlier window is not merely
+# under-powered, it was measuring a different and less meaningful quantity, so nothing interpretable
+# is discarded by resetting.
+#
+# The four windows before this measured nothing at all -- see the git history of this file: the arm
+# never reached the seed step, then was absent from no_user_data rows, then hung off a disabled
+# branch, then was blocked by the pre-personalization seed gate.
+start: "2026-08-31T16:49:48Z"
 
 unit: user
 primary_metric: like_rate

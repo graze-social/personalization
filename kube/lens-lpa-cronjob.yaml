@@ -1,0 +1,79 @@
+# graze-lens-lpa — label-propagation community detection over the follow graph.
+#
+# Feeds the `community` lens facet: members of the communities a viewer's
+# follows concentrate in. Weekly, not nightly — communities are coarse
+# structure and drift slowly, and each run is several full passes over a
+# sampled adjacency (~275M rows at the default 5%).
+#
+# The run is guarded against the classic batch-LPA failure, collapse into one
+# giant community: if the largest community exceeds LENS_LPA_MAX_DOMINANT_SHARE
+# of all accounts, the job fails and the previous labels stay live. That
+# failure is otherwise silent — a collapsed label set does not error, it just
+# turns "my communities" into "everyone".
+#
+# Prereqs: the nightly projection job (reads `follow_graph_int` and
+# `account_stats`); tables from `feed-processor/scripts/create_follow_edges_tables.py`.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: graze-lens-lpa
+  labels:
+    app: graze-lens
+    component: lpa
+spec:
+  # Sunday, after the nightly projection (10:43) has long finished.
+  schedule: "17 14 * * 0"
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 14400 # 4h
+      template:
+        metadata:
+          labels:
+            app: graze-lens
+            component: lpa
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: docr-graze-social-labs
+          containers:
+            - name: lpa
+              # Digest-pinned; updated together with the other lens workloads.
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:33c5d924c5f52403ac63b10b8604dbaf53eb5a2c5d6f4e03619ecbc865ec484a
+              command: ["/app/graze-lens-lpa"]
+              resources:
+                requests:
+                  memory: "256Mi"
+                  cpu: "200m"
+                limits:
+                  # The work is ClickHouse's; this process issues SQL.
+                  memory: "1Gi"
+                  cpu: "1000m"
+              envFrom:
+                - secretRef:
+                    name: app-secrets
+              env:
+                - name: LENS_LPA_SAMPLE_PCT
+                  value: "5"
+                - name: LENS_LPA_ITERATIONS
+                  value: "4"
+                - name: LENS_LPA_MAX_DOMINANT_SHARE
+                  value: "0.5"
+                - name: LENS_LPA_MAX_EXECUTION_SECONDS
+                  value: "3600"
+                - name: RUST_LOG
+                  value: "info"
+              securityContext:
+                runAsNonRoot: true
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532

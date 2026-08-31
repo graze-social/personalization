@@ -39,6 +39,14 @@ use tracing::{info, warn};
 pub const LIVE_TABLE: &str = "follow_graph_int";
 pub const STAGING_TABLE: &str = "follow_graph_int_next";
 pub const MAP_TABLE: &str = "didint_map";
+/// Per-account degree counts, rebuilt from the projection each run. These are
+/// the "priors" the niche/popular lens facets join against.
+pub const STATS_TABLE: &str = "account_stats";
+pub const STATS_STAGING: &str = "account_stats_next";
+/// The last ~90 days of edges, with their date. Small enough (a few hundred
+/// million rows) that the velocity facet can filter it by day at build time.
+pub const RECENT_TABLE: &str = "follow_graph_recent";
+pub const RECENT_STAGING: &str = "follow_graph_recent_next";
 /// Accounts still needing an id, materialised once per run.
 pub const PENDING_TABLE: &str = "didint_pending";
 
@@ -397,6 +405,102 @@ impl Projector {
             before,
             after,
         })
+    }
+
+    /// Rebuild `account_stats` from the freshly swapped projection.
+    ///
+    /// One pass over both endpoints of every edge. The invariant that makes
+    /// this verifiable end to end: `sum(followers) == sum(following) ==` the
+    /// projection's row count — every edge contributes exactly one to each.
+    pub async fn rebuild_stats(&self) -> anyhow::Result<u64> {
+        let db = &self.clickhouse.database;
+
+        self.exec(&format!("TRUNCATE TABLE {db}.{STATS_STAGING}"))
+            .await?;
+        self.exec(&format!(
+            "INSERT INTO {db}.{STATS_STAGING} (account_int, followers, following)
+             SELECT account_int, sum(fin), sum(fout) FROM (
+                 SELECT followee_int AS account_int, toUInt64(1) AS fin, toUInt64(0) AS fout
+                 FROM {db}.{LIVE_TABLE}
+                 UNION ALL
+                 SELECT follower_int, 0, 1 FROM {db}.{LIVE_TABLE}
+             ) GROUP BY account_int
+             SETTINGS max_threads = 4, max_bytes_before_external_group_by = 8000000000"
+        ))
+        .await?;
+
+        let edges = self.count(LIVE_TABLE).await?;
+        let followers_sum: u64 = self
+            .exec(&format!(
+                "SELECT sum(followers) FROM {db}.{STATS_STAGING} FORMAT TabSeparated"
+            ))
+            .await?
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        // Every edge has exactly one followee, so the sums must reconcile. A
+        // mismatch means the aggregation dropped or double-counted rows, and a
+        // prior built from that silently mis-ranks every fame-weighted lens.
+        if followers_sum != edges {
+            anyhow::bail!(
+                "account_stats does not reconcile: sum(followers)={followers_sum} vs {edges} edges"
+            );
+        }
+
+        self.exec(&format!(
+            "EXCHANGE TABLES {db}.{STATS_TABLE} AND {db}.{STATS_STAGING}"
+        ))
+        .await?;
+        self.exec(&format!("TRUNCATE TABLE {db}.{STATS_STAGING}"))
+            .await?;
+        let rows = self.count(STATS_TABLE).await?;
+        info!(rows, edges, "account_stats swapped in");
+        Ok(rows)
+    }
+
+    /// Rebuild the recency slice: edges created in the last ~90 days, with
+    /// their date, so the velocity facet can ask "reached via follows made this
+    /// week" as a plain WHERE. Kept separate from the main projection because
+    /// carrying a date there would grow the hot table 50% for a column only
+    /// this one facet reads.
+    pub async fn rebuild_recent(&self) -> anyhow::Result<u64> {
+        let db = &self.clickhouse.database;
+
+        self.exec(&format!("TRUNCATE TABLE {db}.{RECENT_STAGING}"))
+            .await?;
+        self.exec(&format!(
+            "INSERT INTO {db}.{RECENT_STAGING} (follower_int, followee_int, followed_at)
+             SELECT m1.id, m2.id, toDate(e.created_at)
+             FROM (
+                 SELECT follower, followee, created_at FROM (
+                     SELECT follower, followee, op, created_at FROM {db}.follow_edges FINAL
+                 ) WHERE op = 'create' AND followee != ''
+                   AND created_at > now() - INTERVAL 90 DAY
+                   AND created_at < now() + INTERVAL 1 DAY
+             ) AS e
+             INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
+             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
+             SETTINGS join_algorithm = 'grace_hash', max_threads = 4"
+        ))
+        .await?;
+
+        let after = self.count(RECENT_STAGING).await?;
+        let before = self.count(RECENT_TABLE).await?;
+        // A recency slice legitimately shrinks day to day, so the anti-wipe
+        // floor is looser than the main projection's — but a sudden collapse to
+        // near-nothing still means the source query broke, not the network.
+        if before > 1_000_000 && (after as f64) < before as f64 * 0.2 {
+            anyhow::bail!("refusing to swap follow_graph_recent: rebuilt {after} vs {before} live");
+        }
+
+        self.exec(&format!(
+            "EXCHANGE TABLES {db}.{RECENT_TABLE} AND {db}.{RECENT_STAGING}"
+        ))
+        .await?;
+        self.exec(&format!("TRUNCATE TABLE {db}.{RECENT_STAGING}"))
+            .await?;
+        info!(rows = after, "follow_graph_recent swapped in");
+        Ok(after)
     }
 
     async fn count(&self, table: &str) -> anyhow::Result<u64> {

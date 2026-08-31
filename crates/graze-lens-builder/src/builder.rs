@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::interner::Interner;
+use crate::priors;
 use crate::second_degree;
 use graze_lens_bootstrap::CompletenessStore;
 use graze_lens_bootstrap::{Backfiller, Resolver};
@@ -33,6 +34,10 @@ const ACTIVE_KEY: &str = "lens:active";
 /// builds a key nobody reads.
 pub const FACET_FOLLOWS: &str = "follows";
 pub const FACET_FOLLOWS2: &str = "follows2";
+pub const FACET_NICHE: &str = "niche";
+pub const FACET_POPULAR: &str = "popular";
+pub const FACET_VELOCITY: &str = "velocity";
+pub const FACET_COMMUNITY: &str = "community";
 
 /// Facets this builder can actually produce.
 ///
@@ -40,7 +45,29 @@ pub const FACET_FOLLOWS2: &str = "follows2";
 /// reader composes from these two, so it is a legal thing to ask a feed for and
 /// an illegal thing to ask the builder for.
 pub fn is_buildable_facet(facet: &str) -> bool {
-    matches!(facet, FACET_FOLLOWS | FACET_FOLLOWS2)
+    matches!(
+        facet,
+        FACET_FOLLOWS
+            | FACET_FOLLOWS2
+            | FACET_NICHE
+            | FACET_POPULAR
+            | FACET_VELOCITY
+            | FACET_COMMUNITY
+    )
+}
+
+/// The header byte for each stored facet name. One place, so the dispatch and
+/// the wire format cannot disagree.
+fn facet_header_id(name: &str) -> Option<u8> {
+    match name {
+        FACET_FOLLOWS => Some(crate::scored::FACET_FOLLOWS),
+        FACET_FOLLOWS2 => Some(crate::scored::FACET_FOLLOWS2),
+        FACET_NICHE => Some(crate::scored::FACET_NICHE),
+        FACET_POPULAR => Some(crate::scored::FACET_POPULAR),
+        FACET_VELOCITY => Some(crate::scored::FACET_VELOCITY),
+        FACET_COMMUNITY => Some(crate::scored::FACET_COMMUNITY),
+        _ => None,
+    }
 }
 
 fn now_secs() -> u32 {
@@ -382,6 +409,12 @@ impl Builder {
                     "max_execution_time",
                     self.config.max_execution_seconds.to_string(),
                 ),
+                // Seed lists are inlined as literals — required for primary-key
+                // index analysis — and a whale's 50k follows is ~450 KB of SQL,
+                // over ClickHouse's 256 KB default parse budget. "Any user at
+                // any scale" means the parser budget scales with the whale, not
+                // the whale failing to build.
+                ("max_query_size", "10485760".to_string()),
                 ("cancel_http_readonly_queries_on_client_close", "1".into()),
             ])
             .body(sql.to_string())
@@ -488,12 +521,180 @@ impl Builder {
         facet: &str,
         followees: &[String],
     ) -> anyhow::Result<BuildOutcome> {
-        if facet == FACET_FOLLOWS2 {
-            return self.publish_second_degree(viewer, followees).await;
+        // Exhaustive on purpose. A fallthrough here once published a viewer's
+        // FIRST degree under the second-degree name; with six facets the same
+        // slip would be six ways to serve the wrong signal under a plausible
+        // count. An unmatched name is a bug upstream — is_buildable_facet
+        // admitted something this dispatch does not know.
+        match facet {
+            FACET_FOLLOWS => {
+                self.publish(viewer, facet, followees).await?;
+                self.publish_v2_uniform(viewer, facet, followees).await;
+                Ok(BuildOutcome::Published)
+            }
+            FACET_FOLLOWS2 => self.publish_second_degree(viewer, followees).await,
+            FACET_NICHE => {
+                self.publish_prior(viewer, followees, priors::Prior::Niche)
+                    .await
+            }
+            FACET_POPULAR => {
+                self.publish_prior(viewer, followees, priors::Prior::Popular)
+                    .await
+            }
+            FACET_VELOCITY => self.publish_velocity(viewer, followees).await,
+            FACET_COMMUNITY => self.publish_community(viewer, followees).await,
+            other => {
+                warn!(viewer, facet = other, "facet admitted but not dispatched");
+                Ok(BuildOutcome::UnknownFacet)
+            }
         }
-        self.publish(viewer, facet, followees).await?;
-        self.publish_v2_uniform(viewer, facet, followees).await;
+    }
+
+    /// Seeds for any graph facet: the viewer's follows, as lens-space ids.
+    async fn seeds_for(&self, viewer: &str, first_degree: &[String]) -> anyhow::Result<Vec<u32>> {
+        let Some(interner) = &self.interner else {
+            anyhow::bail!("no interner configured");
+        };
+        let ids = interner.intern_many(first_degree).await?;
+        let _ = viewer;
+        Ok(ids.values().copied().collect())
+    }
+
+    /// Shared tail for every scored facet: sanity-check, encode, publish.
+    async fn publish_scored(
+        &self,
+        viewer: &str,
+        facet_name: &str,
+        map: second_degree::SecondDegree,
+        seeds: &[u32],
+    ) -> anyhow::Result<BuildOutcome> {
+        let Some(interner) = &self.interner else {
+            self.mark_state(viewer, "failed").await?;
+            return Ok(BuildOutcome::NeedsBackfill);
+        };
+        if map.is_empty() {
+            self.mark_state(viewer, "ready").await?;
+            return Ok(BuildOutcome::Empty);
+        }
+        // The invariant that caught a corrupt id map once already: an author
+        // cannot be reached by more of your follows than you have.
+        if (map.max_reach as usize) > seeds.len() {
+            self.mark_state(viewer, "failed").await?;
+            anyhow::bail!(
+                "{facet_name}: max_reach {} exceeds {} seeds — id map or projection corrupt",
+                map.max_reach,
+                seeds.len()
+            );
+        }
+        let Some(header_id) = facet_header_id(facet_name) else {
+            anyhow::bail!("{facet_name} has no header id; dispatch and wire format disagree");
+        };
+        let blob = map.encode_as(header_id, interner.idspace(), now_secs());
+        info!(
+            viewer,
+            facet = facet_name,
+            seeds = seeds.len(),
+            reached = map.all_ids.len(),
+            scored = map.entries.len(),
+            max_reach = map.max_reach,
+            bytes = blob.len(),
+            "built scored facet"
+        );
+        self.publish_blob(viewer, facet_name, &blob).await?;
         Ok(BuildOutcome::Published)
+    }
+
+    /// niche / popular: reach reweighted by global fame from `account_stats`.
+    async fn publish_prior(
+        &self,
+        viewer: &str,
+        first_degree: &[String],
+        prior: priors::Prior,
+    ) -> anyhow::Result<BuildOutcome> {
+        let facet_name = match prior {
+            priors::Prior::Niche => FACET_NICHE,
+            priors::Prior::Popular => FACET_POPULAR,
+        };
+        let seeds = self.seeds_for(viewer, first_degree).await?;
+        if seeds.is_empty() {
+            self.mark_state(viewer, "ready").await?;
+            return Ok(BuildOutcome::Empty);
+        }
+        let sql = priors::prior_reach_query(
+            &self.clickhouse.database,
+            &seeds,
+            self.config.second_degree_cap,
+            prior,
+        );
+        let text = self.query_text(&sql).await?;
+        let mut map = priors::parse_prior_tsv(&text, self.config.second_degree_top_k);
+        second_degree::exclude_first_degree(&mut map, &seeds);
+        self.publish_scored(viewer, facet_name, map, &seeds).await
+    }
+
+    /// velocity: reach over the recency slice only.
+    async fn publish_velocity(
+        &self,
+        viewer: &str,
+        first_degree: &[String],
+    ) -> anyhow::Result<BuildOutcome> {
+        let seeds = self.seeds_for(viewer, first_degree).await?;
+        if seeds.is_empty() {
+            self.mark_state(viewer, "ready").await?;
+            return Ok(BuildOutcome::Empty);
+        }
+        let sql = priors::velocity_query(
+            &self.clickhouse.database,
+            &seeds,
+            self.config.second_degree_cap,
+            self.config.velocity_days,
+        );
+        let text = self.query_text(&sql).await?;
+        let mut map = second_degree::parse_reach_tsv(&text, self.config.second_degree_top_k);
+        second_degree::exclude_first_degree(&mut map, &seeds);
+        self.publish_scored(viewer, FACET_VELOCITY, map, &seeds)
+            .await
+    }
+
+    /// community: members of the viewer's top LPA communities.
+    async fn publish_community(
+        &self,
+        viewer: &str,
+        first_degree: &[String],
+    ) -> anyhow::Result<BuildOutcome> {
+        let seeds = self.seeds_for(viewer, first_degree).await?;
+        if seeds.is_empty() {
+            self.mark_state(viewer, "ready").await?;
+            return Ok(BuildOutcome::Empty);
+        }
+        let affinity_sql = priors::community_affinity_query(
+            &self.clickhouse.database,
+            &seeds,
+            self.config.community_top,
+        );
+        let affinity =
+            priors::parse_affinity_tsv(&self.query_text(&affinity_sql).await?, seeds.len());
+        if affinity.is_empty() {
+            // No LPA labels yet (job has not run) or none of the follows are
+            // labelled. Ready-and-empty, not failed: the serve path falls open
+            // and the next scheduled build picks the labels up.
+            self.mark_state(viewer, "ready").await?;
+            return Ok(BuildOutcome::Empty);
+        }
+        let communities: Vec<u32> = affinity.iter().map(|(c, _)| *c).collect();
+        let members_sql = priors::community_members_query(
+            &self.clickhouse.database,
+            &communities,
+            self.config.second_degree_cap,
+        );
+        let mut map = priors::parse_members_tsv(
+            &self.query_text(&members_sql).await?,
+            &affinity,
+            self.config.second_degree_top_k,
+        );
+        second_degree::exclude_first_degree(&mut map, &seeds);
+        self.publish_scored(viewer, FACET_COMMUNITY, map, &seeds)
+            .await
     }
 
     async fn fetch_follows(&self, viewer: &str) -> anyhow::Result<Vec<String>> {
@@ -597,15 +798,42 @@ mod tests {
     /// publish a first-degree set under a name that promises a blend.
     #[test]
     fn only_real_facets_are_buildable() {
-        assert!(is_buildable_facet(FACET_FOLLOWS));
-        assert!(is_buildable_facet(FACET_FOLLOWS2));
-        assert!(
-            !is_buildable_facet("network"),
-            "network is composed by the reader, not built here"
-        );
+        for f in [
+            FACET_FOLLOWS,
+            FACET_FOLLOWS2,
+            FACET_NICHE,
+            FACET_POPULAR,
+            FACET_VELOCITY,
+            FACET_COMMUNITY,
+        ] {
+            assert!(is_buildable_facet(f), "{f} should build");
+        }
+        // Composites are composed by the reader from stored facets; a build
+        // request for one is a bug, and accepting it would publish first
+        // degree under a name that promises a blend.
+        assert!(!is_buildable_facet("network"));
+        assert!(!is_buildable_facet("discover"));
         assert!(!is_buildable_facet("mutuals"), "not implemented yet");
         assert!(!is_buildable_facet(""));
         assert!(!is_buildable_facet("FOLLOWS"), "matching is exact");
+    }
+
+    /// Facet header ids must be distinct — a collision would let the reader
+    /// accept a blob built for a different signal.
+    #[test]
+    fn facet_header_ids_are_distinct() {
+        let ids = [
+            crate::scored::FACET_FOLLOWS,
+            crate::scored::FACET_FOLLOWS2,
+            crate::scored::FACET_NICHE,
+            crate::scored::FACET_POPULAR,
+            crate::scored::FACET_VELOCITY,
+            crate::scored::FACET_COMMUNITY,
+        ];
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), ids.len());
     }
 
     use super::*;

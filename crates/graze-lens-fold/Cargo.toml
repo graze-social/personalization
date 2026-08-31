@@ -15,6 +15,11 @@ path = "src/main.rs"
 name = "graze-lens-rev-rebuild"
 path = "src/bin/rev_rebuild.rs"
 
+# Label-propagation community detection; weekly, after the projection.
+[[bin]]
+name = "graze-lens-lpa"
+path = "src/bin/lpa_run.rs"
+
 # Rebuilds the u32 traversal projection that second-degree queries read.
 [[bin]]
 name = "graze-lens-project"

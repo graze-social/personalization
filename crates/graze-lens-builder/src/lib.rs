@@ -8,6 +8,7 @@
 pub mod builder;
 pub mod config;
 pub mod interner;
+pub mod priors;
 pub mod queue;
 pub mod scored;
 pub mod second_degree;

@@ -72,7 +72,7 @@ spec:
               # Built from commit 1a835eb (feat/lens-completeness-guard).
               # Digest-pinned: both `latest` and the short-SHA tag are mutable
               # on DOCR.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:311dd6e98592a8bb6503806753e530642480b369c84aab7d0becc88929d83a5f
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:33c5d924c5f52403ac63b10b8604dbaf53eb5a2c5d6f4e03619ecbc865ec484a
               command: ["/app/graze-lens-project"]
               resources:
                 requests:

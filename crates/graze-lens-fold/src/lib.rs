@@ -9,6 +9,7 @@ pub mod config;
 pub mod cursor;
 pub mod delta;
 pub mod event;
+pub mod lpa;
 pub mod metrics;
 pub mod project;
 pub mod rev;

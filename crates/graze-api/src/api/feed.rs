@@ -97,6 +97,22 @@ struct ResponseThompsonMeta {
     is_holdout: bool,
 }
 
+/// Could follow-seeding actually change this response?
+///
+/// A free function taking only the two seed facts, so its independence from the experiment arm is
+/// structural rather than a comment: there is no arm in scope to consult. That matters because this
+/// is the enrolment gate -- if eligibility could vary with the arm, the two arms would be drawn from
+/// different populations and the comparison would be meaningless.
+///
+/// `uf:` keys are written by the follow-seeds CronJob, which has no knowledge of the experiment, so
+/// this is determined entirely by past behaviour.
+#[inline]
+fn follow_seed_eligible(has_like_seed: bool, has_follow_seed: bool) -> bool {
+    // A user with a like seed is served by the post-level path and never reaches the follow hook,
+    // so the treatment cannot change anything for them however many follows they have.
+    !has_like_seed && has_follow_seed
+}
+
 /// Build the randomized-experiment descriptor from config.
 fn graze_api_hash_experiment(config: &crate::config::Config) -> crate::algorithm::HashExperiment {
     crate::algorithm::HashExperiment {
@@ -701,19 +717,14 @@ pub async fn get_feed_skeleton(
     // SUCCESS branch. Measured 2026-08-28: 2,129 no_user_data rows carried no arm at all, so the
     // enrolled population excluded precisely the responses follow-seeding exists to change --
     // coverage could never move in the readout, regardless of whether the treatment worked.
+    // Assigned at the seed gate below rather than here, because enrolment is ELIGIBILITY-GATED:
+    // only users the treatment can actually reach get an arm. Measured 2026-08-31 with everyone
+    // enrolled: just 276 of 1,031 treated users had a `uf:` seed, so 73% of the treatment arm was
+    // untreatable and diluted the ITT ~3.7x. Restricting enrolment to the reachable trades N for
+    // effect size and nets roughly 2.2x on z -- and it answers the question actually being asked,
+    // "does follow-seeding help the users it can reach", rather than a diluted average over people
+    // it never touches.
     let mut follow_seed_arm: Option<bool> = None;
-    // Resolved before the seed gate below, which now depends on it. The assignment needs only the
-    // DID and config, so it can be computed this early; it is copied onto thompson_params later.
-    if state.config.follow_seed_experiment_enabled {
-        let fs_exp = crate::algorithm::FollowSeedExperiment {
-            enabled: true,
-            traffic_pct: state.config.follow_seed_experiment_traffic_pct,
-            salt: state.config.follow_seed_experiment_salt.clone(),
-        };
-        follow_seed_arm = fs_exp.assign(user_did.as_deref().unwrap_or(""));
-    }
-    let allow_follow_seed_for_gate =
-        follow_seed_arm.unwrap_or(state.config.follow_seed_read_enabled);
     let mut feed_cache_hit = false;
     let mut response_thompson_meta: Option<ResponseThompsonMeta> = None;
     // The arm is a pure function of the DID, so compute it once for EVERY request — first page or
@@ -892,8 +903,12 @@ pub async fn get_feed_skeleton(
             // zero `follow_seed_fallback_engaged` lines across two deploys until this changed.
             //
             // Cost is one EXISTS, and only on the path where the like-seed check already failed --
-            // roughly 14% of requests.
-            let has_follow_seed = if has_like_seed || !allow_follow_seed_for_gate {
+            // roughly 12-14% of requests.
+            //
+            // Computed for BOTH arms, deliberately. It is the eligibility test, so it must not
+            // depend on the arm: if only the treatment arm probed for a seed, the control arm could
+            // not be restricted to the same population and the comparison would be asymmetric.
+            let has_follow_seed = if has_like_seed {
                 false
             } else {
                 state
@@ -902,8 +917,25 @@ pub async fn get_feed_skeleton(
                     .await
                     .unwrap_or(false)
             };
-            let user_has_data = has_like_seed || has_follow_seed;
-            if has_follow_seed {
+
+            // Eligible = the treatment could actually change this response. Arm-independent by
+            // construction, and determined by past behaviour: `uf:` keys are written by the
+            // follow-seeds CronJob, which has no knowledge of the experiment.
+            let follow_seed_eligible = follow_seed_eligible(has_like_seed, has_follow_seed);
+            if follow_seed_eligible && state.config.follow_seed_experiment_enabled {
+                let fs_exp = crate::algorithm::FollowSeedExperiment {
+                    enabled: true,
+                    traffic_pct: state.config.follow_seed_experiment_traffic_pct,
+                    salt: state.config.follow_seed_experiment_salt.clone(),
+                };
+                follow_seed_arm = fs_exp.assign(user_did.as_deref().unwrap_or(""));
+            }
+            // An unenrolled request falls back to the plain config flag, which is off by default.
+            let allow_follow_seed =
+                follow_seed_arm.unwrap_or(state.config.follow_seed_read_enabled);
+
+            let user_has_data = has_like_seed || (follow_seed_eligible && allow_follow_seed);
+            if follow_seed_eligible && allow_follow_seed {
                 debug!(algo_id, "follow_seed_admitted_user_without_like_seed");
             }
 
@@ -1949,5 +1981,45 @@ mod holdout_assignment_tests {
             (0.85..1.15).contains(&ratio),
             "holdout and interleaving assignments are correlated: joint/expected = {ratio:.3}"
         );
+    }
+}
+
+#[cfg(test)]
+mod eligibility_tests {
+    use super::follow_seed_eligible;
+
+    /// The enrolment rule, stated as a table.
+    ///
+    /// Measured 2026-08-31 with everyone enrolled: only 276 of 1,031 treated users had a `uf:`
+    /// seed, so 73% of the treatment arm was untreatable and diluted the ITT ~3.7x. Restricting
+    /// enrolment to the reachable is what recovers that.
+    #[test]
+    fn only_a_user_the_treatment_can_reach_is_eligible() {
+        // no like seed, has a follow seed -> the follow hook can fire. Eligible.
+        assert!(follow_seed_eligible(false, true));
+        // has a like seed -> served by the post-level path, follow hook never reached, however
+        // many follows they have. This is the 73% that was diluting the estimate.
+        assert!(!follow_seed_eligible(true, true));
+        // no follow seed -> nothing to seed from.
+        assert!(!follow_seed_eligible(false, false));
+        assert!(!follow_seed_eligible(true, false));
+    }
+
+    /// Eligibility must not depend on the arm, or the arms are drawn from different populations.
+    ///
+    /// The signature already guarantees this -- there is no arm parameter to pass -- so this test
+    /// documents the invariant and will fail to compile if someone adds one.
+    #[test]
+    fn eligibility_is_arm_independent_by_construction() {
+        for like in [true, false] {
+            for follow in [true, false] {
+                let a = follow_seed_eligible(like, follow);
+                let b = follow_seed_eligible(like, follow);
+                assert_eq!(
+                    a, b,
+                    "eligibility must be a pure function of the seed facts"
+                );
+            }
+        }
     }
 }

@@ -58,8 +58,15 @@ spec:
                 - secretRef:
                     name: app-secrets
               env:
+                # 10%, up from the first run's 5%. At 5% the run produced 25.5M
+                # communities across 42M accounts — most accounts effectively
+                # singletons because none of their edges made the sample. The
+                # first run's vote table stayed comfortably inside the memory
+                # budget (external group-by spill never engaged), so doubling
+                # the sample is measured headroom, not hope. The collapse guard
+                # still gates the swap either way.
                 - name: LENS_LPA_SAMPLE_PCT
-                  value: "5"
+                  value: "10"
                 - name: LENS_LPA_ITERATIONS
                   value: "4"
                 - name: LENS_LPA_MAX_DOMINANT_SHARE

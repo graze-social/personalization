@@ -78,6 +78,47 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    info!(enqueued, "refresh complete");
+    // Feed-scoped domain blobs, keyed by algorithm id rather than viewer.
+    // SCAN is fine at this scale: one key per lens-enabled feed.
+    let mut domains = 0usize;
+    let mut cursor: u64 = 0;
+    loop {
+        let (next, keys): (u64, Vec<String>) = deadpool_redis::redis::cmd("SCAN")
+            .arg(cursor)
+            .arg("MATCH")
+            .arg("lens:v2:domain:*")
+            .arg("COUNT")
+            .arg(500)
+            .query_async(&mut conn)
+            .await
+            .context("scan domain blobs")?;
+        for key in keys {
+            let Some(algo_id) = key.rsplit(':').next().and_then(|v| v.parse::<u32>().ok()) else {
+                continue;
+            };
+            let payload =
+                serde_json::json!({ "facet": "domain", "feed_algo_id": algo_id }).to_string();
+            let result: Result<(), _> = deadpool_redis::redis::cmd("XADD")
+                .arg(QUEUE)
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(100_000)
+                .arg("*")
+                .arg("data")
+                .arg(&payload)
+                .query_async(&mut conn)
+                .await;
+            match result {
+                Ok(()) => domains += 1,
+                Err(e) => warn!(algo_id, error = %e, "domain enqueue failed"),
+            }
+        }
+        cursor = next;
+        if cursor == 0 {
+            break;
+        }
+    }
+
+    info!(enqueued, domains, "refresh complete");
     Ok(())
 }

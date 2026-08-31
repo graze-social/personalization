@@ -118,7 +118,20 @@ async fn main() -> anyhow::Result<()> {
                 let viewer = delivery.request.viewer_did.clone();
                 let facet = delivery.request.facet.clone();
 
-                match builder.build(&viewer, &facet).await {
+                // Feed-scoped facets carry an algorithm id and no viewer.
+                let result = if facet == "domain" {
+                    match delivery.request.feed_algo_id {
+                        Some(algo_id) => builder.build_domain(algo_id).await,
+                        None => {
+                            warn!(facet, "domain request without feed_algo_id; dropping");
+                            Ok(BuildOutcome::UnknownFacet)
+                        }
+                    }
+                } else {
+                    builder.build(&viewer, &facet).await
+                };
+
+                match result {
                     Ok(BuildOutcome::Published) => info!(viewer, facet, "lens published"),
                     Ok(BuildOutcome::Empty) => info!(viewer, facet, "viewer follows nobody"),
                     Ok(BuildOutcome::TooLarge) => warn!(viewer, facet, "lens over size budget"),

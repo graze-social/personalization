@@ -7,6 +7,7 @@
 
 pub mod builder;
 pub mod config;
+pub mod domain;
 pub mod interner;
 pub mod priors;
 pub mod queue;

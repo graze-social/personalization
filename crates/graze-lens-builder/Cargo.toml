@@ -9,6 +9,10 @@ license = "MIT"
 name = "graze-lens-builder"
 path = "src/main.rs"
 
+[[bin]]
+name = "graze-lens-refresh"
+path = "src/bin/refresh.rs"
+
 [lib]
 name = "graze_lens_builder"
 path = "src/lib.rs"

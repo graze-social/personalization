@@ -1,0 +1,63 @@
+# graze-lens-refresh — nightly re-enqueue of every published lens facet.
+#
+# Blobs build on demand and live for 7 days, which is right for `follows`
+# (deltas keep it live) and wrong for time-shaped facets: `velocity` claims
+# "what my network discovered this week" and would serve week-old "this week"
+# until its TTL lapsed. This re-enqueues only facets that already exist, so the
+# cost stays proportional to actual use, and it runs after the projection job
+# (10:43) has rebuilt the tables the facets read.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: graze-lens-refresh
+  labels:
+    app: graze-lens
+    component: refresh
+spec:
+  schedule: "13 12 * * *" # after the nightly projection completes
+  timeZone: "Etc/UTC"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 600
+      template:
+        metadata:
+          labels:
+            app: graze-lens
+            component: refresh
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: docr-graze-social-labs
+          containers:
+            - name: refresh
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:6dd2e6776768668e187c0667b84a840dd7eec9aa369101fb8ef8510a40a3afcc
+              command: ["/app/graze-lens-refresh"]
+              resources:
+                requests:
+                  memory: "64Mi"
+                  cpu: "50m"
+                limits:
+                  memory: "256Mi"
+                  cpu: "250m"
+              envFrom:
+                - secretRef:
+                    name: app-secrets
+                - secretRef:
+                    name: lens-redis
+              env:
+                - name: RUST_LOG
+                  value: "info"
+              securityContext:
+                runAsNonRoot: true
+                readOnlyRootFilesystem: true
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532

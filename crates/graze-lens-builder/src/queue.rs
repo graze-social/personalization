@@ -16,8 +16,13 @@ pub const STREAM_KEY: &str = "queue:lens";
 /// One build request, as written by the serve path.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct BuildRequest {
+    /// Empty for feed-scoped builds (the `domain` facet), which have no viewer.
+    #[serde(default)]
     pub viewer_did: String,
     pub facet: String,
+    /// Set only for feed-scoped facets: the algorithm id whose blob to build.
+    #[serde(default)]
+    pub feed_algo_id: Option<u32>,
 }
 
 /// A request together with the stream id needed to acknowledge it.

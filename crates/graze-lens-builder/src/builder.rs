@@ -18,6 +18,7 @@ use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
+use crate::domain;
 use crate::interner::Interner;
 use crate::priors;
 use crate::second_degree;
@@ -38,6 +39,9 @@ pub const FACET_NICHE: &str = "niche";
 pub const FACET_POPULAR: &str = "popular";
 pub const FACET_VELOCITY: &str = "velocity";
 pub const FACET_COMMUNITY: &str = "community";
+/// Feed-scoped: who this feed's recent authors collectively follow. Built per
+/// algorithm id, not per viewer; the reader sums it with viewer facets.
+pub const FACET_DOMAIN: &str = "domain";
 
 /// Facets this builder can actually produce.
 ///
@@ -53,6 +57,7 @@ pub fn is_buildable_facet(facet: &str) -> bool {
             | FACET_POPULAR
             | FACET_VELOCITY
             | FACET_COMMUNITY
+            | FACET_DOMAIN
     )
 }
 
@@ -66,6 +71,7 @@ fn facet_header_id(name: &str) -> Option<u8> {
         FACET_POPULAR => Some(crate::scored::FACET_POPULAR),
         FACET_VELOCITY => Some(crate::scored::FACET_VELOCITY),
         FACET_COMMUNITY => Some(crate::scored::FACET_COMMUNITY),
+        FACET_DOMAIN => Some(crate::scored::FACET_DOMAIN),
         _ => None,
     }
 }
@@ -236,6 +242,83 @@ impl Builder {
     /// building from ClickHouse alone would publish a handful of incidental
     /// edges as if it were their graph — a wrong feed, not a narrow one, and
     /// indistinguishable from someone who genuinely follows almost nobody.
+    /// Build the feed-scoped `domain` blob for one algorithm id.
+    ///
+    /// Deliberately not routed through `build()`: that path is a viewer
+    /// pipeline — completeness guard, PDS backfill, lensmeta state — and none
+    /// of it means anything for a feed. A feed with no recent authors is
+    /// Empty, not NeedsBackfill.
+    pub async fn build_domain(&self, algo_id: u32) -> anyhow::Result<BuildOutcome> {
+        let Some(interner) = &self.interner else {
+            anyhow::bail!("no interner configured; cannot build domain");
+        };
+
+        let authors_sql = domain::author_weights_query(&self.clickhouse.database, algo_id);
+        let authors = domain::parse_author_weights(&self.query_text(&authors_sql).await?);
+        if authors.is_empty() {
+            info!(algo_id, "feed has no recent authors; nothing to build");
+            return Ok(BuildOutcome::Empty);
+        }
+
+        // Intern the authors, carrying each one's decayed weight through.
+        let dids: Vec<String> = authors.iter().map(|(d, _)| d.clone()).collect();
+        let ids = interner.intern_many(&dids).await?;
+        let seeds: Vec<(u32, f64)> = authors
+            .iter()
+            .filter_map(|(d, w)| ids.get(d).map(|id| (*id, *w)))
+            .collect();
+        if seeds.is_empty() {
+            return Ok(BuildOutcome::Empty);
+        }
+
+        let reach_sql = domain::weighted_reach_query(
+            &self.clickhouse.database,
+            &seeds,
+            self.config.second_degree_cap,
+        );
+        let map = domain::parse_domain_tsv(
+            &self.query_text(&reach_sql).await?,
+            self.config.second_degree_top_k,
+        );
+        if map.is_empty() {
+            return Ok(BuildOutcome::Empty);
+        }
+        // Same arithmetic impossibility as every reach facet: an account
+        // cannot be followed by more of the feed's authors than there are.
+        if (map.max_reach as usize) > seeds.len() {
+            anyhow::bail!(
+                "domain: max_reach {} exceeds {} seed authors — id map or projection corrupt",
+                map.max_reach,
+                seeds.len()
+            );
+        }
+
+        let blob = map.encode_as(crate::scored::FACET_DOMAIN, interner.idspace(), now_secs());
+        info!(
+            algo_id,
+            authors = seeds.len(),
+            reached = map.all_ids.len(),
+            scored = map.entries.len(),
+            max_reach = map.max_reach,
+            bytes = blob.len(),
+            "built domain facet"
+        );
+
+        // Keyed by algorithm id. Numeric, so it cannot collide with the
+        // DID-keyed viewer blobs sharing the prefix.
+        let key = format!("lens:v2:{FACET_DOMAIN}:{algo_id}");
+        let ttl = self.config.set_ttl.as_secs();
+        let mut conn = self.redis.get().await?;
+        deadpool_redis::redis::cmd("SET")
+            .arg(&key)
+            .arg(blob)
+            .arg("EX")
+            .arg(ttl)
+            .query_async::<()>(&mut conn)
+            .await?;
+        Ok(BuildOutcome::Published)
+    }
+
     pub async fn build(&self, viewer: &str, facet: &str) -> anyhow::Result<BuildOutcome> {
         // Reject an unknown facet before anything else, and in particular before
         // marking the viewer "building" — a state nothing would ever clear.
@@ -805,6 +888,7 @@ mod tests {
             FACET_POPULAR,
             FACET_VELOCITY,
             FACET_COMMUNITY,
+            FACET_DOMAIN,
         ] {
             assert!(is_buildable_facet(f), "{f} should build");
         }
@@ -813,6 +897,7 @@ mod tests {
         // degree under a name that promises a blend.
         assert!(!is_buildable_facet("network"));
         assert!(!is_buildable_facet("discover"));
+        assert!(!is_buildable_facet("expertise"));
         assert!(!is_buildable_facet("mutuals"), "not implemented yet");
         assert!(!is_buildable_facet(""));
         assert!(!is_buildable_facet("FOLLOWS"), "matching is exact");
@@ -829,6 +914,7 @@ mod tests {
             crate::scored::FACET_POPULAR,
             crate::scored::FACET_VELOCITY,
             crate::scored::FACET_COMMUNITY,
+            crate::scored::FACET_DOMAIN,
         ];
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();

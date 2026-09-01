@@ -133,7 +133,34 @@ pub struct Config {
     ///
     /// This matters because algo 5395 is ~83% of all scoring traffic at 2% scoreable, so most of the
     /// engine's compute currently goes to a feed that structurally cannot produce a ranking.
+    ///
+    /// **The share alone is not sufficient — see [`Config::min_pool_scoreable_posts`].** Every pool
+    /// in the measurement above was small enough that `ALGO_POSTS_LIMIT` never bound, so
+    /// `post_count` described the feed. On a pool that hits the cap it describes the cap instead.
     pub min_pool_scoreable_share: f64,
+
+    /// Absolute number of scoreable candidates that exempts a feed from
+    /// [`Config::min_pool_scoreable_share`]. `0` disables the exemption, leaving the share gate
+    /// exactly as it was.
+    ///
+    /// The share gate is a ratio whose denominator is decided by `ALGO_POSTS_LIMIT` (40,000), not by
+    /// the feed. Candidate sync takes the newest N posts within its window, so a feed matching more
+    /// than N posts gets a pool covering *less* time — and likes accrue over time. Measured on algo
+    /// 6445 on 2026-09-01: 118,589 eligible posts in the 72h window against a 40,000 cap, so the
+    /// pool spanned ~23h, and the share of posts clearing 10 likers rose monotonically with age
+    /// across it — 2.00% at 0-3.6h to 5.28% at 14.4-21h, still climbing where the cap cuts. The feed
+    /// crossed the 4% gate downward every afternoon and back up overnight.
+    ///
+    /// What actually determines whether a co-liker walk can rank is how many scoreable candidates
+    /// there are, not what fraction of the pool they are. Sorted by that count, the feeds the share
+    /// gate blocked were 1,452 · 1,352 · 30 · 24 · 22 · 22 · 20 — a 45x gap with nothing in it, and
+    /// the two largest were the 5th busiest feed in the fleet (2,140 personalized impressions/7d,
+    /// 75% of its output) and one other. Any threshold in 100..=1,200 separates that bimodal set
+    /// identically, so this is not a tuning knob; 500 sits in the empty middle.
+    ///
+    /// Deliberately an exemption rather than a replacement: a feed can still be gated on density
+    /// alone, which is what keeps algo 30374 (20 scoreable posts) correctly skipped.
+    pub min_pool_scoreable_posts: usize,
 
     pub walk_count: usize,
 
@@ -553,6 +580,7 @@ impl Config {
             inverted_coliker_like_days: parse_u32_env("INVERTED_COLIKER_LIKE_DAYS", 4),
             inverted_coliker_like_limit: parse_usize_env("INVERTED_COLIKER_LIKE_LIMIT", 500),
             min_pool_scoreable_share: parse_f64_env("MIN_POOL_SCOREABLE_SHARE", 0.0),
+            min_pool_scoreable_posts: parse_usize_env("MIN_POOL_SCOREABLE_POSTS", 0),
             personalization_holdout_salt: std::env::var("PERSONALIZATION_HOLDOUT_SALT")
                 .unwrap_or_else(|_| "pholdout-v1".to_string()),
             walk_count: parse_usize_env("WALK_COUNT", 2000),
@@ -1097,5 +1125,85 @@ mod density_gate_guards {
                 "algo {algo} at share {share} classified wrongly by gate {gate}"
             );
         }
+    }
+
+    #[test]
+    fn scoreable_floor_defaults_to_disabled() {
+        // Ships inert for the same reason the share gate did: the deploy must not move any feed.
+        // Turning it on is then a single env var, and rolling it back is unsetting one.
+        let c = Config::from_env();
+        assert_eq!(
+            c.min_pool_scoreable_posts, 0,
+            "MIN_POOL_SCOREABLE_POSTS must default to 0 (exemption disabled)"
+        );
+    }
+
+    /// The gate decision, extracted so the floor's effect can be asserted without a Redis round
+    /// trip. Mirrors `LinkLonkAlgorithm::compute_personalization` step 0b exactly.
+    fn is_gated(scoreable: f64, post_count: f64, gate: f64, floor: usize) -> bool {
+        if post_count <= 0.0 {
+            return false;
+        }
+        let share = scoreable / post_count;
+        let has_absolute_signal = floor > 0 && scoreable >= floor as f64;
+        share < gate && !has_absolute_signal
+    }
+
+    #[test]
+    fn a_zero_floor_leaves_the_share_gate_untouched() {
+        // The whole safety case for deploying this rests on it. Floor 0 must reproduce the old
+        // behaviour for every feed, including the ones the gate is supposed to stop.
+        let live: [(i32, f64, f64, bool); 5] = [
+            // algo, scoreable@10, post_count, gated under the 4% share gate alone (measured 9/01)
+            (6445, 1452.0, 38546.0, true),
+            (33516, 1352.0, 39989.0, true),
+            (30374, 20.0, 3797.0, true),
+            (2304, 918.0, 7958.0, false),
+            (2243, 1723.0, 20246.0, false),
+        ];
+        for (algo, sc, pc, gated) in live {
+            assert_eq!(
+                is_gated(sc, pc, 0.04, 0),
+                gated,
+                "algo {algo} moved with the floor disabled"
+            );
+        }
+    }
+
+    #[test]
+    fn the_floor_rescues_pools_with_signal_and_not_pools_without() {
+        // Measured 2026-09-01. The blocked set is bimodal — 1,452 / 1,352 / 30 / 24 / 22 / 22 / 20 —
+        // so every threshold in this range must produce the same partition. If this test ever
+        // becomes sensitive to the exact number, the population has changed and the floor needs
+        // re-measuring rather than re-tuning.
+        for floor in [100usize, 200, 500, 750, 1_200] {
+            assert!(
+                !is_gated(1452.0, 38546.0, 0.04, floor),
+                "algo 6445 (1,452 scoreable, ~23h pool) should be exempt at floor {floor}"
+            );
+            assert!(
+                !is_gated(1352.0, 39989.0, 0.04, floor),
+                "algo 33516 (1,352 scoreable) should be exempt at floor {floor}"
+            );
+            assert!(
+                is_gated(20.0, 3797.0, 0.04, floor),
+                "algo 30374 has 20 scoreable posts and must stay gated at floor {floor}"
+            );
+            assert!(
+                is_gated(30.0, 1260.0, 0.04, floor),
+                "algo 4051 has 30 scoreable posts and must stay gated at floor {floor}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_floor_cannot_gate_a_feed_the_share_gate_would_have_passed() {
+        // It is an exemption, never an additional gate. A dense feed with few scoreable posts —
+        // small pools that clear the share gate easily — must not start being skipped.
+        assert!(!is_gated(8.0, 166.0, 0.04, 500), "algo 3653 at 4.82% share");
+        assert!(
+            !is_gated(192.0, 727.0, 0.04, 500),
+            "algo 8352 at 26.4% share"
+        );
     }
 }

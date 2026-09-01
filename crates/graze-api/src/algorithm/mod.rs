@@ -584,7 +584,14 @@ impl LinkLonkAlgorithm {
             if let (Some(scoreable), Some(post_count)) = (scoreable, post_count) {
                 if post_count > 0.0 {
                     let share = scoreable / post_count;
-                    if share < density_gate {
+                    // Absolute exemption. `share`'s denominator is `ALGO_POSTS_LIMIT` on any pool
+                    // that hits the cap, so on those feeds a low share means "the pool covers few
+                    // hours", not "there is no like signal here". A pool holding this many scoreable
+                    // candidates can produce a ranking regardless of what sits beside them.
+                    // Off by default; see Config::min_pool_scoreable_posts.
+                    let floor = self.config.min_pool_scoreable_posts;
+                    let has_absolute_signal = floor > 0 && scoreable >= floor as f64;
+                    if share < density_gate && !has_absolute_signal {
                         info!(
                             user_hash = %&user_hash[..8.min(user_hash.len())],
                             algo_id,
@@ -592,6 +599,7 @@ impl LinkLonkAlgorithm {
                             post_count,
                             share = format!("{:.4}", share),
                             density_gate,
+                            scoreable_floor = floor,
                             "early_exit: pool like-density below personalization gate"
                         );
                         return Ok(ScoringResult::default());

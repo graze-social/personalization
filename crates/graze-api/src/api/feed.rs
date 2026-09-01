@@ -134,6 +134,7 @@ fn graze_api_hash_experiment(config: &crate::config::Config) -> crate::algorithm
 fn skip_reason_to_fallback_reason(skip: Option<&str>) -> Option<&'static str> {
     match skip {
         Some("pool_density") => Some("pool_density"),
+        Some("pool_size") => Some("pool_size"),
         _ => None,
     }
 }
@@ -1764,7 +1765,7 @@ mod tests {
     /// here shows up as an obviously-unfinished change rather than as a silently unlabelled row.
     #[test]
     fn every_engine_skip_reason_maps_to_a_fallback_reason() {
-        for reason in ["pool_density"] {
+        for reason in ["pool_density", "pool_size"] {
             assert_eq!(
                 skip_reason_to_fallback_reason(Some(reason)),
                 Some(reason),

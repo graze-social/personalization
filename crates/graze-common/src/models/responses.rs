@@ -94,11 +94,11 @@ pub struct ResponseMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoring_time_ms: Option<f64>,
 
-    /// Why scoring was skipped entirely before it ran: `pool_density`. Absent when scoring ran,
-    /// including when it ran and returned nothing.
+    /// Why scoring was skipped entirely before it ran: `pool_density` | `pool_size`. Absent when
+    /// scoring ran, including when it ran and returned nothing.
     ///
     /// Exists so `api::feed` can turn a pre-scoring gate into a `fallback_reason` on the
-    /// provenance blob. Before this, the gate returned an empty `ScoringResult` that was
+    /// provenance blob. Before this, both gates returned an empty `ScoringResult` that was
     /// indistinguishable from "scored and found nothing", so the response was served as fallback
     /// with no reason recorded at all and the coverage failure could not be decomposed in
     /// ClickHouse. Verified on feed 6445 on 2026-09-01: 22 of 24 items carried `source=fallback`

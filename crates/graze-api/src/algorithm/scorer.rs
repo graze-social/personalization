@@ -90,8 +90,8 @@ pub struct ScoringResult {
     pub seed_keep_rate: Option<f64>,
     /// Why scoring was skipped entirely before it ran, when it was.
     ///
-    /// `pool_density` (the feed's like-density gate fired). `None` whenever scoring actually
-    /// ran, including
+    /// `pool_density` (the feed's like-density gate fired) | `pool_size` (the feed's candidate
+    /// pool is below the personalization gate). `None` whenever scoring actually ran, including
     /// when it ran and produced nothing — "we refused to look" and "we looked and found nothing"
     /// are different coverage failures and the whole point of this field is to keep them apart.
     ///

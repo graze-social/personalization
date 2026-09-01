@@ -556,6 +556,7 @@ impl LinkLonkAlgorithm {
                 );
                 return Ok(ScoringResult {
                     posts_checked: pool_size,
+                    skip_reason: Some("pool_size"),
                     ..Default::default()
                 });
             }

@@ -2,8 +2,14 @@
 #
 # Pattern copied from feed-processor/kube/analytics-freshness-cronjob.yml (the established CronJob
 # shape on this cluster): Forbid concurrency, a hard deadline, envFrom a secret, and an image pull
-# secret. Scheduled hourly because the runner uses anytime-valid intervals — repeated inspection
-# does not inflate the error rate, which is precisely why it is safe to run it this often.
+# secret.
+#
+# Scheduled hourly because the verdict is gated on a confidence sequence over the ARM DIFFERENCE,
+# whose error rate survives repeated inspection. Note the precision: this justification stood here
+# before the code supported it, when the only sequence computed was over the per-unit rate POOLED
+# across arms — an interval on a level, which for a non-negative rate cannot contain zero. The
+# fixed-horizon WLS and permutation p-values are still printed, and reading THOSE hourly does
+# inflate their error rate, which is why they are labelled diagnostic.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -25,7 +31,7 @@ spec:
             - name: dockerhub-secret
           containers:
             - name: analysis
-              image: dgaff/graze-analysis@sha256:573861b44a0456467695ff0842c1bf2606d2889e6380410d4aaa400e39c58264
+              image: dgaff/graze-analysis@sha256:3281127e0496941d5fda42a5a5077c3a5298dbd411d370293a58d9a3842a8e94
               # Override the entrypoint so one job runs both the experiment readouts and the
               # density-drift guard. The guard exits non-zero only on a *detection* (a feed that has
               # already stopped being personalized), so a real regression shows up as a failed Job

@@ -11,6 +11,10 @@ motivating investigation:
 - :func:`cuped_adjust` — variance reduction from pre-period data.
 - :func:`always_valid_ci` — the analysis is run on a schedule and looked at whenever, which
   invalidates fixed-horizon p-values. I peeked at one experiment three times in a day.
+- :func:`always_valid_diff_ci` — the same protection for the ARM DIFFERENCE, which is the
+  quantity actually decided on. The one-sample version had, since the harness was written,
+  been applied to a sample pooled across arms — an interval on a level, which for a
+  non-negative rate cannot contain zero.
 """
 
 from __future__ import annotations
@@ -248,6 +252,22 @@ def cuped_adjust(y: np.ndarray, covariate: np.ndarray) -> tuple[np.ndarray, floa
     return y_adj, max(reduction, 0.0)
 
 
+def _normal_mixture_radius(var_estimator: float, t: int, alpha: float, rho: float) -> float:
+    """Half-width of a normal-mixture confidence sequence for an estimator of known variance.
+
+    Factored out so the one-sample and two-sample sequences cannot drift apart: both boundaries
+    are this function, differing only in the variance they hand it. Standard normal-mixture form
+    (Howard et al., *Time-uniform Chernoff bounds*), with ``t`` observations accrued:
+
+        radius = sqrt( V * 2 * (t*rho + 1) / (t*rho) * ln( sqrt(t*rho + 1) / alpha ) )
+
+    For a single mean, ``V = s2/t``, which recovers the original
+    ``s2 * 2 * (t*rho + 1) / (t^2 * rho) * ln(...)`` exactly.
+    """
+    inner = math.sqrt(t * rho + 1.0) / alpha
+    return math.sqrt(var_estimator * 2.0 * (t * rho + 1.0) / (t * rho) * math.log(inner))
+
+
 def always_valid_ci(
     values: np.ndarray, alpha: float = 0.05, rho: float = 1.0
 ) -> tuple[float, float, float]:
@@ -255,10 +275,10 @@ def always_valid_ci(
 
     Returns ``(estimate, low, high)``. Unlike a fixed-horizon interval this may be inspected at any
     time, any number of times, without inflating the error rate; the price is a wider interval.
-    Boundary follows the standard normal-mixture form (Howard et al., *Time-uniform
-    Chernoff bounds*): with ``t`` observations and variance proxy ``s2``,
 
-        radius = sqrt( s2 * 2 * (t*rho + 1) / (t^2 * rho) * ln( sqrt(t*rho + 1) / alpha ) )
+    ⚠️ This is a sequence for ONE mean. Handing it a sample pooled across both arms yields an
+    interval on the *level*, which for a non-negative rate excludes zero no matter what the
+    treatment did — it is not evidence of an effect. For that, use :func:`always_valid_diff_ci`.
     """
     v = np.asarray(values, dtype=float)
     t = v.size
@@ -268,10 +288,103 @@ def always_valid_ci(
     s2 = float(np.var(v, ddof=1))
     if s2 <= 0:
         return mean, mean, mean
-    inner = math.sqrt(t * rho + 1.0) / alpha
-    radius = math.sqrt(s2 * 2.0 * (t * rho + 1.0) / (t * t * rho) * math.log(inner))
+    radius = _normal_mixture_radius(s2 / t, t, alpha, rho)
     return mean, mean - radius, mean + radius
 
+
+@dataclass(frozen=True)
+class SequentialEstimate:
+    """An arm difference bounded by a confidence sequence, safe to read at any time."""
+
+    diff: float
+    rel: float
+    low: float
+    high: float
+    n_control: int
+    n_treatment: int
+    variance_reduction: float = 0.0
+
+    @property
+    def conclusive(self) -> bool:
+        """True when the sequence has separated from zero and the sign is settled."""
+        if not (math.isfinite(self.low) and math.isfinite(self.high)):
+            return False
+        return self.low > 0.0 or self.high < 0.0
+
+    def describe(self) -> str:
+        rel = "n/a" if math.isnan(self.rel) else f"{self.rel:+.1%}"
+        cuped = (
+            f" cuped={self.variance_reduction:.1%}" if self.variance_reduction > 0 else ""
+        )
+        return (
+            f"anytime-valid on the arm DIFFERENCE (unweighted per-unit rate): "
+            f"diff={self.diff:+.4f} ({rel}) CI [{self.low:+.4f}, {self.high:+.4f}] "
+            f"units={self.n_control + self.n_treatment}{cuped} "
+            f"{'SEPARATED FROM ZERO' if self.conclusive else 'includes zero'}"
+        )
+
+
+def always_valid_diff_ci(
+    control: np.ndarray,
+    treatment: np.ndarray,
+    alpha: float = 0.05,
+    rho: float = 1.0,
+    variance_reduction: float = 0.0,
+) -> SequentialEstimate:
+    """Confidence sequence for the DIFFERENCE of two arm means (treatment minus control).
+
+    This is the quantity an A/B readout actually decides on, and the only one whose error rate
+    survives being looked at hourly. It exists because the harness previously computed a sequence
+    on the per-unit rate *pooled across arms* and printed it directly under the primary estimate:
+    an interval on a level, which for a like rate cannot contain zero, sitting where a reader
+    would look for sequential evidence of an effect. Meanwhile the fixed-horizon WLS p-value —
+    read roughly 96 times over the 2026-08-28 holdout window — crossed 0.05 on 2026-09-01
+    (p=0.0466) while the distribution-free permutation test sat flat at ~0.238 across every
+    window, which is the signature of alpha inflation rather than an emerging effect.
+
+    The estimand is the UNWEIGHTED mean of per-unit rates, deliberately, matching
+    :func:`permutation_rate_diff` rather than the impression-weighted WLS. 3.3% of users carry 36%
+    of impressions here, so impression weighting is precisely what makes the parametric fit
+    fragile. The two numbers are therefore not expected to match.
+
+    Variance of the difference is ``s2_c/n_c + s2_t/n_t`` (arms are independent by randomization);
+    the sequence is indexed by total units accrued, which is marginally the more conservative
+    choice since the boundary's log term grows in ``t``.
+    """
+    c = np.asarray(control, dtype=float)
+    t_ = np.asarray(treatment, dtype=float)
+    nc, nt = c.size, t_.size
+    if nc < 2 or nt < 2:
+        return SequentialEstimate(
+            diff=float("nan"), rel=float("nan"), low=float("-inf"), high=float("inf"),
+            n_control=nc, n_treatment=nt, variance_reduction=variance_reduction,
+        )
+    mc, mt = float(c.mean()), float(t_.mean())
+    diff = mt - mc
+    rel = (diff / mc) if mc else float("nan")
+    var = float(np.var(c, ddof=1)) / nc + float(np.var(t_, ddof=1)) / nt
+    se = math.sqrt(var) if var > 0 else 0.0
+    # Degenerate: every unit within an arm scored identically, so there is no basis for a variance
+    # estimate and the boundary is undefined -- unbounded, not zero-width. Mirrors
+    # `Estimate.significant`, which refuses a verdict on a non-positive SE for the same reason: a
+    # negative control with identical rates in both arms once came back p=0.0000 and withheld a
+    # valid result.
+    #
+    # The test is RELATIVE, not `var <= 0`. Exact zero is not the hazard: `np.var` on 50 copies of
+    # 0.09 returns 1.97e-34 rather than 0.0, because 0.09 is not representable and the two-pass
+    # mean leaves float residue. That is strictly positive, so it passes a `<= 0` guard and yields
+    # a ~1e-17-wide interval reading SEPARATED FROM ZERO -- false certainty from rounding noise.
+    scale = max(abs(mc), abs(mt), se)
+    if not math.isfinite(se) or se <= 1e-8 * scale:
+        return SequentialEstimate(
+            diff=diff, rel=rel, low=float("-inf"), high=float("inf"),
+            n_control=nc, n_treatment=nt, variance_reduction=variance_reduction,
+        )
+    radius = _normal_mixture_radius(var, nc + nt, alpha, rho)
+    return SequentialEstimate(
+        diff=diff, rel=rel, low=diff - radius, high=diff + radius,
+        n_control=nc, n_treatment=nt, variance_reduction=variance_reduction,
+    )
 
 def insufficient_data_gate(estimate: Estimate, min_observations: int) -> tuple[bool, str]:
     """Refuse to report a verdict below a minimum sample size.

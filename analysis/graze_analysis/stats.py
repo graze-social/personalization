@@ -393,6 +393,41 @@ def always_valid_diff_ci(
         estimand=estimand,
     )
 
+def covariate_balance(
+    covariate: np.ndarray, treated: np.ndarray, covered: np.ndarray, resamples: int = 2000
+) -> tuple[float, float]:
+    """Re-randomization check on a CUPED covariate. Returns ``(imbalance, p_value)``.
+
+    A covariate is only allowed to adjust the outcome if the treatment cannot have moved it. That
+    is an empirical question, not a design assumption, and it was got wrong here once already: the
+    holdout's pre-period like rate reads 0.00839 control vs 0.00999 treatment, which looks like
+    treatment leakage because it points the same way as the effect. Re-randomizing the arm labels
+    shows it is not — measured 2026-09-01, observed +0.00242 against a null sd of 0.00325,
+    two-sided p=0.459, and the sign REVERSES in an earlier window. It is chance.
+
+    Compares only COVERED units, so a difference in who has pre-period data at all cannot
+    masquerade as a difference in the covariate's value.
+    """
+    c = np.asarray(covariate, dtype=float)
+    m = np.asarray(covered, dtype=bool)
+    t = np.asarray(treated, dtype=bool)
+    if m.sum() < 4 or (t & m).sum() < 2 or (~t & m).sum() < 2:
+        return float("nan"), float("nan")
+    vals, arms = c[m], t[m]
+    observed = float(vals[arms].mean() - vals[~arms].mean())
+    n_t = int(arms.sum())
+    rng = np.random.default_rng(0)  # fixed: this is a diagnostic, it must not flicker hourly
+    idx = np.arange(vals.size)
+    hits = 0
+    for _ in range(resamples):
+        pick = rng.permutation(idx)[:n_t]
+        mask = np.zeros(vals.size, dtype=bool)
+        mask[pick] = True
+        if abs(float(vals[mask].mean() - vals[~mask].mean())) >= abs(observed):
+            hits += 1
+    return observed, hits / resamples
+
+
 def insufficient_data_gate(estimate: Estimate, min_observations: int) -> tuple[bool, str]:
     """Refuse to report a verdict below a minimum sample size.
 

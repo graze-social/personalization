@@ -384,47 +384,96 @@ def test_units_appearing_in_both_arms_are_flagged_above_everything():
     assert "2 unit(s)" in readout.lines[0]
 
 
-def test_cuped_is_reported_but_does_not_move_the_gate():
-    """CUPED is computed and shown, and deliberately does not drive the verdict.
+def _cuped_rows(covariate_shift=0):
+    """Varying per-user rates with a strongly (but not perfectly) correlated pre-period covariate.
 
-    `cuped_covariate_sql` measures the 14 days before `spec.start`. Every window in this repo has
-    been RESET rather than begun fresh, so that period is already under treatment: measured
-    2026-09-01, the holdout's pre-period like rate was 0.00839 control vs 0.00999 treatment, an
-    "imbalance" pointing the same way as the effect, because its control arm has had
-    personalization suppressed continuously since 2026-08-14. Adjusting for that removes real
-    signal, so the gate stays unadjusted and the adjusted interval is shown alongside it.
+    `covariate_shift` displaces the TREATMENT arm's covariate, simulating a covariate the
+    treatment moved -- the one case where adjusting would subtract real signal.
     """
-    # Per-user rates vary, and the pre-period covariate tracks them strongly but NOT perfectly. A
-    # covariate that determines the outcome exactly removes 100% of the variance, leaving float
-    # residue, and the degenerate guard then correctly reports an unbounded interval.
     primary, covariate = [], []
     for i in range(300):
         primary.append((f"c{i}", 10000, (i % 5) + (i % 2), 20))
         covariate.append((f"c{i}", i % 5, 20))
     for i in range(300):
         primary.append((f"t{i}", 250, (i % 5) + (i % 2) + 1, 20))
-        covariate.append((f"t{i}", i % 5, 20))
+        covariate.append((f"t{i}", (i % 5) + covariate_shift, 20))
+    return primary, covariate
 
+
+def _cuped_reader(primary, covariate):
     class R:
         def query(self, sql):
             if "pre_likes" in sql:
                 return covariate
             return primary if "source = 'fallback'" not in sql else _null_control()
 
-    plain = analyse_ab(_spec(), R())
-    with_cuped = analyse_ab(_spec(cuped_covariate="pre_period_like_rate"), R())
+    return R()
 
-    # The covariate is genuinely informative here...
-    line = next(l for l in with_cuped.lines if "CUPED" in l)
-    assert "variance reduction: 80.0%" in line, line
-    assert "adjusted gate would be" in line, line
-    # ...and it is explicitly NOT the gate.
-    caveat = next(l for l in with_cuped.lines if "DIAGNOSTIC, not the gate" in l)
-    assert "pre-period overlaps the treatment" in caveat, caveat
-    assert "coverage" in caveat, caveat
 
-    # The gate itself is byte-identical with and without the covariate.
-    assert with_cuped.lines[0] == plain.lines[0], (with_cuped.lines[0], plain.lines[0])
+def _gate_width(readout):
+    lo, hi = readout.lines[0].split("CI [")[1].split("]")[0].split(", ")
+    return float(hi) - float(lo)
+
+
+def test_a_balanced_covariate_adjusts_the_gate():
+    """CUPED is APPLIED, not merely reported.
+
+    It was first computed and discarded into `_`, then demoted to a diagnostic on the theory that a
+    reset window's pre-period is already under treatment. Re-randomization refuted that (observed
+    +0.00242 vs a null sd of 0.00325, p=0.459), and the adjustment is worth ~24% of the gate width
+    on live data, which is real power on a question that has never had enough.
+    """
+    primary, covariate = _cuped_rows()
+    plain = analyse_ab(_spec(), _cuped_reader(primary, covariate))
+    adjusted = analyse_ab(
+        _spec(cuped_covariate="pre_period_like_rate"), _cuped_reader(primary, covariate)
+    )
+
+    line = next(l for l in adjusted.lines if "CUPED" in l)
+    assert "APPLIED to the gate" in line, line
+    assert _gate_width(adjusted) < _gate_width(plain), (adjusted.lines[0], plain.lines[0])
+
+
+def test_the_covariate_balance_check_is_reported_with_real_coverage():
+    primary, covariate = _cuped_rows()
+    readout = analyse_ab(
+        _spec(cuped_covariate="pre_period_like_rate"), _cuped_reader(primary, covariate)
+    )
+    bal = next(l for l in readout.lines if "covariate balance" in l)
+    assert "re-randomization p=" in bal, bal
+    # COVERAGE means "has pre-period data", not "has a nonzero pre-period rate". Conflating the two
+    # is what produced a bogus 11.9%/17.3% "coverage gap" that read as treatment contamination;
+    # the real figures were 75.6%/74.5%, p=0.64.
+    assert "pre-period data for 100.0% of control / 100.0% of treatment" in bal, bal
+
+
+def test_a_covariate_the_treatment_moved_is_withheld_from_the_gate():
+    """The fallback that keeps the adjustment honest."""
+    primary, covariate = _cuped_rows(covariate_shift=4)
+    readout = analyse_ab(
+        _spec(cuped_covariate="pre_period_like_rate"), _cuped_reader(primary, covariate)
+    )
+    line = next(l for l in readout.lines if "CUPED" in l)
+    assert "WITHHELD from the gate" in line, line
+    assert any("would subtract real signal" in l for l in readout.lines), readout.render()
+
+    # And the gate really is the unadjusted one.
+    plain = analyse_ab(_spec(), _cuped_reader(primary, covariate))
+    assert readout.lines[0] == plain.lines[0], (readout.lines[0], plain.lines[0])
+
+
+def test_a_lone_straddler_is_flagged_without_crying_wolf():
+    primary = _weight_trap_rows() + [("cl0", 250, 3, 20)]
+    readout = analyse_ab(_spec(), FakeReader(primary, _null_control()))
+    assert "BOTH arms" in readout.lines[0], readout.lines[0]
+    assert "watch it rather than act on it" in readout.lines[0], readout.lines[0]
+    assert "Fix before reading" not in readout.lines[0]
+
+
+def test_widespread_straddling_does_demand_a_fix():
+    extra = [(f"cl{i}", 250, 3, 20) for i in range(40)]
+    readout = analyse_ab(_spec(), FakeReader(_weight_trap_rows() + extra, _null_control()))
+    assert "Fix before reading" in readout.lines[0], readout.lines[0]
 
 
 # --- The secondary gets the same peeking protection ------------------------------------------

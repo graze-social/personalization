@@ -9,8 +9,11 @@ from .spec import ExperimentSpec, SpecError, load_spec, spec_from_dict
 from .stats import (
     ControlVerdict,
     Estimate,
+    SequentialEstimate,
     always_valid_ci,
+    always_valid_diff_ci,
     cluster_robust_rate_diff,
+    covariate_balance,
     cuped_adjust,
     insufficient_data_gate,
     negative_control_gate,
@@ -28,6 +31,9 @@ __all__ = [
     "permutation_rate_diff",
     "cuped_adjust",
     "always_valid_ci",
+    "always_valid_diff_ci",
+    "SequentialEstimate",
+    "covariate_balance",
     "insufficient_data_gate",
     "negative_control_gate",
 ]

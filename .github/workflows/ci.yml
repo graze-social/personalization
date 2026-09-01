@@ -102,7 +102,10 @@ jobs:
           cache-dependency-path: analysis/requirements.lock.txt
 
       - name: Install pinned dependencies
-        run: pip install --no-cache-dir -r requirements.lock.txt
+        # NOT --no-cache-dir here, though the Dockerfile uses it. That flag keeps the image small,
+        # but on a runner it leaves ~/.cache/pip absent and setup-python's cache:pip post-step then
+        # fails the whole job trying to save a directory that was never created.
+        run: pip install -r requirements.lock.txt
 
       - name: Verify the lock matches what is installed
         # Catches a hand-edited or stale lock: if resolution drifted, the readout would be

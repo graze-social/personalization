@@ -52,7 +52,7 @@ spec:
         - name: builder
           # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
           # the short-SHA tag are mutable on DOCR.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9bc76cffb666cd69d83f2153902d06475081fef2c63d1d4b2af356934e554c09
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:08d0376a79c3e20e040abecc98e6e7eb5bcf0d971cacd360b2073954d6ec51e0
           command: ["/app/graze-lens-builder"]
           resources:
             requests:
@@ -89,7 +89,7 @@ spec:
             - name: LENS_SET_TTL_SECONDS
               value: "604800"
             - name: LENS_QUERY_MAX_EXECUTION_SECONDS
-              value: "20"
+              value: "60"
             - name: LENS_MAX_SET_SIZE
               value: "200000"
             - name: RUST_LOG

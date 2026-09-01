@@ -29,6 +29,7 @@ from .stats import (
     ControlVerdict,
     Estimate,
     always_valid_ci,
+    always_valid_diff_ci,
     cluster_robust_rate_diff,
     control_moved,
     cuped_adjust,
@@ -86,18 +87,61 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
         return Readout(spec.id, "WITHHELD (negative control moved)", [gate_msg, *lines])
 
     # --- Only now is it legitimate to report the effect ---
-    lines.insert(0, f"  primary  : {primary.describe()}")
+    #
+    # ORDERING IS THE POINT. The gate is the confidence sequence on the arm DIFFERENCE, and it is
+    # printed first. Everything under it is a fixed-horizon diagnostic whose nominal error rate
+    # does not apply here, because this job runs hourly and is read whenever: the holdout window
+    # opened 2026-08-28 and its WLS p crossed 0.05 on roughly the 96th look (2026-09-01,
+    # p=0.0466) while the distribution-free permutation test sat flat at ~0.238 through every
+    # window. That is the signature of alpha inflation, not of an effect emerging.
+    #
+    # The harness did previously print an "anytime-valid" line, but on the per-unit rate POOLED
+    # across arms -- an interval on a level, which for a non-negative rate cannot contain zero,
+    # occupying the slot a reader scans for sequential evidence. Same failure shape as the six
+    # before it: a claim in a comment that the code did not implement.
+    per_unit_rate = primary_rows.numerator / np.maximum(primary_rows.denominator, 1.0)
+
+    # A unit must sit in exactly one arm. The holdout window was once reset because a per-REQUEST
+    # coin flip put 18% of users in both arms, and the sequence's variance assumes independent
+    # arms, so this is checked rather than assumed.
+    first_arm: dict[str, float] = {}
+    straddlers = 0
+    for u, a in zip(primary_rows.unit_ids, primary_rows.arm):
+        if u not in first_arm:
+            first_arm[u] = a
+        elif first_arm[u] != a:
+            straddlers += 1
+
+    treated = primary_rows.arm > 0.5
+    # The gate is the UNADJUSTED difference. CUPED is computed and shown below, but deliberately
+    # does not drive the verdict: `cuped_covariate_sql` measures the 14 days before `spec.start`,
+    # and for a window that was RESET rather than begun fresh, that period is already under
+    # treatment. Measured 2026-09-01 on the holdout -- pre-period like rate 0.00839 control vs
+    # 0.00999 treatment, an "imbalance" pointing the same way as the effect, because the holdout
+    # has suppressed personalization for its control arm continuously since 2026-08-14.
+    # Subtracting that removes real signal rather than noise: it shrank the estimate from
+    # +0.00180 to +0.00045. Coverage is thin besides (11.9% of control units, 17.3% of treatment
+    # have any pre-period row), so the reduction rests on a minority of the sample.
+    seq = always_valid_diff_ci(per_unit_rate[~treated], per_unit_rate[treated])
+
+    lines.insert(0, f"  GATE     : {seq.describe()}")
+    lines.insert(1, f"  primary  : {primary.describe()}   [fixed-horizon, diagnostic]")
+    if straddlers:
+        lines.insert(
+            0,
+            f"  !! {straddlers} unit(s) appear in BOTH arms -- randomization is leaking and the "
+            "gate's independence assumption does not hold. Fix before reading.",
+        )
 
     perm = permutation_rate_diff(
         primary_rows.unit_ids, primary_rows.arm, primary_rows.numerator, primary_rows.denominator
     )
-    lines.append(f"  permutation: {perm.describe()}")
+    lines.append(f"  permutation: {perm.describe()}   [fixed-horizon, diagnostic]")
 
-    per_unit_rate = primary_rows.numerator / np.maximum(primary_rows.denominator, 1.0)
     _, low, high = always_valid_ci(per_unit_rate)
     lines.append(
-        f"  anytime-valid CI on the per-unit rate: [{low:+.4f}, {high:+.4f}] "
-        "(safe to inspect repeatedly)"
+        f"  pooled base rate, both arms: [{low:+.4f}, {high:+.4f}] "
+        "(a LEVEL, not an effect -- cannot contain zero)"
     )
 
     if spec.cuped_covariate:
@@ -108,18 +152,33 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
                 for u in primary_rows.unit_ids
             ]
         )
-        _, reduction = cuped_adjust(per_unit_rate, cov)
-        lines.append(f"  CUPED variance reduction: {reduction:.1%}")
+        adjusted, reduction = cuped_adjust(per_unit_rate, cov)
+        adj_seq = always_valid_diff_ci(
+            adjusted[~treated], adjusted[treated], variance_reduction=reduction
+        )
+        lines.append(
+            f"  CUPED variance reduction: {reduction:.1%}; adjusted gate would be "
+            f"[{adj_seq.low:+.4f}, {adj_seq.high:+.4f}]"
+        )
+        lines.append(
+            "    (DIAGNOSTIC, not the gate: the pre-period overlaps the treatment on a reset "
+            f"window, and pre-period coverage is {(cov[~treated] > 0).mean():.1%} control / "
+            f"{(cov[treated] > 0).mean():.1%} treatment)"
+        )
 
     lines.extend(_scroll_depth_lines(spec, reader))
     lines.extend(_guardrail_lines(spec, reader))
 
-    agree = primary.significant == (perm.p_value < 0.05)
-    verdict = (
-        "SIGNIFICANT" if primary.significant and agree else
-        "INCONCLUSIVE (tests disagree)" if not agree else
-        "NOT SIGNIFICANT"
-    )
+    # The gate decides. The fixed-horizon tests only colour the message.
+    fixed_agree = primary.significant and perm.p_value < 0.05
+    if seq.conclusive:
+        verdict = "EFFECT ESTABLISHED (anytime-valid)"
+        if not fixed_agree:
+            verdict += " -- fixed-horizon tests disagree"
+    else:
+        verdict = "NO EFFECT ESTABLISHED (sequence includes zero)"
+        if primary.significant:
+            verdict += " -- WLS reads significant, uncorrected for repeated inspection"
     return Readout(spec.id, verdict, lines)
 
 

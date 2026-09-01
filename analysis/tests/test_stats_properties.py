@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
-import numpy as np
+import math
 
-from graze_analysis.stats import always_valid_ci, cuped_adjust
+import numpy as np
+import pytest
+
+from graze_analysis.stats import (
+    _normal_mixture_radius,
+    always_valid_ci,
+    always_valid_diff_ci,
+    cuped_adjust,
+)
 
 
 class TestCuped:
@@ -75,3 +83,68 @@ class TestAlwaysValidCI:
     def test_tiny_samples_are_uninformative_rather_than_wrong(self):
         est, lo, hi = always_valid_ci(np.array([1.0]))
         assert lo == float("-inf") and hi == float("inf")
+
+
+class TestAlwaysValidDiffCI:
+    """The sequence on the ARM DIFFERENCE — the quantity the verdict is actually formed on.
+
+    The one-sample version was being handed a sample pooled across both arms, which bounds a
+    *level*: for a non-negative rate that interval cannot contain zero, so it could never have
+    withheld anything.
+    """
+
+    def test_the_two_boundaries_are_the_same_function(self):
+        # Guards the refactor: the one-sample radius must remain exactly the old closed form.
+        for t, s2 in ((5, 0.3), (2437, 0.0038), (68702, 1.2)):
+            expected = math.sqrt(
+                s2 * 2.0 * (t + 1.0) / (t * t) * math.log(math.sqrt(t + 1.0) / 0.05)
+            )
+            assert _normal_mixture_radius(s2 / t, t, 0.05, 1.0) == pytest.approx(expected)
+
+    def test_covers_zero_under_repeated_peeking(self):
+        rng = np.random.default_rng(11)
+        misses = 0
+        trials = 200
+        for _ in range(trials):
+            c = rng.gamma(0.3, 0.04, 400)
+            t = rng.gamma(0.3, 0.04, 400)
+            for n in range(40, 400, 40):
+                est = always_valid_diff_ci(c[:n], t[:n])
+                if est.conclusive:
+                    misses += 1
+                    break
+        assert misses / trials < 0.12, f"separated from zero under a true null: {misses}/{trials}"
+
+    def test_finds_a_real_difference(self):
+        rng = np.random.default_rng(12)
+        c = rng.gamma(0.3, 0.04, 800)
+        t = rng.gamma(0.3, 0.04, 800) * 2.5
+        est = always_valid_diff_ci(c, t)
+        assert est.conclusive and est.low > 0.0, est.describe()
+
+    def test_is_wider_than_the_fixed_horizon_two_sample_interval(self):
+        rng = np.random.default_rng(13)
+        c = rng.normal(0, 1, 900)
+        t = rng.normal(0.1, 1, 900)
+        est = always_valid_diff_ci(c, t)
+        se = math.sqrt(np.var(c, ddof=1) / c.size + np.var(t, ddof=1) / t.size)
+        assert (est.high - est.low) > 2 * 1.96 * se
+
+    def test_a_degenerate_arm_is_uninformative_rather_than_certain(self):
+        # Identical values within each arm give no variance estimate, so the bound is undefined --
+        # not zero-width. `Estimate.significant` refuses a verdict on a non-positive SE for the
+        # same reason: a negative control with identical rates once returned p=0.0000.
+        est = always_valid_diff_ci(np.full(50, 0.01), np.full(50, 0.09))
+        assert not est.conclusive
+        assert est.low == float("-inf") and est.high == float("inf")
+
+    def test_too_few_units_is_uninformative(self):
+        est = always_valid_diff_ci(np.array([0.1]), np.array([0.2, 0.3]))
+        assert not est.conclusive
+
+    def test_cuped_reduction_is_carried_for_reporting(self):
+        rng = np.random.default_rng(14)
+        est = always_valid_diff_ci(
+            rng.gamma(0.3, 0.04, 100), rng.gamma(0.3, 0.04, 100), variance_reduction=0.457
+        )
+        assert "cuped=45.7%" in est.describe()

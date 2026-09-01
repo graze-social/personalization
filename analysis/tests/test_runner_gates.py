@@ -287,6 +287,141 @@ def test_scroll_depth_is_reported_but_never_replaces_the_primary():
     joined = "\n".join(readout.lines)
     assert "scroll_depth (winsorized p90" in joined, joined
     assert "secondary outcome" in joined, joined
-    # The primary must still be present and still first.
+    # The primary must still be present, and a secondary must never outrank it. The anytime-valid
+    # GATE leads (it is the quantity the verdict is formed on); the primary sits immediately under
+    # it, and scroll depth stays below both.
     assert any("primary" in line for line in readout.lines)
-    assert readout.lines[0].strip().startswith("primary")
+    assert readout.lines[0].strip().startswith("GATE")
+    assert readout.lines[1].strip().startswith("primary")
+    primary_at = next(i for i, l in enumerate(readout.lines) if "primary" in l)
+    scroll_at = next(i for i, l in enumerate(readout.lines) if "scroll_depth" in l)
+    assert scroll_at > primary_at, readout.lines
+
+
+# --- The anytime-valid gate -------------------------------------------------------------------
+#
+# This readout is scheduled hourly and read whenever, so a fixed-horizon p-value has no nominal
+# error rate here. The verdict is formed on a confidence sequence over the arm DIFFERENCE. These
+# tests exist because the previous "anytime-valid" line was computed on the per-unit rate POOLED
+# across arms -- an interval on a level, which for a non-negative rate cannot contain zero -- and
+# nothing checked that any sequential quantity reached the verdict.
+
+
+def _uneven(prefix, n_users, likes, seen, arm_value):
+    """Rows with an explicit prefix, so two cohorts can share one arm without colliding ids."""
+    return [(f"{prefix}{i}", arm_value, likes, seen) for i in range(n_users)]
+
+
+def _weight_trap_rows():
+    """An 'effect' that exists only under impression weighting.
+
+    620 users per arm-pair, of whom 20 carry 500 impressions each and all the likes. The
+    impression-weighted fit reads this as overwhelming (p ~ 1e-13); the unweighted per-unit
+    sequence establishes nothing. This is the real shape of the data, not a contrivance: 3.3% of
+    users carry 36% of impressions on this service.
+    """
+    return (
+        _uneven("cl", 300, 0, 10, 10000)
+        + _uneven("ch", 10, 5, 500, 10000)
+        + _uneven("tl", 300, 0, 10, 250)
+        + _uneven("th", 10, 40, 500, 250)
+    )
+
+
+def _null_control():
+    return _rows(120, 1, 20, 10000) + _rows(120, 1, 20, 250)
+
+
+def test_the_verdict_is_formed_on_the_gate_not_the_impression_weighted_fit():
+    readout = analyse_ab(_spec(), FakeReader(_weight_trap_rows(), _null_control()))
+    joined = "\n".join(readout.lines)
+
+    # The fixed-horizon fit is emphatic...
+    primary_line = next(l for l in readout.lines if "primary" in l)
+    assert "SIGNIFICANT" in primary_line, primary_line
+    # ...and the gate is not, so no effect may be declared.
+    assert "NO EFFECT ESTABLISHED" in readout.verdict, readout.render()
+    assert "uncorrected for repeated inspection" in readout.verdict, readout.verdict
+    assert "includes zero" in readout.lines[0], readout.lines[0]
+    assert "EFFECT ESTABLISHED (anytime-valid)" not in readout.verdict
+
+
+def test_the_gate_leads_and_the_fixed_horizon_tests_are_marked_diagnostic():
+    readout = analyse_ab(_spec(), FakeReader(_weight_trap_rows(), _null_control()))
+    assert readout.lines[0].strip().startswith("GATE"), readout.lines[0]
+    assert "arm DIFFERENCE" in readout.lines[0]
+    for name in ("primary", "permutation"):
+        line = next(l for l in readout.lines if name in l)
+        assert "diagnostic" in line, line
+
+
+def test_the_pooled_level_line_cannot_be_read_as_an_effect():
+    readout = analyse_ab(_spec(), FakeReader(_weight_trap_rows(), _null_control()))
+    level = next(l for l in readout.lines if "pooled base rate" in l)
+    assert "not an effect" in level, level
+    # The wording that invited the misreading must not come back.
+    joined = "\n".join(readout.lines)
+    assert "anytime-valid CI on the per-unit rate" not in joined
+
+
+def test_a_real_unit_level_effect_still_clears_the_gate():
+    # Rates must VARY within an arm. Identical per-user rates leave only float residue as variance
+    # (np.var on 50 copies of 0.09 is 1.97e-34, not 0.0), which the degenerate guard rejects.
+    primary = []
+    for k in range(3):
+        primary += _uneven(f"c{k}_", 134, k, 20, 10000)
+        primary += _uneven(f"t{k}_", 134, 6 + 2 * k, 20, 250)
+    readout = analyse_ab(_spec(), FakeReader(primary, _null_control()))
+    assert "EFFECT ESTABLISHED" in readout.verdict, readout.render()
+    assert "SEPARATED FROM ZERO" in readout.lines[0]
+
+
+def test_units_appearing_in_both_arms_are_flagged_above_everything():
+    """A per-REQUEST coin flip once put 18% of users in both arms and cost a window reset."""
+    primary = _weight_trap_rows() + [("cl0", 250, 3, 20), ("cl1", 250, 3, 20)]
+    readout = analyse_ab(_spec(), FakeReader(primary, _null_control()))
+    assert "BOTH arms" in readout.lines[0], readout.lines[0]
+    assert "2 unit(s)" in readout.lines[0]
+
+
+def test_cuped_is_reported_but_does_not_move_the_gate():
+    """CUPED is computed and shown, and deliberately does not drive the verdict.
+
+    `cuped_covariate_sql` measures the 14 days before `spec.start`. Every window in this repo has
+    been RESET rather than begun fresh, so that period is already under treatment: measured
+    2026-09-01, the holdout's pre-period like rate was 0.00839 control vs 0.00999 treatment, an
+    "imbalance" pointing the same way as the effect, because its control arm has had
+    personalization suppressed continuously since 2026-08-14. Adjusting for that removes real
+    signal, so the gate stays unadjusted and the adjusted interval is shown alongside it.
+    """
+    # Per-user rates vary, and the pre-period covariate tracks them strongly but NOT perfectly. A
+    # covariate that determines the outcome exactly removes 100% of the variance, leaving float
+    # residue, and the degenerate guard then correctly reports an unbounded interval.
+    primary, covariate = [], []
+    for i in range(300):
+        primary.append((f"c{i}", 10000, (i % 5) + (i % 2), 20))
+        covariate.append((f"c{i}", i % 5, 20))
+    for i in range(300):
+        primary.append((f"t{i}", 250, (i % 5) + (i % 2) + 1, 20))
+        covariate.append((f"t{i}", i % 5, 20))
+
+    class R:
+        def query(self, sql):
+            if "pre_likes" in sql:
+                return covariate
+            return primary if "source = 'fallback'" not in sql else _null_control()
+
+    plain = analyse_ab(_spec(), R())
+    with_cuped = analyse_ab(_spec(cuped_covariate="pre_period_like_rate"), R())
+
+    # The covariate is genuinely informative here...
+    line = next(l for l in with_cuped.lines if "CUPED" in l)
+    assert "variance reduction: 80.0%" in line, line
+    assert "adjusted gate would be" in line, line
+    # ...and it is explicitly NOT the gate.
+    caveat = next(l for l in with_cuped.lines if "DIAGNOSTIC, not the gate" in l)
+    assert "pre-period overlaps the treatment" in caveat, caveat
+    assert "coverage" in caveat, caveat
+
+    # The gate itself is byte-identical with and without the covariate.
+    assert with_cuped.lines[0] == plain.lines[0], (with_cuped.lines[0], plain.lines[0])

@@ -131,6 +131,45 @@ impl Config {
             plc_directory: optional("LENS_BOOTSTRAP_PLC_DIRECTORY"),
         })
     }
+
+    /// Defaults with no environment read, for tests that need a `Config` but do
+    /// not care about its values. Deliberately not behind `cfg(test)`: the
+    /// integration tests in `tests/` are separate crates and cannot see it.
+    #[doc(hidden)]
+    pub fn for_test() -> Self {
+        Self {
+            redis_url: "redis://127.0.0.1:6379".to_string(),
+            redis_pool_size: 1,
+            clickhouse: ClickHouseConfig {
+                host: "localhost".to_string(),
+                port: 8123,
+                database: "default".to_string(),
+                user: "default".to_string(),
+                password: String::new(),
+                secure: false,
+            },
+            max_execution_seconds: 20,
+            query_timeout: Duration::from_secs(25),
+            consumer_group: "builders".to_string(),
+            consumer_name: "lens-builder-test".to_string(),
+            batch_size: 16,
+            block: Duration::from_millis(5_000),
+            set_ttl: Duration::from_secs(604_800),
+            max_set_size: 200_000,
+            metrics_port: 9090,
+            second_degree_top_k: 20_000,
+            second_degree_cap: 500_000,
+            velocity_days: 7,
+            community_top: 3,
+            concurrency: 8,
+            drain_timeout: Duration::from_secs(30),
+            backfill_request_timeout: Duration::from_secs(20),
+            backfill_page_delay: Duration::from_millis(150),
+            backfill_max_pages: 600,
+            backfill_max_retries: 4,
+            plc_directory: None,
+        }
+    }
 }
 
 fn optional(name: &str) -> Option<String> {

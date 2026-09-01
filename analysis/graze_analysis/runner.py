@@ -32,6 +32,7 @@ from .stats import (
     always_valid_diff_ci,
     cluster_robust_rate_diff,
     control_moved,
+    covariate_balance,
     cuped_adjust,
     insufficient_data_gate,
     negative_control_gate,
@@ -113,24 +114,56 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
             straddlers += 1
 
     treated = primary_rows.arm > 0.5
-    # The gate is the UNADJUSTED difference. CUPED is computed and shown below, but deliberately
-    # does not drive the verdict: `cuped_covariate_sql` measures the 14 days before `spec.start`,
-    # and for a window that was RESET rather than begun fresh, that period is already under
-    # treatment. Measured 2026-09-01 on the holdout -- pre-period like rate 0.00839 control vs
-    # 0.00999 treatment, an "imbalance" pointing the same way as the effect, because the holdout
-    # has suppressed personalization for its control arm continuously since 2026-08-14.
-    # Subtracting that removes real signal rather than noise: it shrank the estimate from
-    # +0.00180 to +0.00045. Coverage is thin besides (11.9% of control units, 17.3% of treatment
-    # have any pre-period row), so the reduction rests on a minority of the sample.
-    seq = always_valid_diff_ci(per_unit_rate[~treated], per_unit_rate[treated])
+
+    # CUPED adjusts the outcome BEFORE the gate is formed -- but only after the covariate is shown
+    # to be something the treatment cannot have moved. That order matters, and it is the second
+    # thing this readout got wrong: the covariate was first computed and discarded into `_`, then
+    # (2026-09-01) demoted to a diagnostic on the theory that a reset window's pre-period is
+    # "already under treatment", because the imbalance pointed the same way as the effect.
+    # Re-randomizing the arm labels refuted that -- observed +0.00242 against a null sd of 0.00325,
+    # p=0.459, sign REVERSING in an earlier window. It is chance, and a pre-treatment window is
+    # measurably WORSE (29.3% reduction against 46.2%) because it is further from the outcome.
+    # So it adjusts, and the balance check below is what keeps that honest.
+    outcome, reduction, balance = per_unit_rate, 0.0, None
+    if spec.cuped_covariate:
+        pre = {str(u): (float(l), float(s_)) for u, l, s_ in reader.query(cuped_covariate_sql(spec))}
+        covered = np.array([u in pre and pre[u][1] > 0 for u in primary_rows.unit_ids])
+        cov = np.array(
+            [
+                (pre[u][0] / pre[u][1]) if u in pre and pre[u][1] else 0.0
+                for u in primary_rows.unit_ids
+            ]
+        )
+        imbalance, p_bal = covariate_balance(cov, treated, covered)
+        adjusted, reduction = cuped_adjust(per_unit_rate, cov)
+        # A covariate the treatment moved would subtract real signal. Fall back rather than guess.
+        balanced = not (p_bal == p_bal) or p_bal > 0.05  # nan -> too little data to reject
+        if balanced:
+            outcome = adjusted
+        balance = (imbalance, p_bal, covered, balanced, reduction)
+        # Only advertise a reduction that was actually taken. A withheld adjustment that still
+        # printed `cuped=60.0%` on the gate line would claim precision the interval does not have.
+        applied_reduction = reduction if balanced else 0.0
+    else:
+        applied_reduction = 0.0
+
+    seq = always_valid_diff_ci(
+        outcome[~treated], outcome[treated], variance_reduction=applied_reduction
+    )
 
     lines.insert(0, f"  GATE     : {seq.describe()}")
     lines.insert(1, f"  primary  : {primary.describe()}   [fixed-horizon, diagnostic]")
     if straddlers:
+        share = straddlers / max(len(set(primary_rows.unit_ids)), 1)
+        note = (
+            " Fix before reading."
+            if share > 0.01
+            else " Too few to move the estimate; watch it rather than act on it."
+        )
         lines.insert(
             0,
-            f"  !! {straddlers} unit(s) appear in BOTH arms -- randomization is leaking and the "
-            "gate's independence assumption does not hold. Fix before reading.",
+            f"  !! {straddlers} unit(s) ({share:.2%}) appear in BOTH arms -- the gate assumes "
+            f"independent arms.{note}",
         )
 
     perm = permutation_rate_diff(
@@ -144,27 +177,20 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
         "(a LEVEL, not an effect -- cannot contain zero)"
     )
 
-    if spec.cuped_covariate:
-        pre = {str(u): (float(l), float(s)) for u, l, s in reader.query(cuped_covariate_sql(spec))}
-        cov = np.array(
-            [
-                (pre[u][0] / pre[u][1]) if u in pre and pre[u][1] else 0.0
-                for u in primary_rows.unit_ids
-            ]
-        )
-        adjusted, reduction = cuped_adjust(per_unit_rate, cov)
-        adj_seq = always_valid_diff_ci(
-            adjusted[~treated], adjusted[treated], variance_reduction=reduction
-        )
+    if balance is not None:
+        imbalance, p_bal, covered, balanced, reduction = balance
+        state = "APPLIED to the gate" if balanced else "WITHHELD from the gate"
+        lines.append(f"  CUPED variance reduction: {reduction:.1%} ({state})")
         lines.append(
-            f"  CUPED variance reduction: {reduction:.1%}; adjusted gate would be "
-            f"[{adj_seq.low:+.4f}, {adj_seq.high:+.4f}]"
+            f"    covariate balance: {imbalance:+.5f} between arms, re-randomization p={p_bal:.3f}"
+            f"; pre-period data for {covered[~treated].mean():.1%} of control / "
+            f"{covered[treated].mean():.1%} of treatment units"
         )
-        lines.append(
-            "    (DIAGNOSTIC, not the gate: the pre-period overlaps the treatment on a reset "
-            f"window, and pre-period coverage is {(cov[~treated] > 0).mean():.1%} control / "
-            f"{(cov[treated] > 0).mean():.1%} treatment)"
-        )
+        if not balanced:
+            lines.append(
+                "    !! the treatment appears to have MOVED the covariate, so adjusting for it "
+                "would subtract real signal. The gate above is unadjusted."
+            )
 
     lines.extend(_scroll_depth_lines(spec, reader))
     lines.extend(_guardrail_lines(spec, reader))

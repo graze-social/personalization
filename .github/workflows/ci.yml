@@ -113,7 +113,11 @@ jobs:
           diff /tmp/expected.txt /tmp/actual.txt
 
       - name: Run tests
-        run: pytest -q
+        # `python -m pytest`, NOT the bare `pytest` console script. The module form puts the
+        # working directory on sys.path; the console script does not, and there is no conftest.py
+        # or installed package to make up the difference -- so bare `pytest` collects nothing but
+        # ModuleNotFoundError. This job caught exactly that on its first run.
+        run: python -m pytest -q
 
   release-build:
     name: Release Build

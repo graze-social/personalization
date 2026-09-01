@@ -79,6 +79,42 @@ jobs:
       # - name: Run integration tests
       #   run: cargo test --workspace --test '*' -- --test-threads=1
 
+  analysis-tests:
+    name: Analysis Tests
+    runs-on: ubuntu-latest
+    # The statistics package had NO CI until 2026-09-01, which is how a confidence sequence
+    # computed over the arms POOLED rather than over their difference shipped and survived: it
+    # bounded a level, could never contain zero, and so could never withhold a result. Everything
+    # here runs offline against fake readers -- no ClickHouse or Redis credentials are needed.
+    defaults:
+      run:
+        working-directory: analysis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          # Matches the analysis image (python:3.12-slim). A different minor version here would
+          # test something other than what runs.
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: analysis/requirements.lock.txt
+
+      - name: Install pinned dependencies
+        run: pip install --no-cache-dir -r requirements.lock.txt
+
+      - name: Verify the lock matches what is installed
+        # Catches a hand-edited or stale lock: if resolution drifted, the readout would be
+        # validated against a different numerical stack than production runs.
+        run: |
+          pip freeze | sort > /tmp/actual.txt
+          grep -v '^#' requirements.lock.txt | grep -v '^$' | sort > /tmp/expected.txt
+          diff /tmp/expected.txt /tmp/actual.txt
+
+      - name: Run tests
+        run: pytest -q
+
   release-build:
     name: Release Build
     runs-on: ubuntu-latest

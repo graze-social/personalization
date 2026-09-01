@@ -1,0 +1,34 @@
+# Fully resolved dependency set, transitive dependencies included. Captured 2026-09-01 with
+# `pip freeze` from the then-deployed analysis image, and re-verified byte-identical against the
+# image deployed after it -- these are the versions production is running, not an aspiration.
+#
+# The image and CI install from THIS file, so both run the exact set the statistics were
+# validated against. Pinning only the direct dependencies in requirements.txt would still
+# leave statsmodels' formula machinery (formulaic, patsy, narwhals) free to move, which is
+# precisely the layer a silent numerical change would hide in.
+#
+# Regenerate with the pip freeze command documented in requirements.txt. Do not hand-edit.
+PyYAML==6.0.3
+Pygments==2.21.0
+backports.zstd==1.7.0
+certifi==2026.7.22
+clickhouse-connect==1.7.2
+formulaic==1.2.2
+iniconfig==2.3.0
+interface_meta==2.0.1
+lz4==4.4.5
+narwhals==2.25.0
+numpy==2.5.2
+packaging==26.3
+pandas==3.0.5
+patsy==1.0.3
+pluggy==1.6.0
+pytest==9.1.1
+python-dateutil==2.9.0.post0
+redis==8.1.0
+scipy==1.18.1
+six==1.17.0
+statsmodels==0.15.0
+typing_extensions==4.16.0
+urllib3==2.7.0
+wrapt==2.4.0

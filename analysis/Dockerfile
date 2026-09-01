@@ -12,8 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+# Install from the LOCK, not requirements.txt: the lock carries transitive pins too, so a rebuild
+# resolves to the same set the statistics were validated against rather than whatever is current.
+COPY requirements.txt requirements.lock.txt ./
+RUN pip install --no-cache-dir -r requirements.lock.txt
 
 COPY graze_analysis ./graze_analysis
 COPY experiments ./experiments

@@ -193,6 +193,12 @@ def _scroll_depth_lines(spec: ExperimentSpec, reader: ClickHouseReader) -> list[
     This is a SECONDARY outcome. More scrolling is not unambiguously better: this codebase already
     measured zero-seed users paginating at a ~1s cadence, which is scanning rather than reading. A
     move here is a prompt to investigate, not a result on its own.
+
+    It gets the same anytime-valid treatment as the primary, and for the same reason: it is read
+    hourly. It needed it MORE, not less. On 2026-09-01 this was the only significant-looking number
+    left in the readout once the primary was gated (+14.0%, p=0.0155) -- which is exactly the
+    position a fixed-horizon test should not be trusted from. Being a secondary means it does not
+    move the top-line verdict; it does not mean it may be read loosely.
     """
     if spec.scroll_depth is None:
         return []
@@ -201,11 +207,25 @@ def _scroll_depth_lines(spec: ExperimentSpec, reader: ClickHouseReader) -> list[
     if len(rows) == 0:
         return [f"  scroll_depth (winsorized p{int(q * 100)}): no rows"]
     est = cluster_robust_rate_diff(rows.unit_ids, rows.arm, rows.numerator, rows.denominator)
-    return [
-        f"  scroll_depth (winsorized p{int(q * 100)}, impressions/user): {est.describe()}",
+    # Denominator is 1 per unit here, so this is the winsorized impression COUNT per user, not a
+    # rate. The estimand is labelled accordingly rather than inheriting the default.
+    treated = rows.arm > 0.5
+    per_unit = rows.numerator / np.maximum(rows.denominator, 1.0)
+    seq = always_valid_diff_ci(
+        per_unit[~treated], per_unit[treated], estimand="winsorized impressions/user"
+    )
+    out = [
+        f"  scroll_depth (winsorized p{int(q * 100)}) GATE: {seq.describe()}",
+        f"    {est.describe()}   [fixed-horizon, diagnostic]",
         f"    (secondary outcome; cap declared in the spec, pooled across arms, "
         f"units={len(rows):,})",
     ]
+    if est.significant and not seq.conclusive:
+        out.append(
+            "    !! the fixed-horizon test reads significant and the sequence does not. This line "
+            "is read hourly, so the sequence is the one that holds."
+        )
+    return out
 
 
 def _guardrail_lines(spec: ExperimentSpec, reader: ClickHouseReader) -> list[str]:

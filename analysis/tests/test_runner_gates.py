@@ -425,3 +425,91 @@ def test_cuped_is_reported_but_does_not_move_the_gate():
 
     # The gate itself is byte-identical with and without the covariate.
     assert with_cuped.lines[0] == plain.lines[0], (with_cuped.lines[0], plain.lines[0])
+
+
+# --- The secondary gets the same peeking protection ------------------------------------------
+#
+# scroll_depth is read hourly like everything else. Being a SECONDARY means it does not move the
+# top-line verdict, not that it may be read loosely -- and on 2026-09-01 it was the only
+# significant-looking number left once the primary was gated (+14.0%, p=0.0155).
+
+
+def _scroll_reader(primary, scroll, control=None):
+    class R:
+        def query(self, sql):
+            if "cap AS (" in sql:
+                return scroll
+            return primary if "source = 'fallback'" not in sql else (control or _null_control())
+
+    return R()
+
+
+def test_scroll_depth_carries_its_own_anytime_valid_gate():
+    # Counts vary within arm, so the variance estimate is real rather than float residue.
+    scroll = []
+    for k in range(3):
+        scroll += _uneven(f"sc{k}_", 100, 8 + k, 1, 10000)
+        scroll += _uneven(f"st{k}_", 100, 14 + k, 1, 250)
+    readout = analyse_ab(_scroll_spec(), _scroll_reader(_weight_trap_rows(), scroll))
+
+    gate = next(l for l in readout.lines if "scroll_depth" in l and "GATE" in l)
+    # Labelled as a COUNT, not a rate -- the denominator is 1 per unit here.
+    assert "winsorized impressions/user" in gate, gate
+    assert "unweighted per-unit rate" not in gate, gate
+    assert "arm DIFFERENCE" in gate, gate
+    # A real, large gap in impressions/user must clear it.
+    assert "SEPARATED FROM ZERO" in gate, gate
+
+
+def test_scroll_depths_fixed_horizon_line_is_marked_diagnostic():
+    scroll = _uneven("sc", 150, 8, 1, 10000) + _uneven("st", 150, 9, 1, 250)
+    readout = analyse_ab(_scroll_spec(), _scroll_reader(_weight_trap_rows(), scroll))
+    idx = next(i for i, l in enumerate(readout.lines) if "scroll_depth" in l and "GATE" in l)
+    assert "[fixed-horizon, diagnostic]" in readout.lines[idx + 1], readout.lines[idx + 1]
+    assert "secondary outcome" in readout.lines[idx + 2], readout.lines[idx + 2]
+
+
+def test_a_significant_secondary_whose_sequence_is_quiet_is_flagged_not_believed():
+    """The 2026-09-01 shape: fixed-horizon significant, sequence includes zero.
+
+    NOTE the mechanism differs from the primary's. scroll_depth carries a denominator of 1 per
+    unit, so impression weighting is uniform and both estimands agree exactly (+11.6129 here).
+    The divergence is purely the peeking correction: a boundary of ~3.7 SE against 1.96 SE. A
+    heavy tail is what makes the SE large enough for that to bite -- 10 users of 310 hold most of
+    the mass, which is the real shape of this data.
+    """
+    scroll = (
+        _uneven("scl", 300, 1, 1, 10000)
+        + _uneven("sch", 10, 40, 1, 10000)
+        + _uneven("stl", 300, 1, 1, 250)
+        + _uneven("sth", 10, 400, 1, 250)
+    )
+    readout = analyse_ab(_scroll_spec(), _scroll_reader(_weight_trap_rows(), scroll))
+    idx = next(i for i, l in enumerate(readout.lines) if "scroll_depth" in l and "GATE" in l)
+    gate, fixed = readout.lines[idx], readout.lines[idx + 1]
+
+    # Precondition, asserted rather than assumed: the two genuinely disagree here.
+    assert "SIGNIFICANT" in fixed and "not significant" not in fixed, fixed
+    assert "includes zero" in gate, gate
+    # ...so the reader must be told which one holds.
+    assert "the sequence is the one that holds" in readout.lines[idx + 3], readout.lines[idx + 3]
+
+
+def test_the_secondary_gate_never_moves_the_top_line_verdict():
+    """A secondary may not promote itself into the verdict, gated or not."""
+    # Primary gate is quiet; scroll depth is enormous and clears its own gate.
+    scroll = []
+    for k in range(3):
+        scroll += _uneven(f"sc{k}_", 100, 1 + k, 1, 10000)
+        scroll += _uneven(f"st{k}_", 100, 90 + k, 1, 250)
+    readout = analyse_ab(_scroll_spec(), _scroll_reader(_weight_trap_rows(), scroll))
+
+    scroll_gate = next(l for l in readout.lines if "scroll_depth" in l and "GATE" in l)
+    assert "SEPARATED FROM ZERO" in scroll_gate, scroll_gate
+    # ...and the verdict still reflects the PRIMARY only.
+    assert "NO EFFECT ESTABLISHED" in readout.verdict, readout.render()
+    # The primary's gate leads; the secondary sits below it.
+    assert readout.lines[0].strip().startswith("GATE")
+    primary_at = next(i for i, l in enumerate(readout.lines) if "primary" in l)
+    scroll_at = next(i for i, l in enumerate(readout.lines) if "scroll_depth" in l)
+    assert scroll_at > primary_at

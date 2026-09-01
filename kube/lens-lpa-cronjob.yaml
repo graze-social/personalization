@@ -44,7 +44,7 @@ spec:
           containers:
             - name: lpa
               # Digest-pinned; updated together with the other lens workloads.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9bc76cffb666cd69d83f2153902d06475081fef2c63d1d4b2af356934e554c09
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:08d0376a79c3e20e040abecc98e6e7eb5bcf0d971cacd360b2073954d6ec51e0
               command: ["/app/graze-lens-lpa"]
               resources:
                 requests:

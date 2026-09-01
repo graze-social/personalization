@@ -173,17 +173,22 @@ impl Builder {
     /// The production builder: refuses to publish a lens for a viewer whose
     /// follow history has not been backfilled, and backfills them instead.
     ///
-    /// `interner_redis` is the Redis holding the **lens-owned** id space,
-    /// which now lives alongside the blobs rather than in the shared space on
-    /// the cache Redis. See `interner.rs` for why that split was made and what
-    /// it costs.
-    pub fn with_backfill(
-        redis: Pool,
-        interner_redis: Option<Pool>,
-        config: Config,
-    ) -> anyhow::Result<Self> {
-        let mut builder = Self::new(redis, config)?;
-        builder.interner = interner_redis.map(Interner::lens);
+    /// The lens-owned id space lives on the **same Redis as the blobs**, so the
+    /// interner is derived from `redis` here rather than passed in.
+    ///
+    /// It used to be a separate `Option<Pool>` argument, and that is exactly how
+    /// it broke: `Interner::lens` names the lens keys, but the caller built the
+    /// pool from `REDIS_URL` (the *cache* Redis). So `lensdid:{lensdid}:map`
+    /// existed on two instances at once — 42,049,737 entries on the lens Valkey,
+    /// where `project_rebuild` builds it and feeder-rs reads it, and a private
+    /// 9,499-entry map on the cache Redis that only the builder ever touched.
+    /// Every v2 blob was filled with ids from the small map and stamped with the
+    /// lens idspace byte, so it looked structurally perfect while no author
+    /// lookup on the serve path could ever match. Deriving the interner from the
+    /// blob pool makes the ids and the blobs impossible to separate again.
+    pub fn with_backfill(redis: Pool, config: Config) -> anyhow::Result<Self> {
+        let mut builder = Self::new(redis.clone(), config)?;
+        builder.interner = Some(Interner::lens(redis));
         let cfg = &builder.config;
 
         let http = reqwest::Client::builder()
@@ -978,5 +983,38 @@ mod tests {
     #[test]
     fn query_excludes_empty_followees() {
         assert!(FOLLOWS_QUERY.contains("followee != ''"));
+    }
+
+    fn test_pool() -> Pool {
+        // deadpool builds lazily; nothing connects until a call is made.
+        deadpool_redis::Config::from_url("redis://127.0.0.1:6379")
+            .builder()
+            .expect("pool builder")
+            .max_size(1)
+            .runtime(deadpool_redis::Runtime::Tokio1)
+            .build()
+            .expect("pool")
+    }
+
+    /// The interner must come from the SAME pool the blobs are published to.
+    ///
+    /// This is the invariant whose violation filled every v2 blob with ids from
+    /// a private 9,499-entry map on the cache Redis while the serve path looked
+    /// authors up in the 42M-entry lens space — a lens that could never match,
+    /// behind a blob that decoded perfectly. `with_backfill` no longer accepts a
+    /// separate pool, so the only thing left to pin is that it always builds one
+    /// and builds it in the lens space.
+    #[test]
+    fn interner_is_always_present_and_lens_spaced() {
+        let builder = Builder::with_backfill(test_pool(), Config::for_test()).expect("builder");
+        let interner = builder
+            .interner
+            .as_ref()
+            .expect("v2 must never be silently disabled: no interner means no v2 or follows2");
+        assert_eq!(
+            interner.idspace(),
+            crate::scored::IDSPACE_LENS,
+            "blobs are stamped with this byte; it must match the space the ids came from"
+        );
     }
 }

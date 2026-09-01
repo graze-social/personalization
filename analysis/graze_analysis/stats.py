@@ -303,6 +303,9 @@ class SequentialEstimate:
     n_control: int
     n_treatment: int
     variance_reduction: float = 0.0
+    #: What the difference is *of*. Named because this class is used for a like RATE and for a
+    #: winsorized impression COUNT, and printing "per-unit rate" over a count would misdescribe it.
+    estimand: str = "unweighted per-unit rate"
 
     @property
     def conclusive(self) -> bool:
@@ -317,7 +320,7 @@ class SequentialEstimate:
             f" cuped={self.variance_reduction:.1%}" if self.variance_reduction > 0 else ""
         )
         return (
-            f"anytime-valid on the arm DIFFERENCE (unweighted per-unit rate): "
+            f"anytime-valid on the arm DIFFERENCE ({self.estimand}): "
             f"diff={self.diff:+.4f} ({rel}) CI [{self.low:+.4f}, {self.high:+.4f}] "
             f"units={self.n_control + self.n_treatment}{cuped} "
             f"{'SEPARATED FROM ZERO' if self.conclusive else 'includes zero'}"
@@ -330,6 +333,7 @@ def always_valid_diff_ci(
     alpha: float = 0.05,
     rho: float = 1.0,
     variance_reduction: float = 0.0,
+    estimand: str = "unweighted per-unit rate",
 ) -> SequentialEstimate:
     """Confidence sequence for the DIFFERENCE of two arm means (treatment minus control).
 
@@ -358,6 +362,7 @@ def always_valid_diff_ci(
         return SequentialEstimate(
             diff=float("nan"), rel=float("nan"), low=float("-inf"), high=float("inf"),
             n_control=nc, n_treatment=nt, variance_reduction=variance_reduction,
+            estimand=estimand,
         )
     mc, mt = float(c.mean()), float(t_.mean())
     diff = mt - mc
@@ -379,11 +384,13 @@ def always_valid_diff_ci(
         return SequentialEstimate(
             diff=diff, rel=rel, low=float("-inf"), high=float("inf"),
             n_control=nc, n_treatment=nt, variance_reduction=variance_reduction,
+            estimand=estimand,
         )
     radius = _normal_mixture_radius(var, nc + nt, alpha, rho)
     return SequentialEstimate(
         diff=diff, rel=rel, low=diff - radius, high=diff + radius,
         n_control=nc, n_treatment=nt, variance_reduction=variance_reduction,
+        estimand=estimand,
     )
 
 def insufficient_data_gate(estimate: Estimate, min_observations: int) -> tuple[bool, str]:

@@ -89,7 +89,15 @@ pub struct FeedContextProvenance {
     ///
     /// `no_user_data` (no seed in the like window) | `no_auth` (unauthenticated request) |
     /// `no_algo_posts` (the feed's candidate pool is empty) | `personalization_holdout` |
-    /// `personalization_error`. `None` when the response *was* personalized.
+    /// `personalization_error` | `pool_density` (the feed's candidate pool carries too little like
+    /// signal to rank — `MIN_POOL_SCOREABLE_SHARE`). `None` when the response *was* personalized.
+    ///
+    /// `pool_density` is a gate the engine applies *before* scoring, and was added later than the
+    /// rest: it returned an empty result indistinguishable from "scored and found nothing", so a
+    /// gated response was served as fallback carrying no reason at all. Verified on feed 6445 on
+    /// 2026-09-01: 22 of the 24 items served at 18:00Z had `source=fallback` and no
+    /// `fallback_reason`. Rows written before that fix carry no reason for this cause, so a
+    /// readout spanning the deploy must not read absence as "personalized".
     ///
     /// Exists because this reason was previously only ever written to a log line, so coverage
     /// failures could not be decomposed in ClickHouse and every experiment silently mixed users

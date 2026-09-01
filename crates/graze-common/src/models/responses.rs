@@ -93,6 +93,21 @@ pub struct ResponseMeta {
     /// Scoring time in milliseconds (excluding cache/URI resolution).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoring_time_ms: Option<f64>,
+
+    /// Why scoring was skipped entirely before it ran: `pool_density`. Absent when scoring ran,
+    /// including when it ran and returned nothing.
+    ///
+    /// Exists so `api::feed` can turn a pre-scoring gate into a `fallback_reason` on the
+    /// provenance blob. Before this, the gate returned an empty `ScoringResult` that was
+    /// indistinguishable from "scored and found nothing", so the response was served as fallback
+    /// with no reason recorded at all and the coverage failure could not be decomposed in
+    /// ClickHouse. Verified on feed 6445 on 2026-09-01: 22 of 24 items carried `source=fallback`
+    /// with no `fallback_reason`.
+    ///
+    /// `Option<String>` rather than `&'static str` because this crosses the wire on
+    /// `/v1/personalize`; the reasons themselves are constants on `ScoringResult::skip_reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 /// Response from the personalize endpoint.
@@ -181,4 +196,31 @@ pub struct InvalidateResponse {
 
     /// Message.
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `skip_reason` is absent from the wire unless a gate actually fired.
+    ///
+    /// Same additive property the provenance blob's own fields rely on: a consumer that has never
+    /// heard of this field sees exactly the payload it saw before, and a present value therefore
+    /// means something happened rather than being a default that is always there.
+    #[test]
+    fn skip_reason_is_omitted_unless_a_gate_fired() {
+        let mut meta = ResponseMeta::default();
+        let json = serde_json::to_string(&meta).expect("serialize");
+        assert!(
+            !json.contains("skip_reason"),
+            "a response that scored must not carry skip_reason: {json}"
+        );
+
+        meta.skip_reason = Some("pool_density".to_string());
+        let json = serde_json::to_string(&meta).expect("serialize");
+        assert!(
+            json.contains("\"skip_reason\":\"pool_density\""),
+            "a gated response must carry the reason: {json}"
+        );
+    }
 }

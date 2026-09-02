@@ -1,41 +1,66 @@
+# Network path to the live `personalization-api` Deployment: ClusterIP Service + public Ingress.
+#
+# This file previously described a Service named `graze-personalization-api` selecting
+# `app=graze-personalization,component=api` -- labels no pod in the cluster carries -- and an
+# Ingress on `personalization.internal.example.com`, a placeholder host. Neither object exists.
+# Applying the old file would have created a Service selecting nothing (silently: an empty
+# Endpoints list is not an error) alongside an Ingress routing a domain nobody owns.
+#
+# Both objects below were created imperatively and existed nowhere but in the cluster.
+#
+# Verified against the cluster on 2026-09-02: `kubectl diff -f kube/service.yaml` returns zero
+# bytes and exit 0. Re-run it before trusting this file; it changes nothing.
+#
+# See kube/api-deployment.yaml for the Deployment and kube/api-pdb.yaml for the disruption budget.
 apiVersion: v1
 kind: Service
 metadata:
-  name: graze-personalization-api
-  labels:
-    app: graze-personalization
-    component: api
+  name: personalization-api
 spec:
+  type: ClusterIP
+  # Matches the Deployment's pod label. In-cluster consumers reach this as
+  # `personalization-api` / `personalization-api.default.svc.cluster.local`.
   selector:
-    app: graze-personalization
-    component: api
+    app: personalization-api
   ports:
-    - name: http
-      port: 80
+    - port: 80
       targetPort: 8080
       protocol: TCP
-  type: ClusterIP
 ---
+# Public entrypoint. This is a real, externally-reachable hostname, not an internal one: the
+# service is an ATProto feed generator, so Bluesky's AppView calls getFeedSkeleton here directly.
+# `beta.graze.social` is also the host in FEED_GENERATOR_DID (did:web:beta.graze.social), so the
+# host is load-bearing for DID resolution -- changing it invalidates the service's identity to
+# every client, not just its routing.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: graze-personalization-ingress
-  labels:
-    app: graze-personalization
+  name: personalization-api-ingress
   annotations:
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
-    nginx.ingress.kubernetes.io/proxy-body-size: "1m"
+    # Reproduces live state. `kubernetes.io/ingress.class` is the deprecated form of
+    # `spec.ingressClassName`; it is what the cluster object actually carries, so it is what is
+    # recorded here. Migrating it is a live change, not a documentation change.
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-credentials: "true"
+    nginx.ingress.kubernetes.io/cors-allow-methods: '*'
+    nginx.ingress.kubernetes.io/cors-allow-headers: '*'
+    nginx.ingress.kubernetes.io/cors-allow-origin: '"https://graze.social", "https://*.graze.social", "https://www.graze.social", "https://preprod.graze.social", "https://sky-feeder-git-astro-graze.vercel.app/*", "https://www.sky-feeder-git-astro-graze.vercel.app/*"'
 spec:
-  ingressClassName: nginx
   rules:
-    - host: personalization.internal.example.com
+    - host: beta.graze.social
       http:
         paths:
           - path: /
             pathType: Prefix
             backend:
               service:
-                name: graze-personalization-api
+                name: personalization-api
                 port:
                   number: 80
+  tls:
+    - hosts:
+        - beta.graze.social
+      # Managed by cert-manager via the issuer annotation above; not created by this file.
+      secretName: personalization-api-tls

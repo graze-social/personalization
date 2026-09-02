@@ -1,119 +1,141 @@
+# The live `personalization-api` Deployment, as it actually runs on the DO sfo3 cluster.
+#
+# This file previously described a Deployment named `graze-personalization-api` running
+# `python -m graze_personalization api`. That object does not exist in the cluster, and no
+# `graze_personalization` Python module exists in this repo -- it was a pre-Rust fiction. Applying
+# it would not have touched the running service (different name); it would have stood up a second,
+# broken Deployment beside it.
+#
+# The running Deployment was created imperatively and has only ever been updated imperatively, so
+# until now its spec existed nowhere but in the cluster. Recorded here so it is recoverable and
+# reviewable.
+#
+# ── Before `kubectl apply -f` ──
+#
+# Verified against the cluster on 2026-09-02: `kubectl diff -f kube/api-deployment.yaml` returns
+# zero bytes and exit 0 against revision 58, so applying this file as written is a no-op. Re-run
+# that diff before trusting it -- it is the check, and it changes nothing:
+#
+#   kubectl diff -f kube/api-deployment.yaml
+#
+# The one field that WILL go stale is `image`. It is pinned to a digest, and deploys are
+# `kubectl set image ... @sha256:...`, so every release moves the cluster ahead of this file.
+# The digest below is the one live at revision 58 (2026-09-02, the build of 09402ab), which means
+# a later `apply` ROLLS BACK to it. Check what is actually running first:
+#
+#   kubectl get deploy personalization-api \
+#     -o jsonpath='{.spec.template.spec.containers[0].image}'
+#
+# Two live fields are deliberately absent, and neither causes a diff: the pod template's
+# `kubectl.kubernetes.io/restartedAt` annotation (cluster history from a past `rollout restart`,
+# not desired state -- `apply` leaves it alone because it is not in the object's
+# last-applied-configuration), and the API defaults the server fills in itself
+# (progressDeadlineSeconds, revisionHistoryLimit, dnsPolicy, terminationGracePeriodSeconds, ...).
+#
+# ── Not in this repo, also unmanaged ──
+#
+# Service `personalization-api` (ClusterIP, 80 -> 8080, selector app=personalization-api) and
+# PodDisruptionBudget `personalization-api-pdb` (minAvailable: 2) are live and have no manifest
+# here. `kube/service.yaml` describes a DIFFERENT, non-existent Service. The PDB is load-bearing
+# for the deploy policy: with 3 replicas and minAvailable 2, a rollout can only ever take one pod
+# at a time.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: graze-personalization-api
+  name: personalization-api
   labels:
-    app: graze-personalization
-    component: api
+    app: personalization-api
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: graze-personalization
-      component: api
+      app: personalization-api
+  # Surge-first, and this is the standing deploy policy rather than an incidental default: a new
+  # pod must be Ready before any old pod is taken down, so a rollout cannot dip below full
+  # capacity. Combined with the startupProbe below, a broken image stalls the rollout instead of
+  # draining the fleet.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   template:
     metadata:
       labels:
-        app: graze-personalization
-        component: api
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
-        prometheus.io/path: "/metrics"
+        app: personalization-api
     spec:
       containers:
-        - name: api
-          image: dgaff/graze-personalization:latest
-          command: ["python", "-m", "graze_personalization", "api"]
+        - name: personalization-api
+          # Pinned by digest, never by tag: `latest` and the short-SHA tag are both mutable, and
+          # concurrent release builds from different refs overwrite `latest`.
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:26f088046186175db34b58cd7e32c9e5904c7f18d309787544d0099c9cd68048
+          # Explicit, and NOT the API default for a digest-pinned image (which is IfNotPresent).
+          imagePullPolicy: Always
+          command: ["/app/graze-api"]
           ports:
             - containerPort: 8080
-              name: http
+              protocol: TCP
+          # Bulk config comes from the ConfigMap and secrets; the inline `env` below OVERRIDES and
+          # extends it. Anything set in both places resolves to the inline value, which is why
+          # reading the ConfigMap alone gives a wrong picture of what is live.
+          envFrom:
+            - configMapRef:
+                name: personalization-env
+            - secretRef:
+                name: app-secrets
+            - secretRef:
+                name: personalization-secrets
+          env:
+            # Pool-size gate (step 0 of compute_personalization). Lives here and NOT in the
+            # ConfigMap, which is easy to miss when checking whether the gate is enabled.
+            - name: MIN_CANDIDATE_POOL_FOR_PERSONALIZATION
+              value: "500"
+            - name: AUTHOR_AFFINITY_ENABLED
+              value: "false"
+            - name: DURABLE_PROFILE_SHADOW_MODE
+              value: "1"
+            - name: THOMPSON_PERSIST_ENABLED
+              value: "1"
+            - name: THOMPSON_PERSIST_INTERVAL_SECONDS
+              value: "30"
+            - name: AB_EXPERIMENT_ENABLED
+              value: "0"
+            - name: AB_EXPERIMENT_DIMENSION
+              value: max_sources
+            - name: AB_EXPERIMENT_VALUES
+              value: 250,10000
+            - name: AB_EXPERIMENT_TRAFFIC_PCT
+              value: "100"
+            - name: AB_EXPERIMENT_SALT
+              value: v1
+            # Randomization for the running holdout experiment. Changing this rate moves the arm
+            # boundary and therefore STARTS A NEW EXPERIMENT -- record a fresh start date in the
+            # spec if you touch it.
+            - name: PERSONALIZATION_HOLDOUT_RATE
+              value: "0.20"
+            - name: FOLLOW_SEED_EXPERIMENT_ENABLED
+              value: "1"
+            - name: FOLLOW_SEED_EXPERIMENT_TRAFFIC_PCT
+              value: "100"
+            - name: FOLLOW_SEED_EXPERIMENT_SALT
+              value: v1
+            - name: FOLLOW_SEED_WEIGHT_MODE
+              value: uniform
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "250m"
+              cpu: 100m
+              memory: 768Mi
             limits:
-              memory: "512Mi"
-              cpu: "1000m"
-          env:
-            - name: REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: redis-url
-            - name: CLICKHOUSE_HOST
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: clickhouse-host
-            - name: CLICKHOUSE_PORT
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: clickhouse-port
-            - name: CLICKHOUSE_USER
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: clickhouse-user
-            - name: CLICKHOUSE_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: clickhouse-password
-            - name: CLICKHOUSE_SECURE
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: clickhouse-secure
-            - name: ADMIN_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: admin-api-key
-            - name: WORKER_TYPE
-              value: "api"
-            - name: HTTP_WORKERS
-              value: "1"
-            - name: PERSONALIZATION_HOLDOUT_RATE
-              value: "0"
-            - name: DEFAULT_MAX_USER_LIKES
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: default-max-user-likes
-            - name: DEFAULT_MAX_SOURCES_PER_POST
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: default-max-sources-per-post
-            - name: DEFAULT_MAX_TOTAL_SOURCES
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: default-max-total-sources
-            - name: DEFAULT_MIN_CO_LIKES
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: default-min-co-likes
-            - name: INVERTED_MIN_POST_LIKES
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: default-min-post-likes
-            - name: INVERTED_MAX_LIKERS_PER_POST
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: default-max-likers-per-post
+              cpu: 500m
+              memory: 2Gi
           # startupProbe, NOT readinessProbe, for the Redis-dependent check.
           #
           # /internal/ready returns 503 when a Redis ping fails. All replicas share one Valkey, so
-          # as a readinessProbe a single blip fails readiness on every pod simultaneously and empties
-          # the Service -- a correlated total outage, strictly worse than serving degraded responses.
-          # This repo already has that failure mode on record elsewhere: a readiness check tied to an
-          # upstream dependency is what wedged network-cache on grazer-prod2 for hours.
+          # as a readinessProbe a single blip fails readiness on every pod simultaneously and
+          # empties the Service -- a correlated total outage, strictly worse than serving degraded
+          # responses. This repo already has that failure mode on record elsewhere: a readiness
+          # check tied to an upstream dependency is what wedged network-cache on grazer-prod2 for
+          # hours.
           #
           # As a startupProbe it gates initial traffic until Redis is connected and is then never
           # evaluated again, so a later blip cannot take pods out of rotation. 3s x 40 = up to 120s
@@ -126,9 +148,9 @@ spec:
             timeoutSeconds: 3
             failureThreshold: 40
           # /internal/alive is a static 200, so it cannot correlate-fail on a dependency. This is
-          # what actually fixes the rollout gap: without any readinessProbe, Kubernetes marks a pod
-          # Ready the instant the container starts and routes traffic to it before the HTTP listener
-          # is accepting connections.
+          # what actually closes the rollout gap: with no readinessProbe at all, Kubernetes marks a
+          # pod Ready the instant the container starts and routes traffic to it before the HTTP
+          # listener is accepting connections.
           readinessProbe:
             httpGet:
               path: /internal/alive
@@ -136,11 +158,6 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
-          securityContext:
-            runAsNonRoot: true
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
+      imagePullSecrets:
+        - name: dockerhub-secret
+        - name: docr-graze-social-labs

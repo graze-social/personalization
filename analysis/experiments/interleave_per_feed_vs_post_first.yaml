@@ -34,6 +34,15 @@ negative_controls:
 
 min_observations: 200
 
+# Units floor on DECIDED USERS -- see the note in interleave_self_check.yaml. Higher than the
+# self-check's 40 because this spec forms a real verdict: 100 decided users resolves roughly a
+# 61/39 split.
+#
+# ⚠️ THIS SPEC'S `start` IS STILL A PLACEHOLDER AND MUST BE RESET WHEN IT IS ENABLED. It is not
+# scheduled and no arm has ever been served, so resetting it now would only invent a window during
+# which nothing ran.
+min_units: 100
+
 notes: >
   READ THE SEED KEEP RATE BEFORE THE PREFERENCE. The treatment shrinks the seed by construction, and
   there are two very different ways it can win or lose. If keep_rate is healthy (say >0.3) the result

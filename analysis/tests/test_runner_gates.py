@@ -807,3 +807,69 @@ def test_a_genuinely_flat_control_gets_no_such_warning():
     readout = analyse_ab(_spec(), FakeReader(primary, flat))
     joined = "\n".join(readout.lines)
     assert "passes only for lack of" not in joined, joined
+
+
+# --- The interleaving readout's units floor -----------------------------------------------------
+#
+# `min_observations` counts TAGGED IMPRESSIONS; the verdict is a sign test over DECIDED USERS, and
+# the two diverge freely. The A/B path got a units floor on 2026-09-02 after forming a verdict from
+# 239 units; this path never called `insufficient_data_gate`, so it did not inherit one.
+
+
+def _il_spec():
+    from graze_analysis.spec import load_spec
+
+    return load_spec("experiments/interleave_self_check.yaml")
+
+
+class _IlReader:
+    """(unit_id, treatment_wins, control_wins, tagged_impressions)"""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def query(self, sql):
+        return self.rows
+
+
+def test_many_tagged_impressions_from_few_users_is_withheld():
+    """The pathology: the impression floor clears while the sign test rests on three people."""
+    spec = _il_spec()
+    # 3 decided users carrying 100 tagged impressions each -> 300 tagged, over the 100 floor.
+    readout = run(spec, _IlReader([(f"u{i}", 4, 0, 100) for i in range(3)]))
+    assert "WITHHELD" in readout.verdict, readout.render()
+    assert "too few decided users" in readout.verdict, readout.verdict
+    joined = "\n".join(readout.lines)
+    assert "only 3 user(s) expressed a preference" in joined, joined
+    # It must name the number the verdict would have rested on, and distinguish it from impressions.
+    assert "not the 300 tagged impressions" in joined, joined
+    # No verdict may leak out.
+    assert "TREATMENT WINS" not in readout.verdict
+
+
+def test_the_units_floor_does_not_block_a_clean_self_check():
+    """A clean self-check has ZERO decided users -- the floor must not turn its pass into a hold."""
+    spec = _il_spec()
+    readout = run(spec, _IlReader([(f"u{i}", 0, 0, 5) for i in range(60)]))
+    assert "NO PREFERENCE" in readout.verdict, readout.render()
+    assert "WITHHELD" not in readout.verdict
+
+
+def test_no_tagged_impressions_reads_as_a_self_check_pass_not_a_shortfall():
+    """Confirmed live 2026-09-02: identical rankers gave competitive_pairs=0 on every draft."""
+    spec = _il_spec()
+    readout = run(spec, _IlReader([]))
+    assert "SELF-CHECK CLEAN" in readout.verdict, readout.render()
+    joined = "\n".join(readout.lines)
+    assert "no competitive pair can form" in joined, joined
+    # The bare "WITHHELD (no tagged impressions)" wording must not be what a self-check shows.
+    assert readout.verdict != "WITHHELD (no tagged impressions)"
+
+
+def test_a_real_comparison_with_no_tagged_rows_is_still_withheld():
+    """Only a SELF-check may read zero-tagged as a pass; differing arms cannot."""
+    from graze_analysis.spec import load_spec
+
+    spec = load_spec("experiments/interleave_per_feed_vs_post_first.yaml")
+    readout = run(spec, _IlReader([]))
+    assert readout.verdict == "WITHHELD (no tagged impressions)", readout.render()

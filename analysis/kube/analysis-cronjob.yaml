@@ -31,7 +31,7 @@ spec:
             - name: dockerhub-secret
           containers:
             - name: analysis
-              image: dgaff/graze-analysis@sha256:cf397a9139eb24f622d8e72c0ba74d6dde36fd4e74774aecbbfaf14f0eb4d9d6
+              image: dgaff/graze-analysis@sha256:3c1d7b3647d6b6781b2c79ed55273a5366a1a69bee2ab1a612abf3a4074c7913
               # Override the entrypoint so one job runs both the experiment readouts and the
               # density-drift guard. The guard exits non-zero only on a *detection* (a feed that has
               # already stopped being personalized), so a real regression shows up as a failed Job
@@ -49,10 +49,17 @@ spec:
                     experiments/follow_seed.yaml \
                     experiments/max_sources_250_vs_10000.yaml
                   contract=$?
+                  # interleave_self_check is read but deliberately NOT contract-checked above.
+                  # The contract asserts a spec's arm field is present in live data; a CLEAN
+                  # self-check writes no `ranker` value at all, by design, so requiring the field
+                  # to be present would invert the test and fail exactly when the harness is
+                  # working. Its pass condition is "no tagged impressions", which the runner
+                  # reports as SELF-CHECK CLEAN.
                   python -m graze_analysis.runner \
                     experiments/personalization_holdout.yaml \
                     experiments/follow_seed.yaml \
-                    experiments/max_sources_250_vs_10000.yaml
+                    experiments/max_sources_250_vs_10000.yaml \
+                    experiments/interleave_self_check.yaml
                   readout=$?
                   python -m graze_analysis.drift
                   drift=$?

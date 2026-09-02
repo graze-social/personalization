@@ -123,10 +123,16 @@ fn graze_api_hash_experiment(config: &crate::config::Config) -> crate::algorithm
     }
 }
 
-/// Map a pre-scoring skip reported by the engine onto a provenance `fallback_reason`.
+/// Map a skip reported by the engine — a bail-out before any scoring ran — onto a provenance
+/// `fallback_reason`.
 ///
 /// Returns a `'static` reason so the caller can hold it in `fallback_reason` past the response it
 /// was read from — the reason is a compile-time constant on both sides, only the wire type differs.
+///
+/// Two of these are config gates (`pool_size`, `pool_density`) and one is not: `no_colikers` is the
+/// engine finding an empty graph around a seed that does exist. They share this channel because
+/// they share the symptom it was built for — an empty `ScoringResult` that the handler cannot tell
+/// apart from "scored and found nothing" — not because they have the same fix.
 ///
 /// A value this build does not recognise maps to `None` rather than being passed through:
 /// `fallback_reason` is a closed set that ClickHouse readouts group by, and an unknown category is
@@ -135,6 +141,7 @@ fn skip_reason_to_fallback_reason(skip: Option<&str>) -> Option<&'static str> {
     match skip {
         Some("pool_density") => Some("pool_density"),
         Some("pool_size") => Some("pool_size"),
+        Some("no_colikers") => Some("no_colikers"),
         _ => None,
     }
 }
@@ -1224,9 +1231,9 @@ pub async fn get_feed_skeleton(
                             .collect();
                         was_personalized = !base_posts_tagged.is_empty();
 
-                        // A pre-scoring gate returns Ok with nothing scored, so this response is
-                        // fallback — and until the engine reported *why*, it was fallback with no
-                        // reason recorded at all, which is the one case `fallback_reason` could not
+                        // A skip returns Ok with nothing scored, so this response is fallback —
+                        // and until the engine reported *why*, it was fallback with no reason
+                        // recorded at all, which is the one case `fallback_reason` could not
                         // decompose. Only fills a slot nothing else has claimed, so a reason set
                         // earlier on this path (holdout, exhausted) still wins.
                         if fallback_reason.is_none() {
@@ -1765,7 +1772,7 @@ mod tests {
     /// here shows up as an obviously-unfinished change rather than as a silently unlabelled row.
     #[test]
     fn every_engine_skip_reason_maps_to_a_fallback_reason() {
-        for reason in ["pool_density", "pool_size"] {
+        for reason in ["pool_density", "pool_size", "no_colikers"] {
             assert_eq!(
                 skip_reason_to_fallback_reason(Some(reason)),
                 Some(reason),

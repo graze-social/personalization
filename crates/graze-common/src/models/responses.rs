@@ -94,15 +94,19 @@ pub struct ResponseMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scoring_time_ms: Option<f64>,
 
-    /// Why scoring was skipped entirely before it ran: `pool_density` | `pool_size`. Absent when
-    /// scoring ran, including when it ran and returned nothing.
+    /// Why scoring was skipped entirely before it ran: `pool_density` | `pool_size` |
+    /// `no_colikers`. Absent when scoring ran, including when it ran and returned nothing.
     ///
-    /// Exists so `api::feed` can turn a pre-scoring gate into a `fallback_reason` on the
-    /// provenance blob. Before this, both gates returned an empty `ScoringResult` that was
-    /// indistinguishable from "scored and found nothing", so the response was served as fallback
-    /// with no reason recorded at all and the coverage failure could not be decomposed in
-    /// ClickHouse. Verified on feed 6445 on 2026-09-01: 22 of 24 items carried `source=fallback`
-    /// with no `fallback_reason`.
+    /// Exists so `api::feed` can turn a bail-out that happened before scoring into a
+    /// `fallback_reason` on the provenance blob. Before this, each of them returned an empty
+    /// `ScoringResult` that was indistinguishable from "scored and found nothing", so the response
+    /// was served as fallback with no reason recorded at all and the coverage failure could not be
+    /// decomposed in ClickHouse. Verified on feed 6445 on 2026-09-01: 22 of 24 items carried
+    /// `source=fallback` with no `fallback_reason`.
+    ///
+    /// `pool_density` and `pool_size` are feed-level config gates. `no_colikers` is not: it is the
+    /// co-liker walk returning nothing for a user who did have seed, which is why it is a separate
+    /// value from `no_user_data` rather than folded into it.
     ///
     /// `Option<String>` rather than `&'static str` because this crosses the wire on
     /// `/v1/personalize`; the reasons themselves are constants on `ScoringResult::skip_reason`.

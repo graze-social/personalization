@@ -717,7 +717,26 @@ impl LinkLonkAlgorithm {
                 use_author_affinity = params.use_author_affinity,
                 "early_exit: no coliker weights found"
             );
-            return Ok(ScoringResult::default());
+            // The last unlabelled early exit in this function, and so the one that stopped
+            // "no fallback_reason implies personalized" from being true. Everything above this
+            // point either returned a labelled skip or produced weights; reaching here means the
+            // walk ran and the graph gave back nothing.
+            //
+            // NOT `no_user_data`, deliberately. The feed handler already turned away every user
+            // without seed before `compute_personalization` was called, so anyone arriving here
+            // was admitted on seed the handler could see: like seed in the retention window, or
+            // follows when the follow-seed read is on. The seed exists and the graph around it is
+            // empty -- a connectivity failure, addressable by the co-liker parameters and the
+            // durable/follow seed work, whereas `no_user_data` is addressable only by getting the
+            // user to like something. Collapsing the two would hide which lever applies.
+            //
+            // Reached both from an empty co-liker walk (`coliker.rs`, "no co-likers found for any
+            // liked posts") and from the durable-profile and follow-seed hooks above declining to
+            // produce weights. Measured on the fleet 2026-09-02, 12h across 3 pods: 3 occurrences.
+            return Ok(ScoringResult {
+                skip_reason: Some("no_colikers"),
+                ..Default::default()
+            });
         }
 
         // Step 2: Score posts using co-liker weights

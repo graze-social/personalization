@@ -29,10 +29,34 @@ design: ab
 # under-powered, it was measuring a different and less meaningful quantity, so nothing interpretable
 # is discarded by resetting.
 #
-# The four windows before this measured nothing at all -- see the git history of this file: the arm
+# The four windows before that measured nothing at all -- see the git history of this file: the arm
 # never reached the seed step, then was absent from no_user_data rows, then hung off a disabled
 # branch, then was blocked by the pre-personalization seed gate.
-start: "2026-08-31T16:49:48Z"
+#
+# ---------------------------------------------------------------------------------------------
+# START, 2026-09-02T14:37:55Z. SIXTH start, and the first reset for a reason unrelated to the
+# arms: the ESTIMAND changed. primary_metric moved like_rate -> scroll_depth (PR #69, merged at
+# exactly this timestamp), and that metric's value on the previous window had already been read
+# (-0.2173, CI [-2.9344, +2.4999], p=0.7861) before it was promoted. Judging a primary on the
+# data used to choose it is what the winsorize_quantile note below forbids, so that data is
+# discarded rather than reinterpreted.
+#
+# ⚠️ NOTE WHAT DID *NOT* CHANGE. FOLLOW_SEED_EXPERIMENT_SALT is still v1 and TRAFFIC_PCT still
+# 100, so the hash boundary has NOT moved and NO USER IS REASSIGNED. Unlike the five resets
+# above, this one re-randomizes nothing; it only drops already-inspected rows. Enrolment,
+# eligibility and delivery are untouched, and the dose evidence stands.
+#
+# ⚠️ THE DOSE CHECK'S `FOLLOW_SEED_FLIP_AT` IS DELIBERATELY LEFT AT 2026-08-31 16:49:48 AND MUST
+# NOT BE "FIXED" TO MATCH THIS. That bound exists because rows written before the arm was ever
+# assigned carry no `follow_seed` key, and an absent JSON field extracts as false -- it is about
+# arm PRESENCE, not about the estimand. The arms did not change here, so all delivery evidence
+# since the original flip remains valid, and moving the bound would discard two days of dose data
+# for nothing. The two timestamps differ on purpose; that is not drift.
+#
+# COST, stated plainly: the 268 units accrued under the old primary are discarded. At the observed
+# ~5.7 eligible users/hour the 500-unit floor is roughly 88 hours (~3.7 days) out. Nothing to do
+# in the meantime -- WITHHELD is the correct state and does not mean "check again sooner".
+start: "2026-09-02T14:37:55Z"
 
 unit: user
 # PRIMARY CHANGED 2026-09-02: like_rate -> scroll_depth.

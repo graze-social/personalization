@@ -10,21 +10,27 @@
 # until now its spec existed nowhere but in the cluster. Recorded here so it is recoverable and
 # reviewable.
 #
-# ── Before `kubectl apply -f` ──
+# ── `image` is a PLACEHOLDER. Substitute the live digest before applying or diffing. ──
 #
-# Verified against the cluster on 2026-09-02: `kubectl diff -f kube/api-deployment.yaml` returns
-# zero bytes and exit 0 against revision 58, so applying this file as written is a no-op. Re-run
-# that diff before trusting it -- it is the check, and it changes nothing:
+# This file records the deployment's STRUCTURE. It deliberately does not record which image is
+# running, because it cannot: deploys are `kubectl set image ... @sha256:<digest>`, so the cluster
+# moves ahead of this file on every release. A digest pinned here was wrong by default -- and its
+# real effect was worse than useless, because `kubectl apply -f` would silently ROLL THE FLEET
+# BACK to whatever stale digest the file happened to hold. That drifted within an hour of this
+# file first being written.
 #
-#   kubectl diff -f kube/api-deployment.yaml
+# So the tag below resolves to nothing on purpose. Applied as-is it fails closed: the new pod
+# cannot pull, and because the strategy is maxUnavailable 0 the rollout stalls with the old pods
+# still serving. A loud stall beats a silent rollback.
 #
-# The one field that WILL go stale is `image`. It is pinned to a digest, and deploys are
-# `kubectl set image ... @sha256:...`, so every release moves the cluster ahead of this file.
-# The digest below is the one live at revision 58 (2026-09-02, the build of 09402ab), which means
-# a later `apply` ROLLS BACK to it. Check what is actually running first:
+# Both diffing and applying take the same shape -- read the live digest, substitute, pipe:
 #
-#   kubectl get deploy personalization-api \
-#     -o jsonpath='{.spec.template.spec.containers[0].image}'
+#   DIGEST=$(kubectl get deploy personalization-api \
+#     -o jsonpath='{.spec.template.spec.containers[0].image}')
+#   sed "s|^\( *\)image: .*|\1image: $DIGEST|" kube/api-deployment.yaml | kubectl diff -f -
+#
+# Swap `diff` for `apply` to apply. The diff is the check on everything except the image, and it
+# changes nothing; it returned zero bytes against revision 58 on 2026-09-02.
 #
 # Two live fields are deliberately absent, and neither causes a diff: the pod template's
 # `kubectl.kubernetes.io/restartedAt` annotation (cluster history from a past `rollout restart`,
@@ -66,9 +72,11 @@ spec:
     spec:
       containers:
         - name: personalization-api
-          # Pinned by digest, never by tag: `latest` and the short-SHA tag are both mutable, and
-          # concurrent release builds from different refs overwrite `latest`.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:26f088046186175db34b58cd7e32c9e5904c7f18d309787544d0099c9cd68048
+          # PLACEHOLDER -- see the header. Substitute the live digest before applying.
+          #
+          # Real deploys pin a DIGEST and never a tag: `latest` and the short-SHA tag are both
+          # mutable, and concurrent release builds from different refs overwrite `latest`.
+          image: registry.digitalocean.com/graze-social-labs/personalization:PLACEHOLDER-SEE-HEADER
           # Explicit, and NOT the API default for a digest-pinned image (which is IfNotPresent).
           imagePullPolicy: Always
           command: ["/app/graze-api"]

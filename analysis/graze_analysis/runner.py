@@ -9,6 +9,7 @@ caveat second.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ import numpy as np
 
 from .data import (
     METRIC_EVENTS,
+    Rows,
     scroll_depth_sql,
     ClickHouseReader,
     ab_rows_sql,
@@ -53,10 +55,53 @@ class Readout:
 
 
 
+#: How each supported primary metric is described on the gate line. The default label would call a
+#: winsorized impression COUNT a "rate", which it is not.
+PRIMARY_ESTIMANDS = {
+    "scroll_depth": "winsorized impressions/user",
+}
+
+
+def _primary_metric_rows(
+    spec: ExperimentSpec, reader: ClickHouseReader, where_extra: str = ""
+) -> "Rows":
+    """Rows for whichever metric the spec nominates as primary.
+
+    `primary_metric` was declared in every spec from the start and READ BY NOTHING: `analyse_ab`
+    called `ab_rows_sql(spec)`, whose numerator defaults to a like, so the primary was always the
+    like rate no matter what the YAML said. A spec asking for `request_more_rate` would have been
+    answered with like_rate, silently. Same failure shape as the rest of this file's history: a
+    declaration the code did not implement.
+
+    Negative controls route through here too, so a control is always measured on the same metric as
+    the primary it guards.
+    """
+    if spec.primary_metric == "scroll_depth":
+        quantile = spec.scroll_depth.winsorize_quantile
+        return rows_from_ab_result(
+            reader.query(scroll_depth_sql(spec, quantile, where_extra=where_extra)), spec
+        )
+    event = METRIC_EVENTS[spec.primary_metric]
+    return rows_from_ab_result(
+        reader.query(ab_rows_sql(spec, where_extra=where_extra, numerator_event=event)), spec
+    )
+
+
 def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
     lines: list[str] = []
 
-    primary_rows = rows_from_ab_result(reader.query(ab_rows_sql(spec)), spec)
+    # Unknown primary is FATAL, unlike an unknown guardrail (which is skipped loudly). There is no
+    # readout without a primary, and silently substituting one is how `primary_metric` came to be
+    # ignored in the first place.
+    if spec.primary_metric != "scroll_depth" and spec.primary_metric not in METRIC_EVENTS:
+        known = ", ".join(sorted({*METRIC_EVENTS, "scroll_depth"}))
+        return Readout(
+            spec.id,
+            "WITHHELD (unknown primary metric)",
+            [f"  primary_metric {spec.primary_metric!r} is not measurable here (known: {known})"],
+        )
+
+    primary_rows = _primary_metric_rows(spec, reader)
     primary = cluster_robust_rate_diff(
         primary_rows.unit_ids, primary_rows.arm, primary_rows.numerator, primary_rows.denominator
     )
@@ -69,7 +114,7 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
     # --- Gate 2: negative controls, before the effect is shown ---
     verdicts: list[ControlVerdict] = []
     for nc in spec.negative_controls:
-        rows = rows_from_ab_result(reader.query(ab_rows_sql(spec, where_extra=nc.where)), spec)
+        rows = _primary_metric_rows(spec, reader, where_extra=nc.where)
         est = cluster_robust_rate_diff(
             rows.unit_ids, rows.arm, rows.numerator, rows.denominator
         )
@@ -82,6 +127,25 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
             )
         )
         lines.append(f"  control {nc.name}: {est.describe()}")
+        # A control that passes only because it is too thin to reach significance is not
+        # protection, and it renders identically to a genuinely flat one. Measured 2026-09-02 on
+        # the scroll_depth primary: pinned_and_rotating had 44 units against the primary's 267 and
+        # a point estimate of -0.8727 against the primary's -0.4633 -- nearly double, same
+        # direction -- and cleared the gate purely for lack of significance. Say so, in the same
+        # spirit as the guardrail lines' event counts.
+        if (
+            not est.significant
+            and math.isfinite(est.diff)
+            and math.isfinite(primary.diff)
+            and abs(est.diff) >= abs(primary.diff)
+        ):
+            share = est.n_units / primary.n_units if primary.n_units else float("nan")
+            lines.append(
+                f"    !! this control's point estimate ({est.diff:+.4f}) is at least as large as "
+                f"the primary's ({primary.diff:+.4f}) and it passes only for lack of "
+                f"significance, on {est.n_units} units ({share:.0%} of the primary's). Weak "
+                "protection, not a clean placebo."
+            )
 
     withheld, gate_msg = negative_control_gate(verdicts)
     if withheld:
@@ -128,12 +192,22 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
     if spec.cuped_covariate:
         pre = {str(u): (float(l), float(s_)) for u, l, s_ in reader.query(cuped_covariate_sql(spec))}
         covered = np.array([u in pre and pre[u][1] > 0 for u in primary_rows.unit_ids])
-        cov = np.array(
-            [
-                (pre[u][0] / pre[u][1]) if u in pre and pre[u][1] else 0.0
-                for u in primary_rows.unit_ids
-            ]
-        )
+        # `pre_period_impressions` uses the raw pre-window impression count; anything else uses
+        # the pre-window like RATE. Which one is right depends on the primary: adjusting a
+        # winsorized impression count by a like rate buys almost nothing on a population whose
+        # like rate is ~0 (measured 3.4% reduction), while its own past impressions predict it
+        # strongly. The covariate must match the outcome or CUPED is decoration.
+        if spec.cuped_covariate == "pre_period_impressions":
+            cov = np.array(
+                [float(pre[u][1]) if u in pre else 0.0 for u in primary_rows.unit_ids]
+            )
+        else:
+            cov = np.array(
+                [
+                    (pre[u][0] / pre[u][1]) if u in pre and pre[u][1] else 0.0
+                    for u in primary_rows.unit_ids
+                ]
+            )
         imbalance, p_bal = covariate_balance(cov, treated, covered)
         adjusted, reduction = cuped_adjust(per_unit_rate, cov)
         # A covariate the treatment moved would subtract real signal. Fall back rather than guess.
@@ -148,7 +222,10 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
         applied_reduction = 0.0
 
     seq = always_valid_diff_ci(
-        outcome[~treated], outcome[treated], variance_reduction=applied_reduction
+        outcome[~treated],
+        outcome[treated],
+        variance_reduction=applied_reduction,
+        estimand=PRIMARY_ESTIMANDS.get(spec.primary_metric, "unweighted per-unit rate"),
     )
 
     lines.insert(0, f"  GATE     : {seq.describe()}")
@@ -226,7 +303,9 @@ def _scroll_depth_lines(spec: ExperimentSpec, reader: ClickHouseReader) -> list[
     position a fixed-horizon test should not be trusted from. Being a secondary means it does not
     move the top-line verdict; it does not mean it may be read loosely.
     """
-    if spec.scroll_depth is None:
+    if spec.scroll_depth is None or spec.primary_metric == "scroll_depth":
+        # When it IS the primary it is already the gate; repeating it as a "secondary" would
+        # invite reading the same number twice as if it were corroboration.
         return []
     q = spec.scroll_depth.winsorize_quantile
     rows = rows_from_ab_result(reader.query(scroll_depth_sql(spec, q)), spec)

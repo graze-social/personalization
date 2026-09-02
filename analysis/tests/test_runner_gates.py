@@ -269,7 +269,15 @@ def test_scroll_depth_sql_pools_the_cap_across_arms():
     sql = scroll_depth_sql(_scroll_spec(), 0.9)
     cap = sql[sql.index("cap AS ("): sql.index("SELECT\n  unit_id")]
     assert "quantile(0.9)" in cap
-    assert "arm_value IN (10000, 250)" in cap, "cap must be computed over BOTH arms"
+    # The cap aggregates the per-unit CTE in full, and that CTE is the only place arms are
+    # restricted -- to BOTH of them. Asserted structurally rather than by looking for the arm
+    # filter inside `cap`: the filter legitimately moved into `u` when scroll_depth gained a
+    # where_extra, and a per-arm cap would show up as a GROUP BY / extra predicate here.
+    assert "FROM u" in cap, cap
+    assert "arm_value" not in cap, f"cap must not restrict by arm: {cap}"
+    assert "GROUP BY" not in cap, f"cap must not be computed per arm: {cap}"
+    unit_cte = sql[sql.index("u AS ("): sql.index("cap AS (")]
+    assert "arm_value IN (10000, 250)" in unit_cte, unit_cte
     # The cast matters: least() on UInt64 and Float64 is an illegal-type error in ClickHouse.
     assert "least(toFloat64(impressions)" in sql
     # One row per unit, so the clustered SE reduces to the ordinary one.
@@ -635,3 +643,167 @@ def test_both_floors_are_named_when_they_pass():
     assert not thin
     assert "79473 observations / 2658 units" in msg, msg
     assert "2000 / 500 minimums" in msg, msg
+
+
+# --- primary_metric actually selects the metric --------------------------------------------------
+#
+# It was declared in every spec from the start and READ BY NOTHING: analyse_ab called
+# ab_rows_sql(spec), whose numerator defaults to a like, so the primary was always the like rate no
+# matter what the YAML said. These tests check the value REACHES the query, not merely that it
+# parses -- the distinction that let six earlier bugs through.
+
+
+class _RecordingReader:
+    """Captures every SQL it is asked for, so we can assert what was actually queried."""
+
+    def __init__(self, rows, control=None):
+        self.rows = rows
+        self.control = control or _null_control()
+        self.sqls = []
+
+    def query(self, sql):
+        self.sqls.append(sql)
+        if "source = 'fallback'" in sql or "source IN" in sql:
+            return self.control
+        return self.rows
+
+
+def _scroll_rows(prefix, n, count, arm):
+    """Scroll-depth shaped rows: the capped impression count, denominator 1."""
+    return [(f"{prefix}{i}", arm, count, 1) for i in range(n)]
+
+
+def test_primary_metric_selects_the_queried_event():
+    rows = _uneven("c", 150, 1, 20, 10000) + _uneven("t", 150, 2, 20, 250)
+    r = _RecordingReader(rows)
+    analyse_ab(_spec(primary_metric="request_more_rate"), r)
+    assert any("requestMore" in q for q in r.sqls), "primary_metric did not reach the query"
+    # And the like event is not what the primary was drawn from.
+    primary_sql = r.sqls[0]
+    assert "requestMore" in primary_sql, primary_sql
+    assert "interactionLike" not in primary_sql, primary_sql
+
+
+def test_an_unknown_primary_metric_is_fatal_not_substituted():
+    r = _RecordingReader(_uneven("c", 10, 1, 20, 10000))
+    readout = analyse_ab(_spec(primary_metric="vibes"), r)
+    assert "WITHHELD" in readout.verdict and "unknown primary metric" in readout.verdict
+    assert "'vibes' is not measurable" in "\n".join(readout.lines)
+    assert "scroll_depth" in "\n".join(readout.lines), "the known set should be listed"
+    # Nothing was queried, so nothing could be silently substituted.
+    assert r.sqls == []
+
+
+def _scroll_primary_spec(**over):
+    return _spec(
+        primary_metric="scroll_depth",
+        scroll_depth={"winsorize_quantile": 0.9},
+        min_observations=200,
+        min_units=100,
+        **over,
+    )
+
+
+def test_scroll_depth_as_primary_drives_the_gate_and_is_labelled_as_a_count():
+    rows = []
+    for k in range(3):
+        rows += _scroll_rows(f"c{k}_", 100, 6 + k, 10000)
+        rows += _scroll_rows(f"t{k}_", 100, 14 + k, 250)
+    r = _RecordingReader(rows)
+    readout = analyse_ab(_scroll_primary_spec(), r)
+
+    assert "cap AS (" in r.sqls[0], "the primary must come from the winsorized query"
+    gate = readout.lines[0]
+    assert "winsorized impressions/user" in gate, gate
+    assert "unweighted per-unit rate" not in gate, gate
+    assert "SEPARATED FROM ZERO" in gate, gate
+
+
+def test_scroll_depth_is_not_also_printed_as_a_secondary_when_it_is_the_primary():
+    """Repeating the same number as a 'secondary' would read as corroboration."""
+    rows = []
+    for k in range(3):
+        rows += _scroll_rows(f"c{k}_", 100, 6 + k, 10000)
+        rows += _scroll_rows(f"t{k}_", 100, 7 + k, 250)
+    readout = analyse_ab(_scroll_primary_spec(), _RecordingReader(rows))
+    assert not any("secondary outcome" in l for l in readout.lines), readout.render()
+    assert sum("winsorized" in l for l in readout.lines) == 1, readout.render()
+
+
+def test_the_negative_control_is_measured_on_the_primarys_metric():
+    """A like-rate control cannot guard a scroll-depth primary."""
+    rows = []
+    for k in range(3):
+        rows += _scroll_rows(f"c{k}_", 100, 6 + k, 10000)
+        rows += _scroll_rows(f"t{k}_", 100, 14 + k, 250)
+    r = _RecordingReader(rows, control=_scroll_rows("nc", 60, 4, 10000) + _scroll_rows("nt", 60, 4, 250))
+    analyse_ab(_scroll_primary_spec(), r)
+    control_sqls = [q for q in r.sqls if "source = 'fallback'" in q]
+    assert control_sqls, "no negative control was queried"
+    for q in control_sqls:
+        assert "cap AS (" in q, "control was measured on a different metric than the primary"
+
+
+def test_a_scroll_depth_primary_without_its_block_is_rejected_at_load():
+    from graze_analysis.spec import SpecError, spec_from_dict
+
+    body = {
+        "id": "t", "design": "ab", "start": "2026-08-12T09:11:56Z", "unit": "user",
+        "primary_metric": "scroll_depth",
+        "arms": {
+            "control": {"field": "params.max_total_sources", "value": 10000},
+            "treatment": {"field": "params.max_total_sources", "value": 250},
+        },
+        "negative_controls": [
+            {"name": "fallback", "reason": "no causal path", "where": "source = 'fallback'"}
+        ],
+    }
+    try:
+        spec_from_dict(body)
+    except SpecError as e:
+        assert "requires a 'scroll_depth' block" in str(e), str(e)
+    else:
+        raise AssertionError("a scroll_depth primary with no cap declared must not load")
+
+
+def test_a_control_that_passes_only_for_lack_of_power_says_so():
+    """A thin control renders identically to a flat one, which reads as protection it isn't.
+
+    Measured 2026-09-02 with the scroll_depth primary: pinned_and_rotating had 44 units against the
+    primary's 267 and a point estimate of -0.8727 against the primary's -0.4633 -- nearly double,
+    same direction -- and cleared the gate purely for lack of significance.
+    """
+    # Primary: a modest difference on many units. Control: a LARGER point estimate on far fewer,
+    # and high-variance (mostly zeros plus a few maxed-out users) so its SE keeps it insignificant.
+    # That combination -- not significant, yet moving more than the primary -- is the pathology.
+    primary = []
+    for k in range(3):
+        primary += _uneven(f"pc{k}_", 100, k, 20, 10000)
+        primary += _uneven(f"pt{k}_", 100, k + 1, 20, 250)
+    control = (
+        _uneven("kz", 20, 0, 20, 10000)
+        + _uneven("kh", 2, 20, 20, 10000)
+        + _uneven("tz", 20, 0, 20, 250)
+        + _uneven("th", 6, 20, 20, 250)
+    )
+
+    readout = analyse_ab(_spec(), FakeReader(primary, control))
+    joined = "\n".join(readout.lines)
+    # It must not have withheld -- the control is not significant...
+    assert "WITHHELD" not in readout.verdict, readout.render()
+    # ...but the reader must be told the pass was for lack of power.
+    assert "passes only for lack of" in joined, joined
+    assert "Weak protection, not a clean placebo" in joined, joined
+    assert "% of the primary's)" in joined, joined
+
+
+def test_a_genuinely_flat_control_gets_no_such_warning():
+    primary = []
+    for k in range(3):
+        primary += _uneven(f"pc{k}_", 100, k, 20, 10000)
+        primary += _uneven(f"pt{k}_", 100, k + 4, 20, 250)
+    # Same rate in both arms, on a healthy number of units.
+    flat = _uneven("fc", 150, 2, 20, 10000) + _uneven("ft", 150, 2, 20, 250)
+    readout = analyse_ab(_spec(), FakeReader(primary, flat))
+    joined = "\n".join(readout.lines)
+    assert "passes only for lack of" not in joined, joined

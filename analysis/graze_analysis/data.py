@@ -239,7 +239,7 @@ def rows_from_ab_result(
     )
 
 
-def scroll_depth_sql(spec: ExperimentSpec, quantile: float) -> str:
+def scroll_depth_sql(spec: ExperimentSpec, quantile: float, where_extra: str = "") -> str:
     """One row per (unit, arm) carrying that unit's winsorized impression count.
 
     Shaped as numerator/denominator with a denominator of 1 so the same cluster-robust estimator can
@@ -248,6 +248,16 @@ def scroll_depth_sql(spec: ExperimentSpec, quantile: float) -> str:
 
     The cap is a POOLED quantile across both arms. Capping per arm would make the cap itself an
     outcome of the treatment and bias the comparison by construction.
+
+    ``where_extra`` exists so this metric can serve as a PRIMARY, not only a secondary: negative
+    controls are mandatory, and a control must be measured on the same metric as the primary it
+    guards. A like-rate control guarding a scroll-depth primary would be checking a surface the
+    verdict no longer rests on.
+
+    Note the CTE shape, which mirrors :func:`ab_rows_sql` for a reason: ``source`` is a JSON field
+    rather than a column, so a restriction like ``source IN ('pinned','rotating')`` can only be
+    applied where that field has been projected. Filtering inside the row scan also means the
+    pooled cap is computed over the restricted set, which is what a subset's quantile means.
     """
     control = spec.arms["control"]
     treatment = next(a for n, a in spec.arms.items() if n != "control")
@@ -257,26 +267,30 @@ def scroll_depth_sql(spec: ExperimentSpec, quantile: float) -> str:
     unit_col = "did" if spec.unit == "user" else "concat(did, '|', toString(occurred))"
     end_clause = f"AND occurred <= toDateTime('{spec.end:%Y-%m-%d %H:%M:%S}')" if spec.end else ""
     population = f"AND ({spec.population})" if spec.population else ""
+    extra = f"AND {where_extra}" if where_extra else ""
 
     return f"""
-WITH u AS (
+WITH d AS (
   SELECT
     {unit_col} AS unit_id,
     {arm_expr} AS arm_value,
-    count() AS impressions
+    JSONExtractString({decoded}, 'source') AS source
   FROM default.feed_interactions
   WHERE occurred >= toDateTime('{spec.start:%Y-%m-%d %H:%M:%S}')
     {end_clause}
     AND interaction_feed_context != ''
     {population}
     AND interaction_event = '{SEEN}'
+),
+u AS (
+  SELECT unit_id, arm_value, count() AS impressions
+  FROM d
+  WHERE arm_value IN ({_sql_literal(control.value)}, {_sql_literal(treatment.value)}) {extra}
   GROUP BY unit_id, arm_value
   HAVING impressions > 0
 ),
 cap AS (
-  SELECT quantile({quantile})(impressions) AS c
-  FROM u
-  WHERE arm_value IN ({_sql_literal(control.value)}, {_sql_literal(treatment.value)})
+  SELECT quantile({quantile})(impressions) AS c FROM u
 )
 SELECT
   unit_id,
@@ -284,5 +298,4 @@ SELECT
   least(toFloat64(impressions), (SELECT c FROM cap)) AS likes,
   1 AS seen
 FROM u
-WHERE arm_value IN ({_sql_literal(control.value)}, {_sql_literal(treatment.value)})
 """

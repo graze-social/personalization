@@ -1,0 +1,27 @@
+# Disruption budget for the live `personalization-api` Deployment.
+#
+# Created imperatively 2026-08-27 and existed nowhere but in the cluster until now. There is no
+# manifest for it elsewhere in this repo.
+#
+# This is load-bearing for the standing deploy policy, not decoration. With 3 replicas and
+# minAvailable 2, at most one pod can be unavailable at a time -- so a voluntary disruption (node
+# drain, cluster upgrade, `kubectl delete pod`) can never take two replicas down together. It
+# reinforces the Deployment's own maxSurge 1 / maxUnavailable 0 from the other direction: the
+# rollout strategy bounds what a DEPLOY does, and this bounds what the CLUSTER does to us.
+#
+# Consequence worth knowing: with exactly 3 replicas this leaves disruptionsAllowed=1, so a node
+# drain that needs two personalization pods evicted will block on the second until the first is
+# rescheduled and Ready. That is the intended trade -- the Deployment has no HPA and is fixed at 3,
+# so there is no headroom to give away.
+#
+# Verified against the cluster on 2026-09-02: `kubectl diff -f kube/api-pdb.yaml` returns zero
+# bytes and exit 0.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: personalization-api-pdb
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: personalization-api

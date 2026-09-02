@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
         // from the dirty set in Redis and never consults the active-viewer cache,
         // so it needs no state from the streamer's copy and sharing one would
         // only add a lock on the hot path.
-        let sweeper = DeltaApplier::new(pool, metrics.clone(), config.set_ttl_seconds);
+        let sweeper = DeltaApplier::new(pool.clone(), metrics.clone(), config.set_ttl_seconds);
         let interval = config.dirty_sweep_interval;
         info!(
             sweep_seconds = interval.as_secs(),
@@ -64,10 +64,29 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Incremental traversal projection: keeps `follow_graph_int`'s content
+    // current between nightly rebuilds. Ids are looked up, never allocated —
+    // see `delta_projection` for why that is correctness and not thrift.
+    let projector = if config.delta_projection_enabled {
+        let interner = graze_common::lens_interner::Interner::lens(pool.clone());
+        let sink = Sink::new(config.clickhouse.clone(), config.insert_timeout).context("sink")?;
+        info!("incremental traversal projection enabled");
+        Some(graze_lens_fold::DeltaProjector::new(
+            interner,
+            sink,
+            metrics.clone(),
+        ))
+    } else {
+        info!(
+            "incremental traversal projection disabled; second degree is as of the nightly rebuild"
+        );
+        None
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     serve_metrics(config.metrics_port, metrics.clone());
 
-    let streamer = Streamer::new(config, cursor, sink, metrics, deltas);
+    let streamer = Streamer::new(config, cursor, sink, metrics, deltas, projector);
     let run = streamer.run(shutdown_rx);
 
     tokio::select! {

@@ -8,7 +8,10 @@
 pub mod builder;
 pub mod config;
 pub mod domain;
-pub mod interner;
+// The interner moved to graze-common so graze-lens-fold can use it too: the
+// builder depends on the fold, so the fold cannot depend back on the builder.
+// Re-exported under the old path so every `crate::interner::…` still resolves.
+pub use graze_common::lens_interner as interner;
 pub mod priors;
 pub mod queue;
 pub mod scored;

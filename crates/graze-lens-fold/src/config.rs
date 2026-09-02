@@ -36,6 +36,12 @@ pub struct Config {
     /// fresher and costs more ClickHouse work per changed viewer; the coalescing
     /// means it costs nothing extra per *event*.
     pub dirty_sweep_interval: Duration,
+    /// Whether to keep the traversal projection current between nightly rebuilds.
+    ///
+    /// Off is the old behaviour: second-degree facets see the graph as of the
+    /// last nightly rebuild. There is a kill switch because this writes to a
+    /// table every facet query reads.
+    pub delta_projection_enabled: bool,
     /// Life extension applied to a set each time a delta lands. Long on
     /// purpose: with deltas keeping it correct, an actively-read set should
     /// never expire, and expiry becomes a garbage-collector for readers who
@@ -73,6 +79,7 @@ impl Config {
             read_timeout_seconds: parse("LENS_FOLD_READ_TIMEOUT_SECONDS", 45)?,
 
             deltas_enabled: parse("LENS_FOLD_DELTAS_ENABLED", true)?,
+            delta_projection_enabled: parse("LENS_FOLD_DELTA_PROJECTION_ENABLED", true)?,
             dirty_sweep_interval: Duration::from_secs(parse("LENS_FOLD_DIRTY_SWEEP_SECONDS", 30)?),
             active_refresh_interval: Duration::from_secs(parse(
                 "LENS_FOLD_ACTIVE_REFRESH_SECONDS",

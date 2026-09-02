@@ -33,6 +33,16 @@
 //! that, a blob built in one space and read in another resolves every lookup to
 //! the wrong account and looks like a lens with strange taste, not a broken one.
 
+/// Blob header byte for the space rust-smasher and membership-service share.
+pub const IDSPACE_SHARED: u8 = 0;
+/// Blob header byte for the lens-owned space.
+///
+/// ⚠️ This records the space the builder *intended*, not where the ids came
+/// from. It is not a provenance guard — a blob filled from the wrong Redis still
+/// carries whichever byte the code stamped. See
+/// `memory/community-facet-not-personalized.md`.
+pub const IDSPACE_LENS: u8 = 1;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -87,7 +97,7 @@ impl Interner {
             redis,
             map_key: DIDINT_MAP,
             seq_key: DIDINT_SEQ,
-            idspace: crate::scored::IDSPACE_SHARED,
+            idspace: IDSPACE_SHARED,
             cache: Arc::new(DashMap::new()),
         }
     }
@@ -98,7 +108,7 @@ impl Interner {
             redis,
             map_key: LENSDID_MAP,
             seq_key: LENSDID_SEQ,
-            idspace: crate::scored::IDSPACE_LENS,
+            idspace: IDSPACE_LENS,
             cache: Arc::new(DashMap::new()),
         }
     }
@@ -115,6 +125,53 @@ impl Interner {
     ///
     /// Order is not preserved; the caller gets a map, because every caller here
     /// wants lookup rather than position.
+    /// Ids for the DIDs that ALREADY have one. Allocates nothing.
+    ///
+    /// The counterpart to `intern_many`, and the right primitive for anything
+    /// reading the firehose. Interning every account that flies past would grow
+    /// this hash by roughly 19M entries a day — it already holds ~42M, on a Redis
+    /// where depth is an outage budget.
+    ///
+    /// Dropping unknown accounts is also the *correct* semantics rather than a
+    /// concession: `follow_graph_int` is built with INNER joins against the id
+    /// map, so an account without an id is already absent from the projection.
+    /// A delta that invented ids would describe edges the base table cannot, and
+    /// the two would disagree about who exists. Unknown accounts are picked up by
+    /// the nightly job's bounded interning, exactly as today.
+    pub async fn lookup_many(&self, dids: &[String]) -> anyhow::Result<HashMap<String, u32>> {
+        let mut out = HashMap::with_capacity(dids.len());
+        let mut unknown: Vec<&String> = Vec::new();
+
+        for did in dids {
+            match self.cache.get(did) {
+                Some(id) => {
+                    out.insert(did.clone(), *id);
+                }
+                None => unknown.push(did),
+            }
+        }
+        if unknown.is_empty() {
+            return Ok(out);
+        }
+
+        let mut conn = self.redis.get().await?;
+        for chunk in unknown.chunks(INTERN_CHUNK) {
+            let mut cmd = deadpool_redis::redis::cmd("HMGET");
+            cmd.arg(self.map_key);
+            for did in chunk {
+                cmd.arg(did.as_str());
+            }
+            let ids: Vec<Option<u32>> = cmd.query_async(&mut conn).await?;
+            for (did, id) in chunk.iter().zip(ids) {
+                if let Some(id) = id {
+                    self.cache.insert((*did).clone(), id);
+                    out.insert((*did).clone(), id);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn intern_many(&self, dids: &[String]) -> anyhow::Result<HashMap<String, u32>> {
         let mut out = HashMap::with_capacity(dids.len());
         let mut missing: Vec<String> = Vec::new();

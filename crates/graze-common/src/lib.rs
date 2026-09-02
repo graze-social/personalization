@@ -10,6 +10,7 @@ pub mod clickhouse;
 pub mod coliker_profile;
 pub mod error;
 pub mod exclusion;
+pub mod lens_interner;
 pub mod metrics_server;
 pub mod models;
 pub mod post_id;

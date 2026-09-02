@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::cursor::Cursor;
 use crate::delta::DeltaApplier;
+use crate::delta_projection::DeltaProjector;
 use crate::event::{self, FollowEdge, FOLLOW_COLLECTION};
 use crate::metrics::Metrics;
 use crate::sink::Sink;
@@ -27,6 +28,7 @@ pub struct Streamer {
     /// Keeps already-published lens sets fresh. `None` disables live
     /// maintenance and falls back to sets expiring on their TTL.
     deltas: Option<DeltaApplier>,
+    projector: Option<DeltaProjector>,
 }
 
 impl Streamer {
@@ -36,6 +38,7 @@ impl Streamer {
         sink: Sink,
         metrics: Metrics,
         deltas: Option<DeltaApplier>,
+        projector: Option<DeltaProjector>,
     ) -> Self {
         Self {
             config,
@@ -43,6 +46,7 @@ impl Streamer {
             sink,
             metrics,
             deltas,
+            projector,
         }
     }
 
@@ -203,6 +207,13 @@ impl Streamer {
         match self.sink.insert(batch).await {
             Ok(()) => {
                 self.metrics.rows_written.inc_by(batch.len() as u64);
+                // Only after the raw insert succeeded: the delta is a derived
+                // view, and a row in it whose edge never landed in `follow_edges`
+                // would survive the nightly compaction as a phantom the base
+                // table cannot account for.
+                if let Some(projector) = &self.projector {
+                    projector.project(batch).await;
+                }
                 batch.clear();
                 *start = None;
                 if let Err(e) = self.cursor.commit(last_seq).await {

@@ -53,8 +53,7 @@ pub const ENTRY_LEN: usize = 6;
 /// lookup simply resolves to the wrong person, which reads as a lens that
 /// filters strangely rather than one that is broken. Stamping the space here
 /// turns that into a blob the reader refuses.
-pub const IDSPACE_SHARED: u8 = 0;
-pub const IDSPACE_LENS: u8 = 1;
+pub use graze_common::lens_interner::{IDSPACE_LENS, IDSPACE_SHARED};
 
 /// Facet ids. Stored as one byte in the header so a reader can reject a blob
 /// built for a different signal rather than silently ranking by the wrong one.

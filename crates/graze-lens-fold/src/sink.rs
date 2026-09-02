@@ -44,6 +44,53 @@ impl Sink {
         })
     }
 
+    /// Insert projected delta rows: `(follower_int, followee_int, seq)`.
+    ///
+    /// Straight to `follow_graph_int_delta`, NOT through a Buffer table. The
+    /// buffer exists to coalesce the raw stream's one-row-at-a-time writes; these
+    /// arrive already batched by the caller, and a Buffer would only add up to
+    /// 100s of invisibility to the freshness this whole path exists to provide.
+    ///
+    /// `op` is written explicitly rather than defaulted, so the column reads the
+    /// same whether or not the resolving delete pass has landed yet.
+    pub async fn insert_delta(&self, rows: &[(u32, u32, u64)]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let body = rows
+            .iter()
+            .map(|(follower, followee, seq)| format!("{follower}\t{followee}\tcreate\t{seq}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let query = format!(
+            "INSERT INTO {}.{} (follower_int, followee_int, op, seq) FORMAT TabSeparated",
+            self.clickhouse.database,
+            crate::delta_projection::DELTA_TABLE
+        );
+
+        let response = self
+            .http
+            .post(self.clickhouse.base_url())
+            .basic_auth(&self.clickhouse.user, Some(&self.clickhouse.password))
+            .header("Content-Type", "text/plain")
+            .timeout(self.timeout)
+            .query(&[("query", query.as_str())])
+            .body(body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "delta insert failed ({}): {}",
+                status,
+                &text[..text.len().min(600)]
+            );
+        }
+        Ok(())
+    }
+
     /// Insert a batch. Returns `Ok(())` only when ClickHouse accepted every row.
     pub async fn insert(&self, edges: &[FollowEdge]) -> anyhow::Result<()> {
         if edges.is_empty() {

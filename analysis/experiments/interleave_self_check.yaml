@@ -5,7 +5,11 @@
 # harness rather than of a ranker, and must be fixed before a real comparison is trusted.
 id: interleave_self_check
 design: interleaving
-start: "2026-08-13T00:00:00Z"
+# START, 2026-09-02T15:36:38Z -- the moment INTERLEAVE_ENABLED/SELF_CHECK went live on
+# personalization-api at TRAFFIC_PCT=10. Reset from a stale 2026-08-13 placeholder: rows from
+# before enrolment existed carry no ranker tag and would have been counted as clean when they were
+# merely absent.
+start: "2026-09-02T15:36:38Z"
 unit: user
 primary_metric: preference
 
@@ -23,6 +27,15 @@ negative_controls:
     where: "source = 'fallback'"
 
 min_observations: 100
+
+# Units floor. `min_observations` counts TAGGED IMPRESSIONS; the verdict is a sign test over
+# DECIDED USERS, and the two diverge freely. 40 decided users is the point at which a two-sided
+# sign test can resolve roughly a 67/33 preference split -- a floor against a verdict that is
+# simply wrong, not a power guarantee.
+#
+# It does NOT gate this spec's expected result. A clean self-check has zero decided users by
+# construction, which the runner reports as SELF-CHECK CLEAN before the floor is consulted.
+min_units: 40
 
 notes: >
   Expected outcome: zero tagged impressions and zero users with a preference. This validates

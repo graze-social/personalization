@@ -392,6 +392,24 @@ def analyse_interleaving(spec: ExperimentSpec, reader: ClickHouseReader) -> Read
     """Per-user preference readout for a team-draft experiment."""
     rows = reader.query(interleaving_rows_sql(spec))
     if not rows:
+        # For a SELF-CHECK this is the PASS condition, not a shortfall: identical rankers produce
+        # identical lists, every item is shared, and a shared item is deliberately left untagged.
+        # Confirmed live 2026-09-02 -- every `interleave_draft` reported competitive_pairs=0 with
+        # control_scored == treatment_scored. Spelled out because "WITHHELD" otherwise reads as a
+        # failure and the distinction decides whether the harness is trusted.
+        control = spec.arms["control"]
+        treatment = next(a for n, a in spec.arms.items() if n != "control")
+        if control.value == treatment.value:
+            return Readout(
+                spec.id,
+                "SELF-CHECK CLEAN (no tagged impressions, as designed)",
+                [
+                    f"  both arms are {control.value!r}, so no competitive pair can form and no "
+                    "item may carry a ranker tag",
+                    "  zero tagged impressions is the expected result here -- the drafting, "
+                    "enrolment and provenance path are all exercised without tagging anything",
+                ],
+            )
         return Readout(spec.id, "WITHHELD (no tagged impressions)", ["  no interleaved items found"])
 
     tau = np.array([float(t) - float(c) for _, t, c, _ in rows])
@@ -421,6 +439,23 @@ def analyse_interleaving(spec: ExperimentSpec, reader: ClickHouseReader) -> Read
             "(the harness's own negative control)"
         )
         return Readout(spec.id, "NO PREFERENCE (self-check clean)", lines)
+
+    # UNITS FLOOR. `min_observations` above counts TAGGED IMPRESSIONS, but the verdict below is a
+    # sign test over DECIDED USERS, and the two diverge freely -- 200 tagged impressions
+    # concentrated in three users would otherwise produce a verdict from three data points. The A/B
+    # path got this floor on 2026-09-02 after forming a verdict from 239 units; this path never
+    # called `insufficient_data_gate` at all, so it did not inherit it.
+    #
+    # Placed AFTER the decided == 0 branch on purpose: a clean self-check legitimately has zero
+    # decided users, and gating it here would turn the harness's own pass condition into a
+    # permanent WITHHELD.
+    if decided < spec.min_units:
+        lines.append(
+            f"  only {decided} user(s) expressed a preference, below the {spec.min_units} "
+            "minimum. The sign test runs over decided users, so that is the number the verdict "
+            f"would rest on -- not the {tagged} tagged impressions."
+        )
+        return Readout(spec.id, "WITHHELD (too few decided users)", lines)
 
     # Sign test on users, which respects the unit of randomization.
     p = _two_sided_binomial(prefer_t, decided)

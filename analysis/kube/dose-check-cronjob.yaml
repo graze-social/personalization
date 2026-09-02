@@ -145,7 +145,7 @@ spec:
                 name: personalization-dose-check-src
           containers:
             - name: dose
-              image: dgaff/graze-analysis@sha256:cf397a9139eb24f622d8e72c0ba74d6dde36fd4e74774aecbbfaf14f0eb4d9d6
+              image: dgaff/graze-analysis@sha256:3c1d7b3647d6b6781b2c79ed55273a5366a1a69bee2ab1a612abf3a4074c7913
               command: ["python", "/src/dose.py"]
               volumeMounts:
                 - name: src

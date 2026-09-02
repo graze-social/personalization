@@ -178,7 +178,7 @@ impl LinkLonkAlgorithm {
         let result_key = Keys::cached_result(algo_id, &user_hash);
         let ttl = self.redis.ttl(&result_key).await?;
 
-        let (posts, cached, cache_age_seconds, scoring_stats) =
+        let (posts, cached, cache_age_seconds, scoring_stats, skip_reason) =
             if ttl > self.config.stale_refresh_threshold_seconds as i64 {
                 // Fresh cache exists - use it
                 let posts = self.get_cached_posts(&result_key, limit, cursor).await?;
@@ -187,6 +187,9 @@ impl LinkLonkAlgorithm {
                     true,
                     Some((params.result_ttl_seconds as i64 - ttl) as u32),
                     None, // No scoring stats for cached results
+                    // A cache hit means an earlier compute cleared the gates, so there is no skip
+                    // to report. A gated compute writes no cache, so it cannot be replayed as one.
+                    None,
                 )
             } else {
                 // Need to compute fresh results
@@ -254,7 +257,7 @@ impl LinkLonkAlgorithm {
                         compute_result.requires_preserved_order,
                     )
                     .await?;
-                (posts, false, Some(0), stats)
+                (posts, false, Some(0), stats, compute_result.skip_reason)
             };
 
         let compute_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
@@ -285,6 +288,7 @@ impl LinkLonkAlgorithm {
                 posts_checked,
                 colikers_used: None, // Tracked at co-liker level
                 scoring_time_ms,
+                skip_reason: skip_reason.map(str::to_string),
             },
         })
     }
@@ -501,6 +505,11 @@ impl LinkLonkAlgorithm {
             // Whichever arm faceted the seed reported its keep rate; carry it so an interleaved
             // readout can still tell a ranking effect from a coverage collapse.
             seed_keep_rate: treatment.seed_keep_rate.or(control.seed_keep_rate),
+            // Neither draft can carry one — both come from `score_with_ranker`, which is only
+            // reached once the gates have passed. Propagated rather than hardcoded to `None` so
+            // that if a gate ever moves inside the ranker path, the reason survives the merge
+            // instead of being silently dropped here.
+            skip_reason: treatment.skip_reason.or(control.skip_reason),
         }
     }
 
@@ -547,6 +556,7 @@ impl LinkLonkAlgorithm {
                 );
                 return Ok(ScoringResult {
                     posts_checked: pool_size,
+                    skip_reason: Some("pool_size"),
                     ..Default::default()
                 });
             }
@@ -602,7 +612,10 @@ impl LinkLonkAlgorithm {
                             scoreable_floor = floor,
                             "early_exit: pool like-density below personalization gate"
                         );
-                        return Ok(ScoringResult::default());
+                        return Ok(ScoringResult {
+                            skip_reason: Some("pool_density"),
+                            ..Default::default()
+                        });
                     }
                 }
             }

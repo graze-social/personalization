@@ -123,6 +123,22 @@ fn graze_api_hash_experiment(config: &crate::config::Config) -> crate::algorithm
     }
 }
 
+/// Map a pre-scoring skip reported by the engine onto a provenance `fallback_reason`.
+///
+/// Returns a `'static` reason so the caller can hold it in `fallback_reason` past the response it
+/// was read from — the reason is a compile-time constant on both sides, only the wire type differs.
+///
+/// A value this build does not recognise maps to `None` rather than being passed through:
+/// `fallback_reason` is a closed set that ClickHouse readouts group by, and an unknown category is
+/// better reported as absent than as one nobody has defined.
+fn skip_reason_to_fallback_reason(skip: Option<&str>) -> Option<&'static str> {
+    match skip {
+        Some("pool_density") => Some("pool_density"),
+        Some("pool_size") => Some("pool_size"),
+        _ => None,
+    }
+}
+
 /// Build feedContext provenance for one item and encode to base64 string.
 /// feed_uri must always be provided—the client echoes this back with interactions
 /// and we rely on it for ClickHouse storage.
@@ -1062,6 +1078,8 @@ pub async fn get_feed_skeleton(
                         let posts_checked = result.meta.posts_checked.unwrap_or(0);
                         let posts_scored = result.meta.total_scored.unwrap_or(0);
                         let _scoring_time_ms = result.meta.scoring_time_ms.unwrap_or(0.0);
+                        // Read before `result` is consumed below.
+                        let skip_reason = result.meta.skip_reason.clone();
 
                         // Collect post IDs that need conversion to URIs
                         let posts_to_convert: Vec<String> = result
@@ -1205,6 +1223,16 @@ pub async fn get_feed_skeleton(
                             .take(limit)
                             .collect();
                         was_personalized = !base_posts_tagged.is_empty();
+
+                        // A pre-scoring gate returns Ok with nothing scored, so this response is
+                        // fallback — and until the engine reported *why*, it was fallback with no
+                        // reason recorded at all, which is the one case `fallback_reason` could not
+                        // decompose. Only fills a slot nothing else has claimed, so a reason set
+                        // earlier on this path (holdout, exhausted) still wins.
+                        if fallback_reason.is_none() {
+                            fallback_reason =
+                                skip_reason_to_fallback_reason(skip_reason.as_deref());
+                        }
                         response_thompson_meta = Some(ResponseThompsonMeta {
                             params: thompson_params.clone(),
                             response_time_ms: total_response_time_ms,
@@ -1730,6 +1758,39 @@ pub async fn send_interactions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The gates the engine can report, and the reason each becomes in the provenance blob.
+    ///
+    /// Kept as one table so adding a gate to `compute_personalization` without giving it a label
+    /// here shows up as an obviously-unfinished change rather than as a silently unlabelled row.
+    #[test]
+    fn every_engine_skip_reason_maps_to_a_fallback_reason() {
+        for reason in ["pool_density", "pool_size"] {
+            assert_eq!(
+                skip_reason_to_fallback_reason(Some(reason)),
+                Some(reason),
+                "{reason} must reach the provenance blob"
+            );
+        }
+    }
+
+    /// Scoring that ran and returned nothing is NOT a skip, and must not be labelled as one.
+    ///
+    /// This is the distinction the field exists to preserve: "we refused to look" is a feed-level
+    /// property that a different feed configuration would fix, whereas "we looked and found
+    /// nothing" is a user-level one. Collapsing them would recreate the ambiguity in a new place.
+    #[test]
+    fn no_skip_yields_no_fallback_reason() {
+        assert_eq!(skip_reason_to_fallback_reason(None), None);
+    }
+
+    /// An unrecognised value is reported as absent rather than passed through, so a blob written
+    /// by a newer build can never introduce a category this build's readouts do not define.
+    #[test]
+    fn an_unknown_skip_reason_is_not_passed_through() {
+        assert_eq!(skip_reason_to_fallback_reason(Some("something_new")), None);
+        assert_eq!(skip_reason_to_fallback_reason(Some("")), None);
+    }
 
     /// The cache previously stored bare URIs, so every item read back was relabelled
     /// `PostLevelPersonalization` — silently mis-attributing fallback and author-affinity

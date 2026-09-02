@@ -88,6 +88,17 @@ pub struct ScoringResult {
     /// collapse: a keep rate near zero means the treatment was effectively "no personalization",
     /// which would otherwise look like a ranking finding.
     pub seed_keep_rate: Option<f64>,
+    /// Why scoring was skipped entirely before it ran, when it was.
+    ///
+    /// `pool_density` (the feed's like-density gate fired) | `pool_size` (the feed's candidate
+    /// pool is below the personalization gate). `None` whenever scoring actually ran, including
+    /// when it ran and produced nothing — "we refused to look" and "we looked and found nothing"
+    /// are different coverage failures and the whole point of this field is to keep them apart.
+    ///
+    /// `&'static str` rather than `String` because every value is a compile-time constant, and
+    /// because the consumer in `api::feed` needs a `'static` reason it can hold past the response
+    /// it came from.
+    pub skip_reason: Option<&'static str>,
 }
 
 impl ScoringResult {
@@ -712,6 +723,9 @@ impl Scorer {
             seed_keep_rate: None,
             ranker_by_post: Default::default(),
             requires_preserved_order: false,
+            // Scoring ran to completion here; an empty result from this path means "looked and
+            // found nothing", which is deliberately not a skip.
+            skip_reason: None,
         })
     }
 
@@ -1248,6 +1262,9 @@ impl Scorer {
             seed_keep_rate: None,
             ranker_by_post: Default::default(),
             requires_preserved_order: false,
+            // Scoring ran to completion here; an empty result from this path means "looked and
+            // found nothing", which is deliberately not a skip.
+            skip_reason: None,
         })
     }
 }
@@ -1255,6 +1272,16 @@ impl Scorer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A default result carries no skip reason, so only a gate can produce one.
+    ///
+    /// Load-bearing because `ScoringResult::default()` is what several "nothing to do" paths
+    /// return. If the default ever gained a reason, every one of those would be relabelled as a
+    /// gate that never fired.
+    #[test]
+    fn a_default_result_reports_no_skip() {
+        assert_eq!(ScoringResult::default().skip_reason, None);
+    }
 
     #[test]
     fn overlap_buckets_cover_every_count_monotonically() {

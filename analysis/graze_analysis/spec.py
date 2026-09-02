@@ -128,6 +128,19 @@ class ExperimentSpec:
     population: str | None = None
     #: Minimum competitive pairs / observations before any verdict is reported.
     min_observations: int = 200
+    #: Minimum UNITS of randomization before any verdict is reported.
+    #:
+    #: Separate from `min_observations` because every estimand here is per-UNIT while that floor
+    #: counts impressions, and the two diverge wildly. Measured 2026-09-02: follow_seed formed a
+    #: verdict on obs=2037 (over its 2000 floor) drawn from just **239 users** — roughly 8.5
+    #: impressions per unit against the holdout's 30. An impression floor is not a unit floor.
+    #:
+    #: This is a floor against estimates that are simply WRONG, exactly as `min_observations` is
+    #: (see `insufficient_data_gate`), and explicitly NOT a power guarantee. No units floor could
+    #: have rescued that readout: the eligible population's per-unit like rate is ~0.015%, so the
+    #: interval is ~13x the base rate and separating from zero would need a >1000% effect. That is
+    #: a metric problem, not a sample-size problem, and it is not this gate's job to hide it.
+    min_units: int = 500
     notes: str = ""
 
     def assert_not_post_treatment(self, *fields: str) -> None:
@@ -243,6 +256,7 @@ def spec_from_dict(raw: dict[str, Any], source: str = "<dict>") -> ExperimentSpe
             raw.get("post_treatment_fields", DEFAULT_POST_TREATMENT_FIELDS)
         ),
         min_observations=int(raw.get("min_observations", 200)),
+        min_units=int(raw.get("min_units", 500)),
         notes=str(raw.get("notes", "")),
     )
 

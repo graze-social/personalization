@@ -26,6 +26,10 @@ def _spec(**over):
             {"name": "fallback", "reason": "no causal path", "where": "source = 'fallback'"}
         ],
         "min_observations": 200,
+        # Lowered for the same reason min_observations is: these fixtures are ~300 units and exist
+        # to exercise negative controls, guardrails and ordering, not the sample floors. The
+        # floors themselves are tested explicitly further down.
+        "min_units": 100,
     }
     body.update(over)
     return spec_from_dict(body)
@@ -562,3 +566,72 @@ def test_the_secondary_gate_never_moves_the_top_line_verdict():
     primary_at = next(i for i, l in enumerate(readout.lines) if "primary" in l)
     scroll_at = next(i for i, l in enumerate(readout.lines) if "scroll_depth" in l)
     assert scroll_at > primary_at
+
+
+# --- The sample floors, in both denominations -------------------------------------------------
+#
+# `min_observations` counts IMPRESSIONS while every estimand here is per-UNIT, and the two diverge
+# wildly. Measured 2026-09-02: follow_seed cleared its 2000-observation floor with obs=2037 drawn
+# from 239 users -- ~8.5 impressions per unit against the holdout's 30 -- and formed a verdict. The
+# obs floor had never been a units guard and nothing said so.
+
+
+def test_a_verdict_is_withheld_when_units_are_thin_even_if_observations_are_not():
+    """The 2026-09-02 shape: impression floor cleared, unit count nowhere near enough."""
+    # 60 users carrying 40 impressions each: obs=2400 clears a 2000 floor, units=60 does not.
+    primary = _uneven("c", 30, 1, 40, 10000) + _uneven("t", 30, 3, 40, 250)
+    readout = analyse_ab(
+        _spec(min_observations=2000, min_units=500), FakeReader(primary, _null_control())
+    )
+    assert "WITHHELD" in readout.verdict, readout.render()
+    joined = "\n".join(readout.lines)
+    assert "60 units is below the 500 minimum" in joined, joined
+    # It must say the obs floor was NOT the problem, or the reader will chase the wrong number.
+    assert "observations were fine at 2400" in joined, joined
+    # And no effect size is printed at all.
+    assert not any("GATE" in line for line in readout.lines)
+
+
+def test_the_observations_floor_still_reports_first_when_both_fail():
+    primary = _uneven("c", 5, 1, 4, 10000) + _uneven("t", 5, 2, 4, 250)
+    readout = analyse_ab(
+        _spec(min_observations=2000, min_units=500), FakeReader(primary, _null_control())
+    )
+    joined = "\n".join(readout.lines)
+    assert "observations is below" in joined, joined
+    assert "units is below" not in joined, joined
+
+
+def test_the_units_floor_defaults_to_500_when_a_spec_is_silent():
+    """A spec that never heard of the floor still gets it. follow_seed's 239 would not pass."""
+    from graze_analysis.spec import spec_from_dict
+
+    body = {
+        "id": "silent",
+        "design": "ab",
+        "start": "2026-08-12T09:11:56Z",
+        "unit": "user",
+        "primary_metric": "like_rate",
+        "arms": {
+            "control": {"field": "params.max_total_sources", "value": 10000},
+            "treatment": {"field": "params.max_total_sources", "value": 250},
+        },
+        # Mandatory, and rightly so -- it caught both false positives in this system's history.
+        "negative_controls": [
+            {"name": "fallback", "reason": "no causal path", "where": "source = 'fallback'"}
+        ],
+    }
+    assert spec_from_dict(body).min_units == 500
+
+
+def test_both_floors_are_named_when_they_pass():
+    from graze_analysis.stats import Estimate, insufficient_data_gate
+
+    est = Estimate(
+        diff=0.01, rel=0.1, se=0.001, ci_low=0.0, ci_high=0.02, p_value=0.04,
+        method="test", n_units=2658, n_obs=79473,
+    )
+    thin, msg = insufficient_data_gate(est, 2000, 500)
+    assert not thin
+    assert "79473 observations / 2658 units" in msg, msg
+    assert "2000 / 500 minimums" in msg, msg

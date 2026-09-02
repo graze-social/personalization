@@ -428,13 +428,26 @@ def covariate_balance(
     return observed, hits / resamples
 
 
-def insufficient_data_gate(estimate: Estimate, min_observations: int) -> tuple[bool, str]:
-    """Refuse to report a verdict below a minimum sample size.
+def insufficient_data_gate(
+    estimate: Estimate, min_observations: int, min_units: int = 0
+) -> tuple[bool, str]:
+    """Refuse to report a verdict below a minimum sample size, in BOTH denominations.
 
     Significance testing alone is not enough protection. The motivating incident was a 37-response
     sample reading ``no_user_data`` at 14% when the value at 706 responses was 49.3% — the small
     sample was not *significant*, it was simply **wrong**, and it was believed because it was
     looked at. A hard floor stops a verdict being formed from a sample that cannot support one.
+
+    Units are checked as well as observations because every estimand in this package is per-UNIT
+    while ``min_observations`` counts impressions. Measured 2026-09-02: follow_seed cleared its
+    2000-observation floor with obs=2037 and formed a verdict from **239 users**, ~8.5 impressions
+    per unit against the holdout's 30. The obs floor had never been a units guard, and nothing
+    said so.
+
+    Neither floor is a power guarantee, and this gate must not be mistaken for one. The same
+    readout's interval was ~13x its own base rate (per-unit like rate ~0.015%), which no sample
+    size available here would fix — that is a choice-of-metric problem and it belongs in the open,
+    not behind a gate.
     """
     if estimate.n_obs < min_observations:
         return True, (
@@ -442,7 +455,17 @@ def insufficient_data_gate(estimate: Estimate, min_observations: int) -> tuple[b
             "Small samples do not merely widen intervals, they produce point estimates that are "
             "simply wrong; no verdict is formed at this size."
         )
-    return False, f"{estimate.n_obs} observations meets the {min_observations} minimum"
+    if estimate.n_units < min_units:
+        return True, (
+            f"WITHHELD: {estimate.n_units} units is below the {min_units} minimum "
+            f"(observations were fine at {estimate.n_obs}). The estimand is per-unit, so units "
+            "are what the interval rests on; a few heavy users clearing an impression floor is "
+            "not evidence."
+        )
+    return False, (
+        f"{estimate.n_obs} observations / {estimate.n_units} units meets the "
+        f"{min_observations} / {min_units} minimums"
+    )
 
 
 @dataclass(frozen=True)

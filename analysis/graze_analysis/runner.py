@@ -62,7 +62,7 @@ def analyse_ab(spec: ExperimentSpec, reader: ClickHouseReader) -> Readout:
     )
 
     # --- Gate 1: enough data to form any verdict at all ---
-    thin, thin_msg = insufficient_data_gate(primary, spec.min_observations)
+    thin, thin_msg = insufficient_data_gate(primary, spec.min_observations, spec.min_units)
     if thin:
         return Readout(spec.id, "WITHHELD (insufficient data)", [thin_msg])
 

@@ -29,6 +29,13 @@ pub struct Config {
     pub deltas_enabled: bool,
     /// How often to reload the set of viewers worth tracking.
     pub active_refresh_interval: Duration,
+    /// How often the sweeper turns dirty viewers into rebuild requests.
+    ///
+    /// This IS the propagation latency for a reader's own follows: a change is
+    /// visible once the sweep fires and the builder drains the queue. Lower is
+    /// fresher and costs more ClickHouse work per changed viewer; the coalescing
+    /// means it costs nothing extra per *event*.
+    pub dirty_sweep_interval: Duration,
     /// Life extension applied to a set each time a delta lands. Long on
     /// purpose: with deltas keeping it correct, an actively-read set should
     /// never expire, and expiry becomes a garbage-collector for readers who
@@ -66,6 +73,7 @@ impl Config {
             read_timeout_seconds: parse("LENS_FOLD_READ_TIMEOUT_SECONDS", 45)?,
 
             deltas_enabled: parse("LENS_FOLD_DELTAS_ENABLED", true)?,
+            dirty_sweep_interval: Duration::from_secs(parse("LENS_FOLD_DIRTY_SWEEP_SECONDS", 30)?),
             active_refresh_interval: Duration::from_secs(parse(
                 "LENS_FOLD_ACTIVE_REFRESH_SECONDS",
                 60,

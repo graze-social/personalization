@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let cursor = Cursor::new(pool.clone());
 
     let deltas = if config.deltas_enabled {
-        let applier = DeltaApplier::new(pool, metrics.clone(), config.set_ttl_seconds);
+        let applier = DeltaApplier::new(pool.clone(), metrics.clone(), config.set_ttl_seconds);
         // Warm the active list before the first event, so a restart does not
         // spend an interval ignoring deltas for viewers who are already live.
         match applier.refresh_active().await {
@@ -39,6 +39,30 @@ async fn main() -> anyhow::Result<()> {
         info!("live lens maintenance disabled; sets will expire on their TTL");
         None
     };
+
+    // The sweeper turns "this viewer's graph moved" into rebuild requests. It
+    // runs on its own timer rather than inline with the stream: the stream is far
+    // too hot to do per-event Redis work on, and coalescing is the point.
+    if deltas.is_some() {
+        // A second applier rather than a shared one: the sweeper works entirely
+        // from the dirty set in Redis and never consults the active-viewer cache,
+        // so it needs no state from the streamer's copy and sharing one would
+        // only add a lock on the hot path.
+        let sweeper = DeltaApplier::new(pool, metrics.clone(), config.set_ttl_seconds);
+        let interval = config.dirty_sweep_interval;
+        info!(
+            sweep_seconds = interval.as_secs(),
+            "dirty-viewer sweeper enabled; this is the propagation latency for a reader's own follows"
+        );
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                sweeper.sweep().await;
+            }
+        });
+    }
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     serve_metrics(config.metrics_port, metrics.clone());

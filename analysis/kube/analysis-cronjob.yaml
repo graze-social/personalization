@@ -31,7 +31,7 @@ spec:
             - name: dockerhub-secret
           containers:
             - name: analysis
-              image: dgaff/graze-analysis@sha256:457de73c066e6cea9141c32c1611750350bc54773657ba71e1fe2014cd47c72a
+              image: dgaff/graze-analysis@sha256:8bbe3d69be10efe6e3e8c253b1b49817a96575ee65ce70c1133ed5f4796fc132
               # Override the entrypoint so one job runs both the experiment readouts and the
               # density-drift guard. The guard exits non-zero only on a *detection* (a feed that has
               # already stopped being personalized), so a real regression shows up as a failed Job

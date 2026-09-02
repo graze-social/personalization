@@ -93,6 +93,21 @@ population: >
 
 min_observations: 2000
 
+# Units floor, declared separately because min_observations counts IMPRESSIONS while the estimand
+# is per-USER, and on this population the two diverge badly. Measured 2026-09-02: this spec cleared
+# its 2000-observation floor with obs=2037 drawn from only **239 users** -- ~8.5 impressions per
+# unit, against the holdout's 30 -- and a verdict was formed and read. The obs floor had never been
+# a units guard.
+#
+# ⚠️ 500 is a floor against estimates that are simply WRONG, not a power guarantee, and it does NOT
+# rescue this experiment. The eligible population's per-unit like rate is ~0.015% (the holdout
+# population's is ~1.13%, i.e. ~75x higher) because eligibility IS "no like seed" -- we select for
+# users who do not like things and then measure their like rate. The 2026-09-02 interval was ~13x
+# its own base rate, so separating from zero would need a >1000% effect. That is a choice-of-metric
+# problem. It is recorded here rather than hidden behind the gate, and it is the open question on
+# this spec: see the ledger, and do NOT resolve it with a sixth window reset.
+min_units: 500
+
 notes: >
   Expect this to accrue faster than the holdout: enrolment is 100% of non-holdout users by default
   rather than 20%, and both arms are the same size.

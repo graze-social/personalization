@@ -35,7 +35,30 @@ design: ab
 start: "2026-08-31T16:49:48Z"
 
 unit: user
-primary_metric: like_rate
+# PRIMARY CHANGED 2026-09-02: like_rate -> scroll_depth.
+#
+# ⚠️ THIS WAS CHOSEN AFTER SEEING THE METRIC'S VALUE ON THIS WINDOW, and that must be on the
+# record. The pre-promotion reading was diff=-0.2173 (-3.2%), CI [-2.9344, +2.4999], WLS p=0.7861 --
+# null, so this is not a promoted winner; but the estimand was still selected post hoc, which is
+# the practice the winsorize_quantile note below exists to forbid. Treat any reading on the CURRENT
+# window as selection-contaminated. A clean pre-registered reading requires a new window, and that
+# call has not been made -- see the ledger.
+#
+# WHY the change: like_rate is unmeasurable on this population, and that is measured, not assumed.
+# Over the whole window the eligible population produced ONE like, from ONE user, across 264 units
+# and 2,359 impressions; request_less and request_more produced ZERO events each, and those three
+# are the entirety of METRIC_EVENTS. The like interval came out ~14.3x its own base rate. The
+# holdout population over the same period: 2,844 likes from 267 users, interval 1.5x base rate.
+# Eligibility IS "no like seed", so the arm selects for users who do not engage and then the
+# primary measured engagement.
+#
+# scroll_depth is the only outcome here whose denominator every unit has BY CONSTRUCTION -- it is
+# impressions per user, and an enrolled user has impressions or they would not be enrolled. So it
+# scales with units rather than with rare events, which is the only way this arm can ever resolve.
+# It is NOT unambiguously better when it moves: more scrolling could be engagement or could be
+# scanning (zero-seed users were measured paginating at a ~1s cadence). A move is a prompt to
+# investigate, not a verdict.
+primary_metric: scroll_depth
 
 # Direction: treatment = allowed to seed from follows. `params.follow_seed` is the ARM, assigned by a
 # per-user salted hash before anything is served — deliberately NOT the realised seed kind, which is
@@ -81,7 +104,12 @@ guardrails:
 scroll_depth:
   winsorize_quantile: 0.90
 
-cuped_covariate: pre_period_like_rate
+# Changed with the primary. A pre-period LIKE RATE cannot de-noise an impression COUNT on a
+# population whose like rate is ~0 -- measured, it bought 3.4% variance reduction against the
+# holdout's 46%. Past impressions predict future impressions, so the covariate now matches the
+# outcome. Still gated by the re-randomization balance check, and still withheld from the gate if
+# the treatment appears to have moved it.
+cuped_covariate: pre_period_impressions
 
 # REQUIRED, and not merely for the usual foreign-traffic reason. An absent JSON field extracts as
 # false, so without this every row written before the flag went live — and every unenrolled row —
@@ -91,7 +119,10 @@ population: >
   JSONHas(tryBase64Decode(interaction_feed_context), 'algo_id')
   AND JSONHas(tryBase64Decode(interaction_feed_context), 'follow_seed')
 
-min_observations: 2000
+# For a scroll_depth primary the denominator is 1 per unit, so observations ARE units and these two
+# floors coincide. 2000 was set for like_rate, where a unit carried ~8.5 impressions; keeping it
+# here would demand 2000 users, which at the observed ~5.7 users/hour is over two weeks.
+min_observations: 500
 
 # Units floor, declared separately because min_observations counts IMPRESSIONS while the estimand
 # is per-USER, and on this population the two diverge badly. Measured 2026-09-02: this spec cleared

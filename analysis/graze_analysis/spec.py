@@ -239,6 +239,17 @@ def spec_from_dict(raw: dict[str, Any], source: str = "<dict>") -> ExperimentSpe
         else None
     )
 
+    # A scroll_depth primary needs the block that declares its cap, and the cap must be declared
+    # up front: it changes the estimand to a capped mean, so choosing it later is choosing it after
+    # seeing the answer. Checked here rather than at readout so a malformed spec fails on load.
+    if str(raw.get("primary_metric", "")) == "scroll_depth" and scroll_depth is None:
+        _raise(
+            SpecError(
+                f"{source}: primary_metric 'scroll_depth' requires a 'scroll_depth' block "
+                "declaring winsorize_quantile"
+            )
+        )
+
     return ExperimentSpec(
         id=str(require("id")),
         design=design,

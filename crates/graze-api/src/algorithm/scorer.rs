@@ -91,9 +91,16 @@ pub struct ScoringResult {
     /// Why scoring was skipped entirely before it ran, when it was.
     ///
     /// `pool_density` (the feed's like-density gate fired) | `pool_size` (the feed's candidate
-    /// pool is below the personalization gate). `None` whenever scoring actually ran, including
-    /// when it ran and produced nothing — "we refused to look" and "we looked and found nothing"
-    /// are different coverage failures and the whole point of this field is to keep them apart.
+    /// pool is below the personalization gate) | `no_colikers` (the co-liker walk, including the
+    /// durable-profile and follow-seed hooks, produced no weights to score from). `None` whenever
+    /// scoring actually ran, including when it ran and produced nothing — "we refused to look" and
+    /// "we looked and found nothing" are different coverage failures and the whole point of this
+    /// field is to keep them apart.
+    ///
+    /// The first two are feed-level config gates; `no_colikers` is not, and is kept separate from
+    /// `no_user_data` for the same reason. A user reaching that exit had seed — the feed handler
+    /// refuses everyone else before this function is called — so the failure is in the graph
+    /// around the seed, not in the seed's absence. Different lever, therefore different label.
     ///
     /// `&'static str` rather than `String` because every value is a compile-time constant, and
     /// because the consumer in `api::feed` needs a `'static` reason it can hold past the response

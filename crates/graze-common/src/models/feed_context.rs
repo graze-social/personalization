@@ -91,15 +91,21 @@ pub struct FeedContextProvenance {
     /// `no_algo_posts` (the feed's candidate pool is empty) | `personalization_holdout` |
     /// `personalization_error` | `pool_density` (the feed's candidate pool carries too little like
     /// signal to rank — `MIN_POOL_SCOREABLE_SHARE`) | `pool_size` (the feed's candidate pool is
-    /// below `MIN_CANDIDATE_POOL_FOR_PERSONALIZATION`). `None` when the response *was*
-    /// personalized.
+    /// below `MIN_CANDIDATE_POOL_FOR_PERSONALIZATION`) | `no_colikers` (the user had seed but the
+    /// co-liker walk derived no weights from it). `None` when the response *was* personalized.
     ///
-    /// The last two are the gates the engine applies *before* scoring, and they were added later
-    /// than the rest: both returned an empty result indistinguishable from "scored and found
-    /// nothing", so a gated response was served as fallback carrying no reason at all. Verified on
+    /// The last three are bail-outs the engine takes *before* scoring, and they were added later
+    /// than the rest: each returned an empty result indistinguishable from "scored and found
+    /// nothing", so the response was served as fallback carrying no reason at all. Verified on
     /// feed 6445 on 2026-09-01: 22 of the 24 items served at 18:00Z had `source=fallback` and no
-    /// `fallback_reason`. Rows written before that fix carry no reason for these two causes, so a
-    /// readout spanning the deploy must not read absence as "personalized".
+    /// `fallback_reason`. Rows written before those fixes carry no reason for these three causes,
+    /// so a readout spanning either deploy must not read absence as "personalized".
+    ///
+    /// `no_colikers` is deliberately not merged into `no_user_data`. Every user who reaches it was
+    /// admitted by the handler's seed check, so their seed exists and it is the graph around it
+    /// that is empty — a connectivity failure the co-liker parameters and the durable/follow seed
+    /// work address, as against a seed-availability failure only the user can fix. Low volume:
+    /// measured on the fleet 2026-09-02, 3 occurrences in 12h across 3 pods.
     ///
     /// Exists because this reason was previously only ever written to a log line, so coverage
     /// failures could not be decomposed in ClickHouse and every experiment silently mixed users

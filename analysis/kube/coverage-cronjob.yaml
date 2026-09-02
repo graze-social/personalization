@@ -2,6 +2,9 @@
 #
 # Exists because `fallback_reason` was only ever a log line until 2026-08-26, so the question "why
 # is this user not being personalized" could only be answered by scraping a few hours of pod logs.
+# The field arrived covering only some causes: the engine's pre-scoring bail-outs went on writing
+# nothing until 2026-09-01 (`pool_size`, `pool_density`) and 2026-09-02 (`no_colikers`), so the
+# UNLABELLED bucket below mixes builds from before each of those, not just from before 2026-08-26.
 # A 6-hour scrape put `no_user_data` at 73% of non-personalized responses; this repo has been burned
 # more than once by single-window traffic mix (the density histogram predicted a 53% skip rate and
 # measured 45%, and the dominant low-density feed changed identity between windows), so the figure
@@ -84,10 +87,23 @@ data:
     UNLABELLED = 'UNLABELLED (pre-instrumentation)'
     unlabelled = sum(r[1] for r in rows if r[0] == UNLABELLED)
     if unlabelled:
+        # Two populations, not one, which is why this bucket shrinks faster than feed-age decay
+        # alone would predict:
+        #   1. builds predating fallback_reason entirely (2026-08-26), echoed back by clients
+        #      scrolling feeds served before it -- decays with FEED age, not wall clock, so this
+        #      part is not expected to reach zero;
+        #   2. builds after that date but before the pre-scoring bail-outs were labelled, which
+        #      wrote no reason whenever the pool-size or like-density gate fired (both labelled
+        #      2026-09-01) or the co-liker walk came back empty (`no_colikers`, 2026-09-02).
+        # (2) stops being produced the moment those builds are rolled, so a drop here after such a
+        # deploy is instrumentation catching up, NOT coverage improving -- and the causes it was
+        # hiding appear as new named buckets above, which is where to look for the difference.
         print(f"\n  !! {unlabelled:,} impressions ({unlabelled/total*100:.1f}%) are UNLABELLED --")
-        print("     served by a build predating fallback_reason (2026-08-26), echoed back by clients")
-        print("     scrolling feeds served before it. This tail decays with FEED age, not wall clock,")
-        print("     so it is not expected to reach zero.")
+        print("     served either by a build predating fallback_reason (2026-08-26) or by one")
+        print("     predating the pre-scoring labels (pool_size/pool_density 2026-09-01,")
+        print("     no_colikers 2026-09-02), echoed back by clients scrolling feeds served then.")
+        print("     The first part decays with FEED age, not wall clock, so it is not expected to")
+        print("     reach zero; the second stops being produced once those builds are rolled.")
         print("     => The impression-share column ABOVE is diluted by it: read it as a lower bound.")
         print("     => The addressable composition and hourly check BELOW divide within the failure")
         print("        set, so they are NOT affected. Those are the numbers to quote.")

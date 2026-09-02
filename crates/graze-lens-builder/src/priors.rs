@@ -79,15 +79,19 @@ pub fn prior_reach_query(database: &str, seeds: &[u32], cap: usize, prior: Prior
          FROM {database}.account_stats AS s \
          INNER JOIN ( \
              SELECT followee_int, uniqExact(follower_int) AS reach \
-             FROM {database}.follow_graph_int \
-             WHERE follower_int IN ({seeds}) \
+             FROM {source} \
              GROUP BY followee_int \
              {having}\
          ) AS r ON s.account_int = r.followee_int \
          ORDER BY score DESC, r.followee_int ASC \
          LIMIT {cap} \
          FORMAT TabSeparated",
-        seeds = seed_list_of(seeds),
+        source = crate::second_degree::edge_source(
+            database,
+            "follow_graph_int",
+            &seed_list_of(seeds),
+            "",
+        ),
     )
 }
 
@@ -97,14 +101,17 @@ pub fn prior_reach_query(database: &str, seeds: &[u32], cap: usize, prior: Prior
 pub fn velocity_query(database: &str, seeds: &[u32], cap: usize, days: u32) -> String {
     format!(
         "SELECT followee_int, uniqExact(follower_int) AS reach \
-         FROM {database}.follow_graph_recent \
-         WHERE follower_int IN ({seeds}) \
-           AND followed_at > today() - {days} \
+         FROM {source} \
          GROUP BY followee_int \
          ORDER BY reach DESC, followee_int ASC \
          LIMIT {cap} \
          FORMAT TabSeparated",
-        seeds = seed_list_of(seeds),
+        source = crate::second_degree::edge_source(
+            database,
+            "follow_graph_recent",
+            &seed_list_of(seeds),
+            &format!("AND followed_at > today() - {days} "),
+        ),
     )
 }
 
@@ -299,10 +306,46 @@ mod tests {
         assert!(q.contains("follow_graph_recent"));
         assert!(q.contains("followed_at > today() - 7"));
         assert!(q.contains("uniqExact(follower_int)"));
+        // Trailing space on purpose: `follow_graph_int_delta` contains
+        // `follow_graph_int` as a substring, and unioning the delta is wanted
+        // here. What must never appear is the full 2.78B-row base table as a
+        // source of its own.
         assert!(
-            !q.contains("follow_graph_int"),
+            !q.contains("default.follow_graph_int "),
             "must not scan the full graph"
         );
+    }
+
+    /// Every reach query must union the incremental delta, or a follow made
+    /// since the nightly rebuild is invisible for up to 24 hours.
+    #[test]
+    fn reach_queries_union_the_incremental_delta() {
+        let delta = graze_lens_fold::delta_projection::DELTA_TABLE;
+        for (name, q) in [
+            (
+                "niche",
+                prior_reach_query("default", &[7], 500, Prior::Niche),
+            ),
+            (
+                "popular",
+                prior_reach_query("default", &[7], 500, Prior::Popular),
+            ),
+            ("velocity", velocity_query("default", &[7], 500, 7)),
+        ] {
+            assert!(q.contains(delta), "{name} must union {delta}");
+            assert!(q.contains("UNION ALL"), "{name} must union, not join");
+            assert!(
+                q.contains("op = 'create'"),
+                "{name} must take only additions from the delta"
+            );
+            // Both halves need the LITERAL seed list; an `IN (subquery)` defeats
+            // index analysis and turns each half into a scan.
+            assert_eq!(
+                q.matches("follower_int IN (7)").count(),
+                2,
+                "{name}: both halves must carry the literal seeds"
+            );
+        }
     }
 
     /// Three columns, weights normalised to the best score, everything into
@@ -352,3 +395,4 @@ mod tests {
         );
     }
 }
+

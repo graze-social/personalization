@@ -38,6 +38,8 @@ use tracing::{info, warn};
 
 pub const LIVE_TABLE: &str = "follow_graph_int";
 pub const STAGING_TABLE: &str = "follow_graph_int_next";
+/// The incremental delta the facets union in; compacted here after each swap.
+const DELTA_TABLE: &str = crate::delta_projection::DELTA_TABLE;
 pub const MAP_TABLE: &str = "didint_map";
 /// Per-account degree counts, rebuilt from the projection each run. These are
 /// the "priors" the niche/popular lens facets join against.
@@ -124,8 +126,55 @@ impl Projector {
 
     pub async fn run(&self) -> anyhow::Result<ProjectReport> {
         let interned = self.extend_interner().await?;
+        // Read BEFORE the rebuild, not after: the rebuild's `FINAL` read of
+        // `follow_edges` sees some prefix of the stream, and anything arriving
+        // during its ~31 minutes is NOT in the result. Compacting to a watermark
+        // taken afterwards would delete delta rows the new base does not contain
+        // — a silent hole in the traversal graph until the next night.
+        let watermark = self.delta_watermark().await;
         let report = self.rebuild(interned).await?;
+        // Best-effort: a delta that keeps its rows is merely larger than it needs
+        // to be, and unioning a table this size is free (measured). Failing the
+        // whole projection over housekeeping would be the worse trade.
+        if let Some(seq) = watermark {
+            if let Err(e) = self.compact_delta(seq).await {
+                warn!(error = %e, watermark = seq, "could not compact the delta");
+            }
+        }
         Ok(report)
+    }
+
+    /// The highest `seq` the coming rebuild is guaranteed to include.
+    async fn delta_watermark(&self) -> Option<u64> {
+        let db = &self.clickhouse.database;
+        match self
+            .exec(&format!(
+                "SELECT max(seq) FROM {db}.{DELTA_TABLE} FORMAT TabSeparated"
+            ))
+            .await
+        {
+            Ok(text) => text.trim().parse::<u64>().ok(),
+            Err(e) => {
+                warn!(error = %e, "could not read the delta watermark");
+                None
+            }
+        }
+    }
+
+    /// Drop delta rows the freshly swapped base now contains.
+    ///
+    /// `ALTER DELETE` is a mutation and would be brutal on the 2.78B-row base;
+    /// here it runs against a table holding a day of edges, which is what makes
+    /// it acceptable. Rows above the watermark are deliberately kept: they
+    /// arrived while the rebuild was running and exist nowhere else.
+    async fn compact_delta(&self, watermark: u64) -> anyhow::Result<()> {
+        let db = &self.clickhouse.database;
+        self.exec(&format!(
+            "ALTER TABLE {db}.{DELTA_TABLE} DELETE WHERE seq <= {watermark}"
+        ))
+        .await?;
+        info!(watermark, "compacted the traversal delta");
+        Ok(())
     }
 
     /// Give an id to every account in the graph that lacks one.

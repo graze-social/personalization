@@ -40,6 +40,13 @@ pub struct Metrics {
     pub sweep_rebuilds_requested: Counter,
     pub sweep_failures: Counter,
     pub dirty_viewers: Gauge,
+
+    /// Incremental traversal projection. `delta_rows_skipped` rising is normal
+    /// and not a fault: it counts edges where one side has no id yet, which the
+    /// base projection also omits — they arrive with the nightly interning pass.
+    pub delta_rows_projected: Counter,
+    pub delta_rows_skipped: Counter,
+    pub delta_projection_failures: Counter,
 }
 
 impl Metrics {
@@ -95,6 +102,27 @@ impl Metrics {
             "deltas_applied",
             "Follows applied directly to a live lens set",
             deltas_applied.clone(),
+        );
+
+        let delta_rows_projected = Counter::default();
+        registry.register(
+            "delta_rows_projected",
+            "Edges written to the incremental traversal projection",
+            delta_rows_projected.clone(),
+        );
+
+        let delta_rows_skipped = Counter::default();
+        registry.register(
+            "delta_rows_skipped",
+            "Edges skipped because an endpoint has no id yet",
+            delta_rows_skipped.clone(),
+        );
+
+        let delta_projection_failures = Counter::default();
+        registry.register(
+            "delta_projection_failures",
+            "Batches that could not be projected into the delta",
+            delta_projection_failures.clone(),
         );
 
         let dirty_marked = Counter::default();
@@ -159,6 +187,9 @@ impl Metrics {
             reconnects,
             cursor_age_seconds,
             deltas_applied,
+            delta_rows_projected,
+            delta_rows_skipped,
+            delta_projection_failures,
             dirty_marked,
             sweeps,
             sweep_rebuilds_requested,

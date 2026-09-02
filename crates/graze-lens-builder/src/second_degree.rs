@@ -122,16 +122,44 @@ pub fn parse_reach_tsv(text: &str, top_k: usize) -> SecondDegree {
 /// leave two live rows for the same pair — counting rows would let one of your
 /// follows contribute twice. It is checkable: reach must never exceed the seed
 /// count, and when it did (2,234 against 1,183 seeds) that was the symptom.
+/// Seed-bounded edge source: the nightly projection plus the incremental delta.
+///
+/// Returns a parenthesised subquery, so a caller drops it in where it used to
+/// name a table. `base_extra` is appended to the base half's `WHERE` for callers
+/// with their own predicate (velocity's window); the delta needs no equivalent
+/// because every row in it is newer than the last rebuild by construction.
+///
+/// Both halves carry the **literal** seed list, which is what keeps this free:
+/// each uses its own sparse index rather than scanning. Measured on production
+/// against a real viewer's 1,187 seeds, three runs each — base alone
+/// 0.70/0.57/0.56 s, base UNION a 131M-row second table 0.60/0.55/0.47 s.
+/// Identical within noise.
+///
+/// Duplicates across the two halves are harmless and expected: every caller
+/// counts `uniqExact(follower_int)`, which is precisely the collapsing
+/// `project.rs` deliberately defers to this layer rather than paying for over
+/// 2.77 billion rows.
+///
+/// Deletes are NOT excluded yet. The delta carries creates only — a jetstream
+/// follow-delete names no followee — so `op = 'create'` is written explicitly
+/// here to keep the predicate honest, and the resolving pass can add a tombstone
+/// exclusion without revisiting every call site.
+pub fn edge_source(database: &str, base: &str, seeds: &str, base_extra: &str) -> String {
+    let delta = graze_lens_fold::delta_projection::DELTA_TABLE;
+    format!(
+        "(            SELECT follower_int, followee_int FROM {database}.{base}            WHERE follower_int IN ({seeds}) {base_extra}           UNION ALL            SELECT follower_int, followee_int FROM {database}.{delta}            WHERE follower_int IN ({seeds}) AND op = 'create'          )"
+    )
+}
+
 pub fn reach_query(database: &str, seeds: &[u32], cap: usize) -> String {
     format!(
         "SELECT followee_int, uniqExact(follower_int) AS reach \
-         FROM {database}.{LIVE_TABLE} \
-         WHERE follower_int IN ({}) \
+         FROM {source} \
          GROUP BY followee_int \
          ORDER BY reach DESC, followee_int ASC \
          LIMIT {cap} \
          FORMAT TabSeparated",
-        seed_list(seeds)
+        source = edge_source(database, LIVE_TABLE, &seed_list(seeds), "")
     )
 }
 
@@ -213,6 +241,16 @@ mod tests {
         assert!(q.contains("IN (7,8,9)"));
         assert!(!q.to_uppercase().contains("IN (SELECT"));
         assert!(q.contains("follow_graph_int"), "must use the projection");
+        assert!(
+            q.contains(graze_lens_fold::delta_projection::DELTA_TABLE),
+            "must union the incremental delta, or a follow since the nightly \
+             rebuild is invisible for up to 24 hours"
+        );
+        assert_eq!(
+            q.matches("follower_int IN (").count(),
+            2,
+            "both halves must carry the literal seed list"
+        );
         assert!(
             !q.contains("follow_edges"),
             "must never traverse the fold table"

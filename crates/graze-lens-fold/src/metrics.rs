@@ -28,6 +28,18 @@ pub struct Metrics {
     pub deltas_rebuild_requested: Counter,
     pub delta_failures: Counter,
     pub active_viewers: Gauge,
+
+    /// Propagation of a viewer's OWN graph changes into their v2 blobs.
+    ///
+    /// `dirty_marked` counts graph changes seen for active viewers;
+    /// `sweep_rebuilds_requested` counts the rebuilds that resulted. The ratio is
+    /// the coalescing factor — a viewer on a follow spree is marked many times
+    /// and rebuilt once, which is the whole point.
+    pub dirty_marked: Counter,
+    pub sweeps: Counter,
+    pub sweep_rebuilds_requested: Counter,
+    pub sweep_failures: Counter,
+    pub dirty_viewers: Gauge,
 }
 
 impl Metrics {
@@ -85,6 +97,37 @@ impl Metrics {
             deltas_applied.clone(),
         );
 
+        let dirty_marked = Counter::default();
+        registry.register(
+            "dirty_marked",
+            "Graph changes seen for an active viewer, before coalescing",
+            dirty_marked.clone(),
+        );
+
+        let sweeps = Counter::default();
+        registry.register("sweeps", "Dirty-viewer sweeps run", sweeps.clone());
+
+        let sweep_rebuilds_requested = Counter::default();
+        registry.register(
+            "sweep_rebuilds_requested",
+            "Facet rebuilds enqueued by the sweeper, after coalescing",
+            sweep_rebuilds_requested.clone(),
+        );
+
+        let sweep_failures = Counter::default();
+        registry.register(
+            "sweep_failures",
+            "Sweeps that could not complete; their viewers stay dirty for the next one",
+            sweep_failures.clone(),
+        );
+
+        let dirty_viewers = Gauge::default();
+        registry.register(
+            "dirty_viewers",
+            "Viewers drained by the most recent sweep",
+            dirty_viewers.clone(),
+        );
+
         let deltas_rebuild_requested = Counter::default();
         registry.register(
             "deltas_rebuild_requested",
@@ -116,6 +159,11 @@ impl Metrics {
             reconnects,
             cursor_age_seconds,
             deltas_applied,
+            dirty_marked,
+            sweeps,
+            sweep_rebuilds_requested,
+            sweep_failures,
+            dirty_viewers,
             deltas_rebuild_requested,
             delta_failures,
             active_viewers,

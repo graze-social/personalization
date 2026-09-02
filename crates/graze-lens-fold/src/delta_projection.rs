@@ -36,15 +36,24 @@
 //! that invented ids would claim edges the base cannot express. Unknown accounts
 //! wait for the nightly job's bounded interning, exactly as before.
 //!
-//! # Additions only, for now
+//! # Removals, and the lookup they need
 //!
 //! A jetstream follow-delete carries `(repo, rkey)` and no followee, so a
-//! retraction cannot be written at ingest without first resolving the rkey. The
-//! base rebuild sidesteps this by letting `FINAL` collapse the create. So this
-//! writes creates, and the `op` column plus the queries' tombstone exclusion are
-//! already in place for the resolving pass to fill in. The asymmetry is a
-//! deliberate interim: missing someone you just followed is the failure readers
-//! notice, and seeing someone you just unfollowed is the milder one.
+//! retraction cannot be written from the event alone — the base rebuild
+//! sidesteps this by letting `FINAL` collapse the create. Here each batch's
+//! deletes are resolved to their subject in one point lookup and written as
+//! `op = 'delete'` tombstones, which the reach queries exclude.
+//!
+//! Two sources, cheapest first. A follow that was undone inside the same batch
+//! is resolved from the batch itself, because its create row may not have
+//! reached the base table yet — that is the one case ClickHouse cannot answer.
+//! Everything else is one query per flush, roughly four deletes a second at
+//! measured rates.
+//!
+//! An unresolvable delete leaves the addition standing until the nightly
+//! compaction. That is the honest failure: the rkey names a follow this
+//! projection never carried, or one whose create predates the delta entirely, so
+//! there is nothing to retract.
 
 use std::collections::HashMap;
 
@@ -81,15 +90,23 @@ impl DeltaProjector {
     /// for no reason.
     pub async fn project(&self, batch: &[FollowEdge]) {
         let creates: Vec<&FollowEdge> = batch.iter().filter(|e| e.op == "create").collect();
-        if creates.is_empty() {
+        let deletes: Vec<&FollowEdge> = batch.iter().filter(|e| e.op == "delete").collect();
+        if creates.is_empty() && deletes.is_empty() {
             return;
         }
 
+        // Resolve removals first, so their subjects join the same id lookup.
+        let retractions = self.resolve_retractions(batch, &deletes).await;
+
         // One lookup for the whole batch, both sides of every edge at once.
-        let mut dids: Vec<String> = Vec::with_capacity(creates.len() * 2);
+        let mut dids: Vec<String> = Vec::with_capacity(creates.len() * 2 + retractions.len() * 2);
         for edge in &creates {
             dids.push(edge.follower.clone());
             dids.push(edge.followee.clone());
+        }
+        for (follower, followee, _) in &retractions {
+            dids.push(follower.clone());
+            dids.push(followee.clone());
         }
         dids.sort_unstable();
         dids.dedup();
@@ -103,18 +120,32 @@ impl DeltaProjector {
             }
         };
 
-        let mut rows: Vec<(u32, u32, u64)> = Vec::with_capacity(creates.len());
+        let mut rows: Vec<(u32, u32, &'static str, u64)> =
+            Vec::with_capacity(creates.len() + retractions.len());
         let mut skipped = 0u64;
         for edge in &creates {
             match (ids.get(&edge.follower), ids.get(&edge.followee)) {
-                (Some(&follower), Some(&followee)) => rows.push((follower, followee, edge.seq)),
+                (Some(&follower), Some(&followee)) => {
+                    rows.push((follower, followee, "create", edge.seq))
+                }
                 // One side has no id yet, so the base projection does not contain
                 // this edge either. Waiting for the nightly pass keeps the two
                 // tables describing the same population.
                 _ => skipped += 1,
             }
         }
+        let mut tombstones = 0u64;
+        for (follower, followee, seq) in &retractions {
+            match (ids.get(follower), ids.get(followee)) {
+                (Some(&follower), Some(&followee)) => {
+                    rows.push((follower, followee, "delete", *seq));
+                    tombstones += 1;
+                }
+                _ => skipped += 1,
+            }
+        }
         self.metrics.delta_rows_skipped.inc_by(skipped);
+        self.metrics.delta_tombstones.inc_by(tombstones);
 
         if rows.is_empty() {
             return;
@@ -130,6 +161,63 @@ impl DeltaProjector {
                 self.metrics.delta_projection_failures.inc();
             }
         }
+    }
+    /// Subjects for this batch's deletes, as `(follower, followee, seq)`.
+    ///
+    /// The in-batch pass matters more than it looks: a follow undone within the
+    /// same flush has a create row that may not be in the base table yet, so
+    /// ClickHouse would answer "no such record" and the addition would stand
+    /// until the nightly compaction.
+    async fn resolve_retractions(
+        &self,
+        batch: &[FollowEdge],
+        deletes: &[&FollowEdge],
+    ) -> Vec<(String, String, u64)> {
+        if deletes.is_empty() {
+            return Vec::new();
+        }
+
+        let in_batch: HashMap<(&str, &str), &str> = batch
+            .iter()
+            .filter(|e| e.op == "create" && !e.followee.is_empty())
+            .map(|e| ((e.follower.as_str(), e.rkey.as_str()), e.followee.as_str()))
+            .collect();
+
+        let mut out: Vec<(String, String, u64)> = Vec::with_capacity(deletes.len());
+        let mut ask: Vec<(String, String)> = Vec::new();
+        let mut seq_of: HashMap<(String, String), u64> = HashMap::new();
+        for edge in deletes {
+            let key = (edge.follower.as_str(), edge.rkey.as_str());
+            match in_batch.get(&key) {
+                Some(followee) => {
+                    out.push((edge.follower.clone(), (*followee).to_string(), edge.seq))
+                }
+                None => {
+                    ask.push((edge.follower.clone(), edge.rkey.clone()));
+                    seq_of.insert((edge.follower.clone(), edge.rkey.clone()), edge.seq);
+                }
+            }
+        }
+
+        if !ask.is_empty() {
+            match self.sink.resolve_followees(&ask).await {
+                Ok(found) => {
+                    for (follower, rkey, followee) in found {
+                        if let Some(&seq) = seq_of.get(&(follower.clone(), rkey)) {
+                            out.push((follower, followee, seq));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, deletes = ask.len(), "could not resolve unfollows");
+                    self.metrics.delta_resolve_failures.inc();
+                }
+            }
+        }
+
+        let unresolved = deletes.len().saturating_sub(out.len()) as u64;
+        self.metrics.delta_unresolved_deletes.inc_by(unresolved);
+        out
     }
 }
 

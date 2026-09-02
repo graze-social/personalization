@@ -47,6 +47,13 @@ pub struct Metrics {
     pub delta_rows_projected: Counter,
     pub delta_rows_skipped: Counter,
     pub delta_projection_failures: Counter,
+    /// Retractions. `delta_unresolved_deletes` rising means unfollows whose
+    /// create row this projection never carried — their addition stands until
+    /// the nightly compaction, so a rising share is a real freshness gap rather
+    /// than an error.
+    pub delta_tombstones: Counter,
+    pub delta_unresolved_deletes: Counter,
+    pub delta_resolve_failures: Counter,
 }
 
 impl Metrics {
@@ -102,6 +109,27 @@ impl Metrics {
             "deltas_applied",
             "Follows applied directly to a live lens set",
             deltas_applied.clone(),
+        );
+
+        let delta_tombstones = Counter::default();
+        registry.register(
+            "delta_tombstones",
+            "Unfollows resolved to a subject and written as retractions",
+            delta_tombstones.clone(),
+        );
+
+        let delta_unresolved_deletes = Counter::default();
+        registry.register(
+            "delta_unresolved_deletes",
+            "Unfollows whose subject could not be resolved; their addition stands until compaction",
+            delta_unresolved_deletes.clone(),
+        );
+
+        let delta_resolve_failures = Counter::default();
+        registry.register(
+            "delta_resolve_failures",
+            "Batches whose unfollow resolution query failed",
+            delta_resolve_failures.clone(),
         );
 
         let delta_rows_projected = Counter::default();
@@ -190,6 +218,9 @@ impl Metrics {
             delta_rows_projected,
             delta_rows_skipped,
             delta_projection_failures,
+            delta_tombstones,
+            delta_unresolved_deletes,
+            delta_resolve_failures,
             dirty_marked,
             sweeps,
             sweep_rebuilds_requested,

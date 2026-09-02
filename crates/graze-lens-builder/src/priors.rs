@@ -342,8 +342,12 @@ mod tests {
             // index analysis and turns each half into a scan.
             assert_eq!(
                 q.matches("follower_int IN (7)").count(),
-                2,
-                "{name}: both halves must carry the literal seeds"
+                3,
+                "{name}: both read halves plus the tombstone set need literal seeds"
+            );
+            assert!(
+                q.contains("op = 'delete'"),
+                "{name} must exclude retracted edges"
             );
         }
     }

@@ -146,8 +146,21 @@ pub fn parse_reach_tsv(text: &str, top_k: usize) -> SecondDegree {
 /// exclusion without revisiting every call site.
 pub fn edge_source(database: &str, base: &str, seeds: &str, base_extra: &str) -> String {
     let delta = graze_lens_fold::delta_projection::DELTA_TABLE;
+    let base_half = format!(
+        "SELECT follower_int, followee_int FROM {database}.{base} \
+         WHERE follower_int IN ({seeds}) {base_extra}"
+    );
+    let delta_half = format!(
+        "SELECT follower_int, followee_int FROM {database}.{delta} \
+         WHERE follower_int IN ({seeds}) AND op = 'create'"
+    );
+    let retracted = format!(
+        "SELECT follower_int, followee_int FROM {database}.{delta} \
+         WHERE follower_int IN ({seeds}) AND op = 'delete'"
+    );
     format!(
-        "(            SELECT follower_int, followee_int FROM {database}.{base}            WHERE follower_int IN ({seeds}) {base_extra}           UNION ALL            SELECT follower_int, followee_int FROM {database}.{delta}            WHERE follower_int IN ({seeds}) AND op = 'create'          )"
+        "(SELECT follower_int, followee_int FROM ({base_half} UNION ALL {delta_half}) \
+          WHERE (follower_int, followee_int) NOT IN ({retracted}))"
     )
 }
 
@@ -239,7 +252,21 @@ mod tests {
     fn query_inlines_literal_seeds() {
         let q = reach_query("default", &[7, 8, 9], 1000);
         assert!(q.contains("IN (7,8,9)"));
-        assert!(!q.to_uppercase().contains("IN (SELECT"));
+        // The property that matters is the SEED predicate: a subquery there
+        // defeats index analysis and turns each read into a scan. The tombstone
+        // exclusion is a `NOT IN (SELECT …)` by necessity, but it sits in an
+        // outer layer over the union's result, and its own seed predicate is
+        // literal too — so the blanket "no IN (SELECT" check is now too coarse
+        // to say what it means.
+        assert!(
+            !q.contains("follower_int IN (SELECT"),
+            "seeds must be inlined; a subquery here is the 11 MB -> 636 MB regression"
+        );
+        assert_eq!(
+            q.matches("NOT IN (SELECT").count(),
+            1,
+            "the only subquery may be the tombstone exclusion"
+        );
         assert!(q.contains("follow_graph_int"), "must use the projection");
         assert!(
             q.contains(graze_lens_fold::delta_projection::DELTA_TABLE),
@@ -248,8 +275,12 @@ mod tests {
         );
         assert_eq!(
             q.matches("follower_int IN (").count(),
-            2,
-            "both halves must carry the literal seed list"
+            3,
+            "both read halves plus the tombstone set must carry the literal seeds"
+        );
+        assert!(
+            q.contains("op = 'delete'"),
+            "an unfollow must be able to retract an edge the base still holds"
         );
         assert!(
             !q.contains("follow_edges"),

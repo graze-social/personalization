@@ -52,7 +52,17 @@ spec:
         - name: builder
           # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
           # the short-SHA tag are mutable on DOCR.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9a3c8adddad484fe900319fc0e2fe2505e02ceda88d0a3c41e6e80e64094c03a
+          # `48350bf` — blob v3, which carries the raw count beside each
+          # weight (#75). Deployed 2026-09-03; a forced refresh rebuilt all
+          # published blobs, verified GLZ3 in Redis with follows BOOLEAN
+          # (max_count 1) and follows2/niche/community COUNTABLE with
+          # max_count <= seed_count.
+          #
+          # ONLY this deployment moved. graze-lens-fold and the four lens
+          # cronjobs share this image tag and are deliberately still on
+          # 9a3c8add: they run different binaries that this change does not
+          # touch, so moving them would be blast radius for nothing.
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:022634171dd93341b26585f04b1f1981a3d68e595ae0977c3c240affe1ef386a
           command: ["/app/graze-lens-builder"]
           resources:
             requests:

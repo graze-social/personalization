@@ -61,7 +61,7 @@ fn community_entries_reflect_the_viewers_affinity() {
     println!("members rows parsed: {}", community_of.len());
 
     let top_k = 20_000;
-    let map = priors::parse_members_tsv(&mem_text, &affinity, top_k);
+    let map = priors::parse_members_tsv(&mem_text, &affinity, seeds, top_k);
     println!(
         "\n=== parse_members_tsv -> entries={} all_ids={} ===",
         map.entries.len(),
@@ -69,7 +69,7 @@ fn community_entries_reflect_the_viewers_affinity() {
     );
 
     let mut by_community: HashMap<u32, usize> = HashMap::new();
-    for (id, _) in &map.entries {
+    for (id, _, _) in &map.entries {
         *by_community
             .entry(community_of.get(id).copied().unwrap_or(u32::MAX))
             .or_default() += 1;
@@ -87,14 +87,14 @@ fn community_entries_reflect_the_viewers_affinity() {
     }
 
     // Which account set the normalisation max, and what it looks like.
-    if let Some((top_id, top_w)) = map.entries.iter().max_by_key(|(_, w)| *w) {
+    if let Some((top_id, top_w, _)) = map.entries.iter().max_by_key(|(_, w, _)| *w) {
         println!(
             "\nhighest-weight entry: account {top_id} weight {top_w} community {:?} followers {:?}",
             community_of.get(top_id),
             followers_of.get(top_id)
         );
     }
-    let scores: Vec<u16> = map.entries.iter().map(|(_, w)| *w).collect();
+    let scores: Vec<u16> = map.entries.iter().map(|(_, w, _)| *w).collect();
     println!(
         "weight range: {:?} .. {:?}",
         scores.iter().min(),
@@ -106,7 +106,7 @@ fn community_entries_reflect_the_viewers_affinity() {
         let body: String = map
             .entries
             .iter()
-            .map(|(id, w)| format!("{id}\t{w}\n"))
+            .map(|(id, w, _)| format!("{id}\t{w}\n"))
             .collect();
         std::fs::write(&out, body).expect("write dump");
         println!("dumped {} entries to {out}", map.entries.len());

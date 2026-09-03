@@ -151,7 +151,7 @@ pub fn community_members_query(database: &str, communities: &[u32], cap: usize) 
 /// Parse `(id, reach, score)` rows into a scored map, normalising weights
 /// against the viewer's own best score.
 pub fn parse_prior_tsv(text: &str, top_k: usize) -> SecondDegree {
-    let mut entries: Vec<(u32, u16)> = Vec::with_capacity(top_k.min(1024));
+    let mut entries: Vec<(u32, u16, u16)> = Vec::with_capacity(top_k.min(1024));
     let mut all_ids: Vec<u32> = Vec::new();
     let mut max_reach = 0u32;
     let mut max_score = 0f64;
@@ -180,7 +180,16 @@ pub fn parse_prior_tsv(text: &str, top_k: usize) -> SecondDegree {
             } else {
                 0.0
             };
-            entries.push((id, scored::weight_from_f32(w as f32)));
+            // The COUNT is the raw reach, not this prior's score: a threshold
+            // must mean "this many of your follows" on niche and popular alike,
+            // or a creator switching fame prior would silently change what
+            // "at least 5" asks for. The score is the weight; the reach is the
+            // count.
+            entries.push((
+                id,
+                scored::weight_from_f32(w as f32),
+                scored::count_from_u32(reach),
+            ));
         }
     }
 
@@ -219,10 +228,16 @@ pub fn parse_affinity_tsv(text: &str, seeds: usize) -> Vec<(u32, f32)> {
 
 /// Parse `(account, community, followers)` member rows, weighting each member
 /// by `affinity_share(community) × ln(2 + fame)`, normalised to the best.
-pub fn parse_members_tsv(text: &str, affinity: &[(u32, f32)], top_k: usize) -> SecondDegree {
+pub fn parse_members_tsv(
+    text: &str,
+    affinity: &[(u32, f32)],
+    seeds: usize,
+    top_k: usize,
+) -> SecondDegree {
     let share = |c: u32| affinity.iter().find(|(k, _)| *k == c).map(|(_, s)| *s);
-    let mut raw: Vec<(u32, f64)> = Vec::new();
+    let mut raw: Vec<(u32, f64, u16)> = Vec::new();
     let mut all_ids: Vec<u32> = Vec::new();
+    let mut max_reach = 0u32;
 
     for line in text.lines() {
         let mut cols = line.split('\t');
@@ -238,24 +253,35 @@ pub fn parse_members_tsv(text: &str, affinity: &[(u32, f32)], top_k: usize) -> S
         };
         let Some(sh) = share(c) else { continue };
         all_ids.push(a);
-        raw.push((a, sh as f64 * (2.0 + f as f64).ln()));
+        // The count community can honestly give: how many of the viewer's own
+        // follows sit in this member's community. `affinity` carries it as a
+        // share of the seed count, so multiplying it back recovers the integer
+        // it was computed from.
+        //
+        // Before this, community published `max_reach: 0`, which made
+        // `publish_scored`'s `max_reach <= seeds.len()` assert vacuous for the
+        // one facet whose logs showed a suspiciously constant reach. Giving it
+        // a real count makes that assert live for the first time.
+        let count = scored::count_from_u32((sh * seeds.max(1) as f32).round() as u32);
+        max_reach = max_reach.max(count as u32);
+        raw.push((a, sh as f64 * (2.0 + f as f64).ln(), count));
     }
 
     raw.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
-    let max = raw.first().map(|(_, s)| *s).unwrap_or(0.0);
-    let entries: Vec<(u32, u16)> = raw
+    let max = raw.first().map(|(_, s, _)| *s).unwrap_or(0.0);
+    let entries: Vec<(u32, u16, u16)> = raw
         .into_iter()
         .take(top_k)
-        .map(|(a, s)| {
+        .map(|(a, s, count)| {
             let w = if max > 0.0 { s / max } else { 0.0 };
-            (a, scored::weight_from_f32(w as f32))
+            (a, scored::weight_from_f32(w as f32), count)
         })
         .collect();
 
     SecondDegree {
         entries,
         all_ids,
-        max_reach: 0,
+        max_reach,
     }
 }
 
@@ -382,7 +408,7 @@ mod tests {
         let affinity = vec![(5u32, 0.9f32), (9u32, 0.1f32)];
         // account 100: community 5, 1k followers. account 200: community 9, 5k.
         let tsv = "200\t9\t5000\n100\t5\t1000\n";
-        let m = parse_members_tsv(tsv, &affinity, 10);
+        let m = parse_members_tsv(tsv, &affinity, 100, 10);
         assert_eq!(m.entries[0].0, 100, "high-affinity community wins");
         assert!(
             m.all_ids.contains(&200),
@@ -392,7 +418,7 @@ mod tests {
 
     #[test]
     fn members_of_unknown_communities_are_dropped() {
-        let m = parse_members_tsv("100\t77\t1000\n", &[(5, 1.0)], 10);
+        let m = parse_members_tsv("100\t77\t1000\n", &[(5, 1.0)], 100, 10);
         assert!(
             m.is_empty(),
             "a member row for a community we did not ask about is a bug upstream"

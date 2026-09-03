@@ -1,0 +1,47 @@
+# Packaging metadata ONLY — this does not change how the analysis image is built.
+#
+# The image still installs from requirements.lock.txt and COPYs graze_analysis/ (see Dockerfile),
+# so nothing about the running CronJobs moves because this file exists.
+#
+# It exists so OTHER services can depend on this package instead of copying from it. The first is
+# feed-gym, which needs always_valid_diff_ci for its guardrails. Copying stats.py would fork the
+# sequential boundary: _normal_mixture_radius was factored out precisely so the one-sample and
+# two-sample sequences could not drift apart, and a second copy in another repo reintroduces
+# exactly that hazard one repo further away, where a fix here would never reach it.
+#
+#   pip install "graze-analysis @ git+ssh://git@github.com/graze-social/personalization.git@<sha>#subdirectory=analysis"
+#
+# Dependents pin a commit SHA; bumping the pin is an explicit PR in the dependent repo.
+#
+# Runtime pins mirror requirements.txt exactly. They are pinned, not floored, for the reason
+# documented at length there: this package decides experiment verdicts, and an unpinned resolve
+# moves the statistics libraries underneath the inference without failing loudly. pytest is a
+# dev extra rather than a runtime dependency -- the image installs it via the lock file, which
+# is unchanged.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graze-analysis"
+version = "0.1.0"
+description = "Experiment analysis that is correct by default: ITT, cluster-robust SEs, mandatory negative controls, always-valid intervals."
+requires-python = ">=3.12"
+dependencies = [
+    "numpy==2.5.2",
+    "scipy==1.18.1",
+    "pandas==3.0.5",
+    "statsmodels==0.15.0",
+    "pyyaml==6.0.3",
+    "clickhouse-connect==1.7.2",
+    "redis==8.1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+# Explicit, because this directory's siblings (experiments/, tests/, kube/) are not packages and
+# auto-discovery would either sweep them in or refuse the build as ambiguous.
+[tool.setuptools]
+packages = ["graze_analysis"]

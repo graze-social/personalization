@@ -298,7 +298,17 @@ impl Builder {
             );
         }
 
-        let blob = map.encode_as(crate::scored::FACET_DOMAIN, interner.idspace(), now_secs());
+        // `seeds` here are the FEED's authors, not a viewer's follows — so
+        // domain's count is "how many of this feed's authors follow them",
+        // which is a different population from every viewer facet's count.
+        // That is why a threshold belongs to its layer and units never mix
+        // inside one comparison.
+        let blob = map.encode_as_with_seeds(
+            crate::scored::FACET_DOMAIN,
+            interner.idspace(),
+            now_secs(),
+            seeds.len(),
+        );
         info!(
             algo_id,
             authors = seeds.len(),
@@ -417,7 +427,12 @@ impl Builder {
         }
 
         let built_at = now_secs();
-        let blob = map.encode(interner.idspace(), built_at);
+        let blob = map.encode_as_with_seeds(
+            crate::scored::FACET_FOLLOWS2,
+            interner.idspace(),
+            built_at,
+            seeds.len(),
+        );
         info!(
             viewer,
             seeds = seeds.len(),
@@ -445,14 +460,27 @@ impl Builder {
         };
         let result = async {
             let ids = interner.intern_many(followees).await?;
-            let entries: Vec<(u32, u16)> = ids
+            // `follows` is the boolean facet: you follow someone or you do
+            // not. Its stored count is a literal 1 — true, so it cannot
+            // mislead a `>= 1` filter — but `KIND_BOOLEAN` is the real guard,
+            // and the reader refuses counts on it independently of the value.
+            //
+            // It is also the only facet with no bloom and no top-K cut: every
+            // followee is encoded. So "only people I follow" is an exact,
+            // false-positive-free membership test — the filter creators most
+            // want is the one that can be answered precisely.
+            let entries: Vec<(u32, u16, u16)> = ids
                 .values()
-                .map(|id| (*id, crate::scored::WEIGHT_MAX))
+                .map(|id| (*id, crate::scored::WEIGHT_MAX, 1u16))
                 .collect();
-            let blob = crate::scored::encode_in_space(
+            let seed_count = crate::scored::count_from_u32(entries.len() as u32);
+            let blob = crate::scored::encode_v3_in_space(
                 crate::scored::FACET_FOLLOWS,
                 interner.idspace(),
+                crate::scored::KIND_BOOLEAN,
                 now_secs(),
+                1,
+                seed_count,
                 entries,
             );
             self.publish_blob(viewer, facet, &blob).await
@@ -677,7 +705,7 @@ impl Builder {
         let Some(header_id) = facet_header_id(facet_name) else {
             anyhow::bail!("{facet_name} has no header id; dispatch and wire format disagree");
         };
-        let blob = map.encode_as(header_id, interner.idspace(), now_secs());
+        let blob = map.encode_as_with_seeds(header_id, interner.idspace(), now_secs(), seeds.len());
         info!(
             viewer,
             facet = facet_name,
@@ -778,6 +806,7 @@ impl Builder {
         let mut map = priors::parse_members_tsv(
             &self.query_text(&members_sql).await?,
             &affinity,
+            seeds.len(),
             self.config.second_degree_top_k,
         );
         second_degree::exclude_first_degree(&mut map, &seeds);

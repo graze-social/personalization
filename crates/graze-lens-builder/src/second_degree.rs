@@ -36,8 +36,16 @@ use crate::scored::{self, FACET_FOLLOWS2};
 
 /// A built second-degree map, before publishing.
 pub struct SecondDegree {
-    /// Top-K, scored and sorted by id, ready to encode.
-    pub entries: Vec<(u32, u16)>,
+    /// Top-K, scored and sorted by id, ready to encode: `(id, weight, count)`.
+    ///
+    /// `count` is the raw reach — how many of the viewer's own follows reach
+    /// this author — kept alongside the normalised weight rather than discarded
+    /// with it. niche and popular store the same raw reach here, NOT their own
+    /// prior-adjusted score, so "at least 5" means the same thing on every
+    /// viewer facet: five of your follows, whichever fame prior the creator
+    /// chose. The weight is what differs between them; the count is the common
+    /// currency.
+    pub entries: Vec<(u32, u16, u16)>,
     /// Every id reached, for the bloom tail.
     pub all_ids: Vec<u32>,
     pub max_reach: u32,
@@ -48,7 +56,7 @@ impl SecondDegree {
         self.all_ids.is_empty()
     }
 
-    /// Encode as a v2 blob: scored top-K plus a bloom over the whole tail.
+    /// Encode as a blob: scored top-K plus a bloom over the whole tail.
     pub fn encode(&self, idspace: u8, built_at: u32) -> Vec<u8> {
         self.encode_as(FACET_FOLLOWS2, idspace, built_at)
     }
@@ -60,7 +68,31 @@ impl SecondDegree {
     /// them refused at read time (the good failure) or, worse, accepted as a
     /// signal they are not.
     pub fn encode_as(&self, facet_id: u8, idspace: u8, built_at: u32) -> Vec<u8> {
-        let mut blob = scored::encode_in_space(facet_id, idspace, built_at, self.entries.clone());
+        self.encode_as_with_seeds(facet_id, idspace, built_at, 0)
+    }
+
+    /// Encode, declaring how many accounts the build started from.
+    ///
+    /// `seed_count` is the viewer's follow count, and it is the ceiling every
+    /// stored count must respect — the reader's `integrity_sample` asserts
+    /// `count <= max_count <= seed_count`, which is the invariant that caught a
+    /// corrupt id map once already (2,234 reach against 1,183 seeds).
+    pub fn encode_as_with_seeds(
+        &self,
+        facet_id: u8,
+        idspace: u8,
+        built_at: u32,
+        seed_count: usize,
+    ) -> Vec<u8> {
+        let mut blob = scored::encode_v3_in_space(
+            facet_id,
+            idspace,
+            scored::KIND_COUNTABLE,
+            built_at,
+            scored::count_from_u32(self.max_reach),
+            scored::count_from_u32(seed_count as u32),
+            self.entries.clone(),
+        );
         scored::append_bloom(&mut blob, &self.all_ids);
         blob
     }
@@ -73,7 +105,7 @@ impl SecondDegree {
 /// what lets a lens degrade smoothly past the top-K instead of falling off a
 /// cliff.
 pub fn parse_reach_tsv(text: &str, top_k: usize) -> SecondDegree {
-    let mut entries: Vec<(u32, u16)> = Vec::with_capacity(top_k.min(1024));
+    let mut entries: Vec<(u32, u16, u16)> = Vec::with_capacity(top_k.min(1024));
     let mut all_ids: Vec<u32> = Vec::new();
     let mut max_reach = 0u32;
 
@@ -100,7 +132,14 @@ pub fn parse_reach_tsv(text: &str, top_k: usize) -> SecondDegree {
             } else {
                 reach as f32 / max_reach as f32
             };
-            entries.push((id, scored::weight_from_f32(w)));
+            // The raw reach rides along with the weight it produced. Before
+            // this it was read, used for `max_reach`, and dropped — which is
+            // why no filter could ever say "at least 5 of your follows".
+            entries.push((
+                id,
+                scored::weight_from_f32(w),
+                scored::count_from_u32(reach),
+            ));
         }
     }
 
@@ -191,7 +230,7 @@ pub fn exclude_first_degree(map: &mut SecondDegree, first_degree: &[u32]) {
     let before = map.all_ids.len();
     map.all_ids.retain(|id| sorted.binary_search(id).is_err());
     map.entries
-        .retain(|(id, _)| sorted.binary_search(id).is_err());
+        .retain(|(id, _, _)| sorted.binary_search(id).is_err());
     debug!(
         removed = before - map.all_ids.len(),
         "excluded first degree from second"
@@ -316,7 +355,7 @@ mod tests {
         let mut m = parse_reach_tsv(tsv, 10);
         exclude_first_degree(&mut m, &[200]);
         assert_eq!(m.all_ids, vec![100, 300]);
-        assert!(m.entries.iter().all(|(id, _)| *id != 200));
+        assert!(m.entries.iter().all(|(id, _, _)| *id != 200));
     }
 
     #[test]

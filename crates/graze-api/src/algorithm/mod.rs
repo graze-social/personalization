@@ -194,16 +194,21 @@ impl LinkLonkAlgorithm {
             } else {
                 // Need to compute fresh results
                 let audit_ref = audit.as_mut().map(|a| &mut **a);
-                let mut compute_result = self
+                let compute_result = self
                     .compute_personalization(&user_hash, algo_id, &params, audit_ref)
                     .await?;
 
                 // Interleaving: blend a second ranker's list into this one so the user acts as
                 // their own control. Runs only for enrolled users, and only on a fresh compute —
-                // cached pages replay the draft that was already stored.
-                if let Some((control, treatment, control_first)) =
-                    self.interleave_assignment(Some(user_did), algo_id)
-                {
+                // cached pages replay the draft that was already stored — and never past a gate
+                // (see `interleave_or_keep`).
+                let compute_result = Self::interleave_or_keep(compute_result, || async {
+                    let Some((control, treatment, control_first)) =
+                        self.interleave_assignment(Some(user_did), algo_id)
+                    else {
+                        return Ok(None);
+                    };
+
                     // Derive co-liker weights ONCE and score both arms from them, so the arms differ
                     // only by traversal. Deriving per arm reintroduces the seed-sampling shuffle as
                     // noise (see `score_with_ranker`).
@@ -221,23 +226,26 @@ impl LinkLonkAlgorithm {
                         )
                         .await?;
 
-                    if !weights.is_empty() {
-                        let control_result = self
-                            .score_with_ranker(&user_hash, algo_id, &params, &weights, control)
-                            .await?;
-                        let treatment_result = self
-                            .score_with_ranker(&user_hash, algo_id, &params, &weights, treatment)
-                            .await?;
-                        compute_result = self.apply_interleaving(
-                            control_result,
-                            treatment_result,
-                            control,
-                            treatment,
-                            control_first,
-                            limit,
-                        );
+                    if weights.is_empty() {
+                        return Ok(None);
                     }
-                }
+
+                    let control_result = self
+                        .score_with_ranker(&user_hash, algo_id, &params, &weights, control)
+                        .await?;
+                    let treatment_result = self
+                        .score_with_ranker(&user_hash, algo_id, &params, &weights, treatment)
+                        .await?;
+                    Ok(Some(self.apply_interleaving(
+                        control_result,
+                        treatment_result,
+                        control,
+                        treatment,
+                        control_first,
+                        limit,
+                    )))
+                })
+                .await?;
 
                 // Capture scoring stats before converting
                 let stats = Some((
@@ -440,6 +448,40 @@ impl LinkLonkAlgorithm {
         }
     }
 
+    /// Hand a computed ranking to the interleaving draft — unless a gate already fired.
+    ///
+    /// `compute_personalization` returns early from its pool-size and like-density gates with a
+    /// `skip_reason` and no ranking. Replacing that result with a draft broke both halves of what
+    /// the gates are for:
+    ///
+    /// * The label. Drafts come from `score_with_ranker`, which never sets `skip_reason`, so an
+    ///   interleaved response lost its `fallback_reason` — the defect PR #61 fixed, reintroduced
+    ///   through this path. Measured 2026-09-03 on revision 62: 15 `pool_density` early exits
+    ///   produced 14 labels, ~7% short, matching `INTERLEAVE_TRAFFIC_PCT=10`.
+    /// * The cost, which matters more. The gates exist to SKIP the co-liker walk on feeds that
+    ///   structurally cannot rank; drafting ran that walk plus two full scoring passes on exactly
+    ///   those feeds, so a gated feed cost *more* than an ungated one.
+    ///
+    /// `build_draft` is therefore a closure rather than a ready-made draft: all of that work lives
+    /// inside it and is never invoked once `skip_reason` is set. It returns `None` when the user is
+    /// not enrolled or has no co-liker weights, in which case the computed ranking stands as well.
+    ///
+    /// A gated pool is not a valid experiment arm either — both arms would be drawn from a pool the
+    /// engine has already judged unrankable — so nothing is lost by not enrolling it.
+    async fn interleave_or_keep<F, Fut>(
+        compute_result: ScoringResult,
+        build_draft: F,
+    ) -> Result<ScoringResult>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Option<ScoringResult>>>,
+    {
+        if compute_result.skip_reason.is_some() {
+            return Ok(compute_result);
+        }
+        Ok(build_draft().await?.unwrap_or(compute_result))
+    }
+
     /// Team-draft the control and treatment lists into a single ranking.
     ///
     /// The draft order *is* the ranking, so `DIVERSITY_PRESERVE_ORDER` must be on for the
@@ -505,10 +547,10 @@ impl LinkLonkAlgorithm {
             // Whichever arm faceted the seed reported its keep rate; carry it so an interleaved
             // readout can still tell a ranking effect from a coverage collapse.
             seed_keep_rate: treatment.seed_keep_rate.or(control.seed_keep_rate),
-            // Neither draft can carry one — both come from `score_with_ranker`, which is only
-            // reached once the gates have passed. Propagated rather than hardcoded to `None` so
-            // that if a gate ever moves inside the ranker path, the reason survives the merge
-            // instead of being silently dropped here.
+            // Neither draft can carry one — both come from `score_with_ranker`, which
+            // `interleave_or_keep` only reaches once the gates have passed. Propagated rather than
+            // hardcoded to `None` so that if a gate ever moves inside the ranker path, the reason
+            // survives the merge instead of being silently dropped here.
             skip_reason: treatment.skip_reason.or(control.skip_reason),
         }
     }
@@ -1127,5 +1169,84 @@ impl LinkLonkAlgorithm {
     /// Get liker cache statistics.
     pub fn get_cache_stats(&self) -> CacheStats {
         self.liker_cache.get_stats()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn gated(reason: &'static str) -> ScoringResult {
+        ScoringResult {
+            skip_reason: Some(reason),
+            ..Default::default()
+        }
+    }
+
+    fn draft() -> ScoringResult {
+        ScoringResult {
+            scored_posts: vec![(1.0, "post".to_string())],
+            scored_count: 1,
+            requires_preserved_order: true,
+            ..Default::default()
+        }
+    }
+
+    /// The invariant: a gated `ScoringResult` must come out of the interleaving branch unchanged.
+    ///
+    /// Both halves matter. The label must survive, because the drafts cannot carry a
+    /// `skip_reason` and dropping it takes `fallback_reason` off the response. And the draft must
+    /// never be *built*, because the gate's whole point is to skip the co-liker walk and the two
+    /// scoring passes on a feed that cannot rank — a gated feed must cost less, not more.
+    #[tokio::test]
+    async fn a_gated_result_survives_the_interleaving_branch_untouched() {
+        for reason in ["pool_size", "pool_density", "no_colikers"] {
+            let built = Cell::new(false);
+            let out = LinkLonkAlgorithm::interleave_or_keep(gated(reason), || async {
+                built.set(true);
+                Ok(Some(draft()))
+            })
+            .await
+            .unwrap();
+
+            assert!(!built.get(), "{reason}: drafted past the gate");
+            assert_eq!(out.skip_reason, Some(reason), "{reason}: label dropped");
+            assert!(
+                out.scored_posts.is_empty(),
+                "{reason}: gated result replaced"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ungated_result_is_replaced_by_the_draft() {
+        let built = Cell::new(false);
+        let out = LinkLonkAlgorithm::interleave_or_keep(ScoringResult::default(), || async {
+            built.set(true);
+            Ok(Some(draft()))
+        })
+        .await
+        .unwrap();
+
+        assert!(built.get(), "the draft was never built");
+        assert_eq!(out.scored_count, 1);
+        assert!(out.requires_preserved_order);
+    }
+
+    /// Not enrolled, or enrolled with no co-liker weights: the computed ranking stands.
+    #[tokio::test]
+    async fn an_ungated_result_stands_when_there_is_no_draft() {
+        let computed = ScoringResult {
+            scored_posts: vec![(2.0, "computed".to_string())],
+            scored_count: 1,
+            ..Default::default()
+        };
+        let out = LinkLonkAlgorithm::interleave_or_keep(computed, || async { Ok(None) })
+            .await
+            .unwrap();
+
+        assert_eq!(out.scored_posts, vec![(2.0, "computed".to_string())]);
+        assert!(!out.requires_preserved_order);
     }
 }

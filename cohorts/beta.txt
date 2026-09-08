@@ -75,3 +75,14 @@ did:plc:7tthud43qlc2k3b7ooh7fsvu
 did:plc:fmug4zegnl7lf6ljp7aokpeh
 # topics.medsky.network
 did:plc:r6adix3aiqomftlw6m3ftd37
+
+# The rest of the Medsky accounts, added the same day as the first two.
+# pediatricskc is keyed on the DID that Graze recorded under the older handle
+# pediatricskc.medsky.social; it now presents as pediatricskc.medsky.network and
+# both handles resolve to this same DID.
+# medsky.network
+did:plc:hd564mpf6bekrwzyhvujs54b
+# lmsanational.medsky.network
+did:plc:qpidl6ss7p5grhqkduypgltx
+# pediatricskc.medsky.network
+did:plc:xitpfrpmistljpssx3i6csfd

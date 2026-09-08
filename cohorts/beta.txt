@@ -68,3 +68,10 @@ did:plc:zoaio4horax5ncnyeewotygo
 did:plc:2hwwem55ce6djnk6bn62cstr
 # bryanrva.dev
 did:plc:7tthud43qlc2k3b7ooh7fsvu
+
+# Added 2026-09-08. Both are Medsky accounts (the healthcare-worker network on
+# atproto) and both already have Graze accounts, ids 1442 and 5494.
+# moderation.medsky.network
+did:plc:fmug4zegnl7lf6ljp7aokpeh
+# topics.medsky.network
+did:plc:r6adix3aiqomftlw6m3ftd37

@@ -54,3 +54,24 @@ did:plc:geoqe3qls5mwezckxxsewys2
 did:plc:jijwtzgroy76samnivlqrpec
 # hipstersmoothie.com
 did:plc:m2sjv3wncvsasdapla35hzwj
+
+# Added 2026-09-04.
+#
+# thenexusofprivacy.net (jdp23) — runs several feeds. Also asked for
+# testing.thenexusofprivacy.net, an account for feeds that aren't ready for
+# prime time; that handle resolves to no DID as of 2026-09-04 (no _atproto TXT
+# record, no /.well-known/atproto-did, resolveHandle 400, absent from
+# searchActors), so there is nothing to key on yet. Add it once it resolves.
+# thenexusofprivacy.net
+did:plc:zoaio4horax5ncnyeewotygo
+# francesmeh.reviews
+did:plc:2hwwem55ce6djnk6bn62cstr
+# bryanrva.dev
+did:plc:7tthud43qlc2k3b7ooh7fsvu
+
+# Added 2026-09-08. Both are Medsky accounts (the healthcare-worker network on
+# atproto) and both already have Graze accounts, ids 1442 and 5494.
+# moderation.medsky.network
+did:plc:fmug4zegnl7lf6ljp7aokpeh
+# topics.medsky.network
+did:plc:r6adix3aiqomftlw6m3ftd37

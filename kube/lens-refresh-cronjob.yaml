@@ -23,7 +23,9 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 1
-      activeDeadlineSeconds: 600
+      # The refresh paces its enqueues over LENS_REFRESH_SPREAD_SECONDS (4h);
+      # the deadline must outlast that, with margin for a slow lens:active read.
+      activeDeadlineSeconds: 18000
       template:
         metadata:
           labels:
@@ -35,7 +37,7 @@ spec:
             - name: docr-graze-social-labs
           containers:
             - name: refresh
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9a3c8adddad484fe900319fc0e2fe2505e02ceda88d0a3c41e6e80e64094c03a
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:e10d73dc1ab11549be4c6ed2a31acf9b011593d1736a88fee5f5d35032b0ff43
               command: ["/app/graze-lens-refresh"]
               resources:
                 requests:
@@ -52,6 +54,10 @@ spec:
               env:
                 - name: RUST_LOG
                   value: "info"
+                # Spread ~45k nightly re-enqueues over four hours instead of dropping
+                # them on the queue at once — see bin/refresh.rs.
+                - name: LENS_REFRESH_SPREAD_SECONDS
+                  value: "14400"
               securityContext:
                 runAsNonRoot: true
                 readOnlyRootFilesystem: true

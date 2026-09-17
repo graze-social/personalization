@@ -49,10 +49,30 @@ pub struct Config {
     /// Scored entries kept per second-degree map. 20k at 6 bytes is 120 KB —
     /// the strongest signals, sized to the serve path's read budget.
     pub second_degree_top_k: usize,
-    /// Ceiling on rows pulled for one second-degree build. Bounds both the
-    /// transfer and the bloom; past this the tail is noise that costs bytes on
-    /// every request.
+    /// Ceiling on rows pulled for one scored-facet build (follows2, niche,
+    /// popular, velocity). Bounds both the transfer and the bloom; past this
+    /// the tail is noise that costs bytes on every request.
+    ///
+    /// 🔴 THE BLOOM IS SIZED FROM THIS, at 8 bits per member rounded up to a
+    /// power of two, so the cap IS the blob's size for any viewer whose reach
+    /// hits it: 500k members → a 4M-bit, 512 KB bloom behind ~150 KB of scored
+    /// entries. Measured 2026-09-17 on 40 random active viewers: niche hit the
+    /// cap for 7, follows2/popular for 1. 131,072 members fill a 1M-bit
+    /// (128 KB) bloom exactly, and every reach past the top 131k of a viewer's
+    /// second degree is a stranger with epsilon weight.
     pub second_degree_cap: usize,
+    /// Ceiling on members pulled for one COMMUNITY build.
+    ///
+    /// Separate from `second_degree_cap` because community is the facet that
+    /// actually pays: a viewer's top-3 communities together run to hundreds of
+    /// thousands of accounts, so 39 of the same 40 sampled viewers hit the old
+    /// 500k cap and carried a 665 KB blob — two thirds of every viewer's lens
+    /// footprint, and the whole of the cold-read timeout budget. 65,536
+    /// members fill a 512K-bit (64 KB) bloom exactly; members arrive ordered by
+    /// follower count within the viewer's communities, so what the cap drops is
+    /// the least-followed tail. A "community" filter at 500k accounts was not a
+    /// filter; at 65k it is one.
+    pub community_cap: usize,
     /// Window for the velocity facet: "discovered in the last N days".
     pub velocity_days: u32,
     /// How many of the viewer's top communities the community facet draws from.
@@ -114,7 +134,8 @@ impl Config {
             metrics_port: parse("METRICS_PORT", 9090)?,
 
             second_degree_top_k: parse("LENS_SECOND_DEGREE_TOP_K", 20_000)?,
-            second_degree_cap: parse("LENS_SECOND_DEGREE_CAP", 500_000)?,
+            second_degree_cap: parse("LENS_SECOND_DEGREE_CAP", 131_072)?,
+            community_cap: parse("LENS_COMMUNITY_CAP", 65_536)?,
             velocity_days: parse("LENS_VELOCITY_DAYS", 7)?,
             community_top: parse("LENS_COMMUNITY_TOP", 3)?,
 
@@ -158,7 +179,8 @@ impl Config {
             max_set_size: 200_000,
             metrics_port: 9090,
             second_degree_top_k: 20_000,
-            second_degree_cap: 500_000,
+            second_degree_cap: 131_072,
+            community_cap: 65_536,
             velocity_days: 7,
             community_top: 3,
             concurrency: 8,

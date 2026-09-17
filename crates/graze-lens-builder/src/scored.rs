@@ -452,6 +452,27 @@ pub fn bloom_contains(blob: &[u8], id: u32) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The caps in `config.rs` are chosen to fill a power-of-two bloom exactly;
+    /// this pins the bytes each one costs, so a cap change is a size change on
+    /// purpose rather than by rounding accident.
+    #[test]
+    fn the_configured_caps_fill_their_blooms_exactly() {
+        for (members, expect_bits) in [
+            (65_536usize, 524_288u32),
+            (131_072, 1_048_576),
+            (500_000, 4_194_304),
+        ] {
+            let ids: Vec<u32> = (1..=members as u32).collect();
+            let mut blob = Vec::new();
+            append_bloom(&mut blob, &ids);
+            let m_bits = u32::from_le_bytes(blob[4..8].try_into().unwrap());
+            assert_eq!(m_bits, expect_bits, "{members} members");
+            assert_eq!(blob.len(), 12 + expect_bits as usize / 8);
+        }
+        // 64 KB for community, 128 KB for the other scored facets, against the 512 KB the
+        // old 500k cap produced for every viewer whose reach hit it.
+    }
     use super::*;
 
     /// The bytes feeder-rs must agree on. If this changes, the other repo's

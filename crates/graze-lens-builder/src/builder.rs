@@ -801,7 +801,7 @@ impl Builder {
         let members_sql = priors::community_members_query(
             &self.clickhouse.database,
             &communities,
-            self.config.second_degree_cap,
+            self.config.community_cap,
         );
         let mut map = priors::parse_members_tsv(
             &self.query_text(&members_sql).await?,

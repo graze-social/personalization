@@ -24,7 +24,10 @@ metadata:
 spec:
   # Horizontally scalable: the consumer group hands each request to exactly one
   # replica. Kept at 1 for M0, where the whole population is an allowlist.
-  replicas: 1
+  # Two, since 2026-09-17: one pod builds about one facet a second, and the
+  # refresh plus on-demand builds want headroom so a new reader's first build
+  # is not waiting on the fleet's nightly rebuild.
+  replicas: 2
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -66,8 +69,8 @@ spec:
           command: ["/app/graze-lens-builder"]
           resources:
             requests:
-              memory: "128Mi"
-              cpu: "100m"
+              memory: "256Mi"
+              cpu: "250m"
             limits:
               memory: "512Mi"
               cpu: "1"

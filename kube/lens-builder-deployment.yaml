@@ -65,7 +65,7 @@ spec:
           # cronjobs share this image tag and are deliberately still on
           # 9a3c8add: they run different binaries that this change does not
           # touch, so moving them would be blast radius for nothing.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:b04cf3d437d09b70e09f5769f6adf62e3ba8dc98f796c78860b2c23d1ac53f39
+          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:e10d73dc1ab11549be4c6ed2a31acf9b011593d1736a88fee5f5d35032b0ff43
           command: ["/app/graze-lens-builder"]
           resources:
             requests:

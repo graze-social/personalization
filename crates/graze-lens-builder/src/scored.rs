@@ -458,7 +458,11 @@ mod tests {
     /// purpose rather than by rounding accident.
     #[test]
     fn the_configured_caps_fill_their_blooms_exactly() {
-        for (members, expect_bits) in [(65_536usize, 524_288u32), (131_072, 1_048_576), (500_000, 4_194_304)] {
+        for (members, expect_bits) in [
+            (65_536usize, 524_288u32),
+            (131_072, 1_048_576),
+            (500_000, 4_194_304),
+        ] {
             let ids: Vec<u32> = (1..=members as u32).collect();
             let mut blob = Vec::new();
             append_bloom(&mut blob, &ids);

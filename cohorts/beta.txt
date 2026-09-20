@@ -86,3 +86,18 @@ did:plc:hd564mpf6bekrwzyhvujs54b
 did:plc:qpidl6ss7p5grhqkduypgltx
 # pediatricskc.medsky.network
 did:plc:xitpfrpmistljpssx3i6csfd
+
+# Added 2026-09-20. These three already held the `lenses` flag in feed_db — they
+# were in the beta in every way that serves, and only this file did not say so.
+# Found by diffing the file against the flag rather than by anyone reporting it,
+# which is the second time this file has drifted BEHIND what actually served.
+# The flag is what gates; this file is what a human reads. Keep them equal.
+#
+# feeds.richferro.com is a SECOND account of richferro.com (already above under a
+# different DID) — the same person's feed-publishing account, not a duplicate row.
+# oops.wtf
+did:plc:7opjnfmb6gtbgjrsr3777ujx
+# feeds.richferro.com
+did:plc:r7bmrtzbjsxppr6klwu7eqbp
+# jmbroad.bsky.social
+did:plc:aeda6g6w6hgevhl3dfao7rvy

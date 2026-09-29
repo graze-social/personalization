@@ -101,8 +101,20 @@ spec:
             # unfiltered feed while it rebuilt.
             - name: LENS_SET_TTL_SECONDS
               value: "604800"
+            # 20s, matching the code default. This was 60, which let a build
+            # whose graph expansion had gone pathological hold a worker slot for
+            # a full minute; 131 queries hit exactly that on 2026-09-29. A build
+            # that cannot finish in 20s is not going to produce a useful blob.
             - name: LENS_QUERY_MAX_EXECUTION_SECONDS
-              value: "60"
+              value: "20"
+            # Per pod, so the fleet runs 2x this many reach queries at once.
+            # Unset it defaults to 8, i.e. 16 concurrent -- measured 2026-09-29
+            # holding non-graph ClickHouse p99 at ~8.2s against a ~500ms
+            # baseline for ten hours a night. Interim throttle: the real fix is
+            # dropping niche/popular from the nightly refresh (86% of the query
+            # time), after which this can go back up.
+            - name: LENS_BUILD_CONCURRENCY
+              value: "3"
             - name: LENS_MAX_SET_SIZE
               value: "200000"
             - name: RUST_LOG

@@ -20,14 +20,19 @@ use tracing_subscriber::EnvFilter;
 
 const ACTIVE_KEY: &str = "lens:active";
 const QUEUE: &str = "queue:lens";
-const FACETS: &[&str] = &[
-    "follows",
-    "follows2",
-    "niche",
-    "popular",
-    "velocity",
-    "community",
-];
+/// Only the facets whose *content* is time-shaped, which is what this job was
+/// written for. Measured on prod 2026-09-29: a nightly pass enqueues 195,228
+/// builds against a fleet that drains ~9,240/hour, so it runs for ~10 hours and
+/// holds non-graph ClickHouse p99 at ~8.2 s against a ~500 ms baseline.
+///
+/// `niche` and `popular` are 28% of those builds and **86% of the ClickHouse
+/// query time** — they join `account_stats` and expand the full follow graph,
+/// ~5.3 s each, against ~0.8 s for the rest. Neither is time-shaped: both are
+/// structural properties of the follow graph. `follows` and `follows2` are not
+/// time-shaped either, and the module docs above already say deltas keep
+/// `follows` live between builds. All four keep their 7-day TTL and rebuild on
+/// demand, which spreads that load over real requests instead of one burst.
+const FACETS: &[&str] = &["velocity", "community"];
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

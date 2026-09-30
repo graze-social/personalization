@@ -47,8 +47,24 @@ async fn main() -> anyhow::Result<()> {
 
     let mut shutdown = Box::pin(signal::ctrl_c());
     let block_ms = config.block.as_millis() as u64;
+    let reclaim_min_idle_ms = config.reclaim_min_idle.as_millis() as u64;
+    // Sweep on the first pass rather than after one interval: a pod that just
+    // replaced a crashed one should pick up what that one dropped, now.
+    let mut next_reclaim = tokio::time::Instant::now();
 
     loop {
+        // Entries stranded by a dead consumer -- see `queue::Queue::reclaim`.
+        // Failure is logged and skipped: a sweep is housekeeping, and must
+        // never stop the worker from draining new work.
+        let mut reclaimed = Vec::new();
+        if tokio::time::Instant::now() >= next_reclaim {
+            next_reclaim = tokio::time::Instant::now() + config.reclaim_interval;
+            match queue.reclaim(reclaim_min_idle_ms, config.batch_size).await {
+                Ok(d) => reclaimed = d,
+                Err(e) => warn!(error = %e, "pending-list sweep failed"),
+            }
+        }
+
         let deliveries = tokio::select! {
             _ = &mut shutdown => {
                 info!("shutdown requested");
@@ -78,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
         // Two builds for the same viewer may overlap. That is safe rather than
         // merely tolerable: publishing stages into a temporary key and RENAMEs,
         // so a reader sees one complete set or the other, never a mixture.
-        for delivery in deliveries {
+        for delivery in reclaimed.into_iter().chain(deliveries) {
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(e) => {

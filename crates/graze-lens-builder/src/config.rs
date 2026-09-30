@@ -30,6 +30,13 @@ pub struct Config {
     pub batch_size: usize,
     /// How long to block waiting for work before looping.
     pub block: Duration,
+    /// How often to sweep the pending list for entries stranded by a dead
+    /// consumer. See `queue::Queue::reclaim`.
+    pub reclaim_interval: Duration,
+    /// How long an entry must have sat unacknowledged before we take it back.
+    /// Must exceed the longest plausible build (a whale backfill is ~2 min) so
+    /// a sweep does not steal work that is still running.
+    pub reclaim_min_idle: Duration,
 
     /// TTL on a built lens set.
     ///
@@ -127,6 +134,8 @@ impl Config {
                 .unwrap_or_else(|| "lens-builder-0".to_string()),
             batch_size: parse("LENS_BATCH_SIZE", 16)?,
             block: Duration::from_millis(parse("LENS_BLOCK_MS", 5_000)?),
+            reclaim_interval: Duration::from_secs(parse("LENS_RECLAIM_INTERVAL_SECONDS", 300)?),
+            reclaim_min_idle: Duration::from_secs(parse("LENS_RECLAIM_MIN_IDLE_SECONDS", 600)?),
 
             set_ttl: Duration::from_secs(parse("LENS_SET_TTL_SECONDS", 604_800)?),
             max_set_size: parse("LENS_MAX_SET_SIZE", 200_000)?,
@@ -175,6 +184,8 @@ impl Config {
             consumer_name: "lens-builder-test".to_string(),
             batch_size: 16,
             block: Duration::from_millis(5_000),
+            reclaim_interval: Duration::from_secs(300),
+            reclaim_min_idle: Duration::from_secs(600),
             set_ttl: Duration::from_secs(604_800),
             max_set_size: 200_000,
             metrics_port: 9090,

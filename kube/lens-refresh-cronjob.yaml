@@ -37,7 +37,7 @@ spec:
             - name: docr-graze-social-labs
           containers:
             - name: refresh
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:e10d73dc1ab11549be4c6ed2a31acf9b011593d1736a88fee5f5d35032b0ff43
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9788abaeb43a8b2c90ebceb64d5e7863fd2d2667084274d8973999f8c06f8121
               command: ["/app/graze-lens-refresh"]
               resources:
                 requests:

@@ -55,7 +55,13 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 1
-      activeDeadlineSeconds: 10800 # 3h; the measured rebuild took 89s
+      # 4h. The rebuild now spills to disk (max_bytes_in_join, see
+      # crates/graze-lens-fold/src/project.rs) and writes 5.56B rows at
+      # roughly 2.5M/s once grace_hash starts flushing buckets, so the pod
+      # needs to outlast a ~55min rebuild plus interning, stats and the
+      # recency slice. The old note here said "the measured rebuild took
+      # 89s", which has not been true since the graph outgrew one bucket.
+      activeDeadlineSeconds: 14400
       template:
         metadata:
           labels:
@@ -72,7 +78,7 @@ spec:
               # Built from commit 1a835eb (feat/lens-completeness-guard).
               # Digest-pinned: both `latest` and the short-SHA tag are mutable
               # on DOCR.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9a3c8adddad484fe900319fc0e2fe2505e02ceda88d0a3c41e6e80e64094c03a
+              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:c4051e638abdaae248bd9da03ae4a84c161f6c4c99cc964cad8aae2813fd5e19
               command: ["/app/graze-lens-project"]
               resources:
                 requests:
@@ -94,8 +100,13 @@ spec:
                 - secretRef:
                     name: lens-redis
               env:
+                # 90min. Sized for the spilled rebuild, not the old
+                # in-memory one. Measured 2026-09-30: the write reaches
+                # 42% (2.31B of 5.56B rows) by 1800s and then runs at
+                # ~2.5M rows/s, so the whole statement lands in ~50-55min.
+                # At 1800s it was killed mid-write every night.
                 - name: LENS_PROJECT_MAX_EXECUTION_SECONDS
-                  value: "1800"
+                  value: "5400"
                 - name: LENS_PROJECT_MIN_RATIO
                   value: "0.5"
                 # Bounds how many new accounts one pass may add. The cap was

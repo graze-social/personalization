@@ -183,3 +183,80 @@ async fn feeder_written_request_is_claimable() {
         .await
         .unwrap_or(());
 }
+
+/// An entry delivered to a consumer that then dies must not be stranded.
+///
+/// This is the failure that ran in production for weeks: `XINFO CONSUMERS`
+/// showed 24 consumers against 2 running pods, 22 of them dead and holding 81
+/// entries idle for 12 to 30 days. Pods are replaced on every deploy and every
+/// OOM, and before `Queue::reclaim` each one took its unacked entries with it.
+#[tokio::test]
+async fn a_dead_consumers_entries_are_reclaimed() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: TEST_REDIS_URL unset");
+        return;
+    };
+    let config = test_config(&url);
+    let pool = pool(&url, &config);
+
+    let group = format!("test-reclaim-{}", std::process::id());
+    let doomed = Queue::new(pool.clone(), group.clone(), "pod-that-dies".into());
+    let survivor = Queue::new(pool.clone(), group.clone(), "pod-that-lives".into());
+    doomed.ensure_group().await.expect("ensure group");
+
+    let payload = r#"{"viewer_did":"did:plc:orphan","facet":"velocity"}"#;
+    let mut conn = pool.get().await.expect("conn");
+    let _: String = deadpool_redis::redis::cmd("XADD")
+        .arg("queue:lens")
+        .arg("*")
+        .arg("data")
+        .arg(payload)
+        .query_async(&mut conn)
+        .await
+        .expect("xadd");
+
+    // Delivered to `doomed`, which then "dies" without acking.
+    let claimed = doomed.read(10, 1_000).await.expect("read");
+    assert!(
+        claimed
+            .iter()
+            .any(|d| d.request.viewer_did == "did:plc:orphan"),
+        "setup failed: the doomed consumer never received the entry"
+    );
+
+    // min_idle 0 so the test does not have to wait out a real idle window.
+    // In production this is LENS_RECLAIM_MIN_IDLE_SECONDS (600s), which is what
+    // keeps a sweep from stealing a build that is still running.
+    let reclaimed = survivor.reclaim(0, 10).await.expect("reclaim");
+    let ours = reclaimed
+        .iter()
+        .find(|d| d.request.viewer_did == "did:plc:orphan")
+        .expect("the orphaned entry was not reclaimed");
+    assert_eq!(ours.request.facet, "velocity");
+
+    // And acking it as the survivor actually clears it, rather than leaving it
+    // pending under the dead consumer's name.
+    survivor.ack(&ours.id).await.expect("ack");
+    let pending: deadpool_redis::redis::Value = deadpool_redis::redis::cmd("XPENDING")
+        .arg("queue:lens")
+        .arg(&group)
+        .query_async(&mut conn)
+        .await
+        .expect("xpending");
+    if let deadpool_redis::redis::Value::Array(summary) = pending {
+        if let Some(deadpool_redis::redis::Value::Int(n)) = summary.first() {
+            assert_eq!(
+                *n, 0,
+                "entry is still pending after being reclaimed and acked"
+            );
+        }
+    }
+
+    let _: () = deadpool_redis::redis::cmd("XGROUP")
+        .arg("DESTROY")
+        .arg("queue:lens")
+        .arg(&group)
+        .query_async(&mut conn)
+        .await
+        .expect("destroy group");
+}

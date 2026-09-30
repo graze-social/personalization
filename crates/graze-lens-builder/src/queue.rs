@@ -6,10 +6,10 @@
 //! duplicating work. feeder-rs is the producer (`feeder-rs/src/lens.rs`).
 
 use deadpool_redis::Pool;
-use redis::streams::StreamReadReply;
+use redis::streams::{StreamAutoClaimReply, StreamReadReply};
 use redis::{RedisResult, Value};
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub const STREAM_KEY: &str = "queue:lens";
 
@@ -75,10 +75,8 @@ impl Queue {
         let mut conn = self.redis.get().await?;
 
         // `>` means "messages never delivered to this group". Entries already
-        // delivered but unacknowledged stay in the pending list; nothing here
-        // reclaims them, which is deliberate — a build that died mid-flight is
-        // re-requested by the serve path on the viewer's next request, and that
-        // is cheaper than reasoning about ownership transfer.
+        // delivered but unacknowledged stay in the pending list; `reclaim`
+        // below is what brings those back.
         let reply: StreamReadReply = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg(&self.group)
@@ -111,6 +109,80 @@ impl Queue {
                     }
                 }
             }
+        }
+        Ok(out)
+    }
+
+    /// Take back entries stranded by a consumer that died mid-build.
+    ///
+    /// This used to be deliberately absent. The argument was that a build which
+    /// died mid-flight is re-requested by the serve path on the viewer's next
+    /// request, so ownership transfer was not worth reasoning about. Two things
+    /// that argument did not account for, both measured on prod 2026-09-30:
+    ///
+    /// 1. **Not every build has a viewer who will come back.** The nightly
+    ///    refresh (`bin/refresh.rs`) enqueues for every viewer with a published
+    ///    facet, not for whoever is currently reading. Nothing re-requests those,
+    ///    so an orphan is simply never built until the blob TTLs out.
+    /// 2. **The pending list is never cleaned.** `XINFO CONSUMERS` showed **24
+    ///    consumers against 2 running pods** — 22 dead ones holding **81 entries
+    ///    idle for 12 to 30 days**. Pods are replaced on every deploy and every
+    ///    OOM, and each one leaves its unacked entries behind forever.
+    ///
+    /// Reclaiming is cheap here specifically because a duplicate build is safe:
+    /// publishing stages into a temporary key and RENAMEs, so a reader sees one
+    /// complete set or the other (see the note in `main.rs`). `min_idle_ms` only
+    /// has to exceed the longest plausible build — a whale backfill is ~2 min —
+    /// to keep us from stealing work that is still running, and even losing that
+    /// race costs a wasted rebuild rather than a wrong answer.
+    ///
+    /// XAUTOCLAIM also drops PEL entries whose stream entry no longer exists.
+    /// That matters here: the producer trims with `MAXLEN ~ 100_000` while a
+    /// pass enqueues ~195k, so entries are routinely trimmed out from under the
+    /// pending list. Those are reported as `deleted` and are gone for good --
+    /// nothing can rebuild them, and counting them is the only way to see it.
+    pub async fn reclaim(&self, min_idle_ms: u64, count: usize) -> anyhow::Result<Vec<Delivery>> {
+        let mut conn = self.redis.get().await?;
+
+        // Cursor "0-0": always sweep from the start of the pending list. The
+        // list is small in the healthy case, and starting over each time means
+        // a worker that restarts mid-sweep does not skip anything.
+        let reply: StreamAutoClaimReply = redis::cmd("XAUTOCLAIM")
+            .arg(STREAM_KEY)
+            .arg(&self.group)
+            .arg(&self.consumer)
+            .arg(min_idle_ms)
+            .arg("0-0")
+            .arg("COUNT")
+            .arg(count)
+            .query_async(&mut conn)
+            .await
+            .map_err(anyhow::Error::from)?;
+
+        if !reply.deleted_ids.is_empty() {
+            warn!(
+                count = reply.deleted_ids.len(),
+                "pending entries were trimmed out of the stream before they could be built"
+            );
+        }
+
+        let mut out = Vec::new();
+        for entry in reply.claimed {
+            match parse_entry(&entry.map) {
+                Some(request) => out.push(Delivery {
+                    id: entry.id,
+                    request,
+                }),
+                None => {
+                    // Same reasoning as in `read`: it will never parse, and
+                    // leaving it pending is what created this problem.
+                    warn!(id = %entry.id, "dropping unparseable reclaimed request");
+                    let _ = self.ack(&entry.id).await;
+                }
+            }
+        }
+        if !out.is_empty() {
+            info!(count = out.len(), "reclaimed orphaned build requests");
         }
         Ok(out)
     }

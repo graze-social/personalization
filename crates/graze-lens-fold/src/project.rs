@@ -359,10 +359,26 @@ impl Projector {
         self.exec(&format!(
             // grace_hash, because the default hash join builds both 42M-row
             // sides in memory while streaming 2.79 billion rows through them
-            // and ClickHouse refused at 21.6 GiB. grace_hash buckets to disk
-            // and stays bounded; the extra IO is irrelevant for a job that
-            // already runs for twenty minutes. max_threads caps how many
+            // and ClickHouse refused at 21.6 GiB. max_threads caps how many
             // in-flight blocks pile up alongside it.
+            //
+            // 🔴 max_bytes_in_join is what makes grace_hash actually bucket.
+            // It is the per-bucket threshold the algorithm splits on; left at
+            // its default of 0 — unlimited — grace_hash builds one bucket and
+            // degrades into the plain hash join it was chosen to avoid. This
+            // read "grace_hash buckets to disk and stays bounded" and set no
+            // threshold, which was true only while one bucket happened to fit.
+            // It stopped fitting on 2026-09-27 and the projection failed three
+            // nights running, leaving follow_graph_int frozen at its 9/26
+            // contents while the nightly refresh rebuilt 195k lens blobs from
+            // it. Note the query ceiling is no longer the 21.6 GiB above: it is
+            // 10 GiB, set on the `default` user profile.
+            //
+            // Measured on prod, 1,000 left rows so it is purely the build side:
+            //   unset  OOM at 11.78 GiB      1 GB   3.36 GiB peak
+            //   2 GB   5.08 GiB peak         500 MB 2.72 GiB peak
+            // 1 GB keeps roughly 3x headroom under the ceiling, so the map can
+            // grow well past today's 42M before this needs revisiting.
             //
             // The map is collapsed by OPTIMIZE before this runs, so no FINAL
             // here. FINAL inside the join looked right and cost 21.7 GiB — it
@@ -391,7 +407,8 @@ impl Projector {
              ) AS e
              INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
              INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
-             SETTINGS join_algorithm = 'grace_hash', max_threads = 4"
+             SETTINGS join_algorithm = 'grace_hash', max_threads = 4,
+                      max_bytes_in_join = 1000000000"
         ))
         .await?;
 
@@ -529,7 +546,8 @@ impl Projector {
              ) AS e
              INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
              INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
-             SETTINGS join_algorithm = 'grace_hash', max_threads = 4"
+             SETTINGS join_algorithm = 'grace_hash', max_threads = 4,
+                      max_bytes_in_join = 1000000000"
         ))
         .await?;
 

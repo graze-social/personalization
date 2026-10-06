@@ -26,6 +26,11 @@ concurrency:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # id-token lets the job mint a short-lived OIDC token and assume the ECR
+    # push role. No long-lived AWS key is stored in this repository.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -38,6 +43,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # Both registries, deliberately, until the DigitalOcean cluster is retired.
+      # That cluster still serves production and pulls from DOCR, so an
+      # ECR-only push would make it impossible to ship a fix to the live estate.
+      # Drop the DigitalOcean half once the cutover has soaked.
       - name: Install doctl
         uses: digitalocean/action-doctl@v2
         with:
@@ -46,11 +55,22 @@ jobs:
       - name: Log in to DigitalOcean Container Registry
         run: doctl registry login --expiry-seconds 600
 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::715841359524:role/graze-github-ecr-push
+          aws-region: us-west-2
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: registry.digitalocean.com/graze-social-labs/personalization
+          images: |
+            registry.digitalocean.com/graze-social-labs/personalization
+            715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}

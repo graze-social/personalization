@@ -30,6 +30,8 @@ use anyhow::Context;
 use graze_common::ClickHouseConfig;
 use tracing::{info, warn};
 
+use crate::project::GROUP_BY_SPILL_BYTES;
+
 pub const COMMUNITY_TABLE: &str = "account_community";
 pub const COMMUNITY_STAGING: &str = "account_community_next";
 pub const MEMBERS_TABLE: &str = "community_members";
@@ -115,6 +117,9 @@ impl Lpa {
             // Votes: for each account, how many sampled neighbours carry each
             // label. Bounded by the sample size, and spilled to disk past the
             // group-by budget — this is the round's heavy step.
+            //
+            // The budget is GROUP_BY_SPILL_BYTES; see project.rs for why it
+            // is 3 GB and not the 8 GB this used to hold.
             self.exec(&format!("DROP TABLE IF EXISTS {db}.{VOTES}"))
                 .await?;
             self.exec(&format!(
@@ -124,7 +129,7 @@ impl Lpa {
                  INNER JOIN {db}.{LABELS} AS l ON e.dst = l.account
                  GROUP BY e.src, l.label
                  SETTINGS join_algorithm = 'grace_hash', max_threads = 4,
-                          max_bytes_before_external_group_by = 8000000000"
+                          max_bytes_before_external_group_by = {GROUP_BY_SPILL_BYTES}"
             ))
             .await
             .with_context(|| format!("votes, round {round}"))?;
@@ -138,7 +143,7 @@ impl Lpa {
                  SELECT account, argMax(label, (cnt, label)) AS label
                  FROM {db}.{VOTES} GROUP BY account
                  SETTINGS max_threads = 4,
-                          max_bytes_before_external_group_by = 8000000000"
+                          max_bytes_before_external_group_by = {GROUP_BY_SPILL_BYTES}"
             ))
             .await
             .with_context(|| format!("majority, round {round}"))?;

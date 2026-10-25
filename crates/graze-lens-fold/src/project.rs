@@ -59,6 +59,18 @@ pub const PENDING_TABLE: &str = "didint_pending";
 /// lands in exactly one — they just stop pruning.
 const FOLLOW_EDGES_PARTITIONS: u32 = 32;
 
+/// When the lens jobs' big aggregations start spilling to disk.
+///
+/// These jobs run as the `batch` ClickHouse user, whose queries share one
+/// 12 GiB per-replica budget with every other batch workload, the lens builder
+/// included. At the old 8 GB the heavy GROUP BYs held 7.5-8.7 GiB in memory
+/// (`lpa_votes` 8.71, `lpa_top` 7.59, `account_stats_next` 7.46), which left
+/// about 3 GiB for everything else, and LPA runs during the nightly refresh.
+/// A spill never changes a GROUP BY's result, only its memory and speed.
+/// Measured 2026-10-25 on `account_stats_next` as `batch` at 3 GB: 2.91 GiB
+/// peak (was 7.46), 47 s (was 94), 1.72 GiB spilled, output identical.
+pub const GROUP_BY_SPILL_BYTES: u64 = 3_000_000_000;
+
 /// How many passes the main rebuild takes. See `rebuild` for why one pass
 /// stopped fitting.
 const REBUILD_SLICES: u32 = 8;
@@ -543,7 +555,7 @@ impl Projector {
                  UNION ALL
                  SELECT follower_int, 0, 1 FROM {db}.{LIVE_TABLE}
              ) GROUP BY account_int
-             SETTINGS max_threads = 4, max_bytes_before_external_group_by = 8000000000"
+             SETTINGS max_threads = 4, max_bytes_before_external_group_by = {GROUP_BY_SPILL_BYTES}"
         ))
         .await?;
 

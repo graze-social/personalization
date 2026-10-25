@@ -80,6 +80,14 @@ pub struct Config {
     /// the least-followed tail. A "community" filter at 500k accounts was not a
     /// filter; at 65k it is one.
     pub community_cap: usize,
+    /// How long a pod reuses one community's member list before asking
+    /// ClickHouse again. The tables behind it change when LPA runs (weekly),
+    /// so this bounds how stale a community build can be after a rerun.
+    /// Zero turns the cache off.
+    pub community_cache_ttl: Duration,
+    /// Most communities, and most member rows across them, a pod caches.
+    pub community_cache_entries: usize,
+    pub community_cache_rows: usize,
     /// Window for the velocity facet: "discovered in the last N days".
     pub velocity_days: u32,
     /// How many of the viewer's top communities the community facet draws from.
@@ -145,6 +153,12 @@ impl Config {
             second_degree_top_k: parse("LENS_SECOND_DEGREE_TOP_K", 20_000)?,
             second_degree_cap: parse("LENS_SECOND_DEGREE_CAP", 131_072)?,
             community_cap: parse("LENS_COMMUNITY_CAP", 65_536)?,
+            community_cache_ttl: Duration::from_secs(parse(
+                "LENS_COMMUNITY_CACHE_TTL_SECONDS",
+                600,
+            )?),
+            community_cache_entries: parse("LENS_COMMUNITY_CACHE_ENTRIES", 4_096)?,
+            community_cache_rows: parse("LENS_COMMUNITY_CACHE_ROWS", 1_048_576)?,
             velocity_days: parse("LENS_VELOCITY_DAYS", 7)?,
             community_top: parse("LENS_COMMUNITY_TOP", 3)?,
 
@@ -192,6 +206,9 @@ impl Config {
             second_degree_top_k: 20_000,
             second_degree_cap: 131_072,
             community_cap: 65_536,
+            community_cache_ttl: Duration::from_secs(600),
+            community_cache_entries: 4_096,
+            community_cache_rows: 1_048_576,
             velocity_days: 7,
             community_top: 3,
             concurrency: 8,

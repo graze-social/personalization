@@ -6,6 +6,7 @@
 //! for an hour and feeds keep serving, unlensed.
 
 pub mod builder;
+pub mod community_cache;
 pub mod config;
 pub mod domain;
 // The interner moved to graze-common so graze-lens-fold can use it too: the

@@ -52,6 +52,25 @@ pub const RECENT_STAGING: &str = "follow_graph_recent_next";
 /// Accounts still needing an id, materialised once per run.
 pub const PENDING_TABLE: &str = "didint_pending";
 
+/// `follow_edges` is partitioned by `cityHash64(follower) % 32`
+/// (feed-processor `scripts/create_follow_edges_tables.py`). The rebuild slices
+/// on that same expression so each pass reads only its own partitions. If the
+/// table is ever repartitioned the slices stay correct — every follower still
+/// lands in exactly one — they just stop pruning.
+const FOLLOW_EDGES_PARTITIONS: u32 = 32;
+
+/// How many passes the main rebuild takes. See `rebuild` for why one pass
+/// stopped fitting.
+const REBUILD_SLICES: u32 = 8;
+
+/// The `follow_edges` partitions slice `k` of `slices` covers. Every partition
+/// lands in exactly one slice.
+fn slice_partitions(slices: u32, k: u32) -> Vec<u32> {
+    (0..FOLLOW_EDGES_PARTITIONS)
+        .filter(|p| p % slices == k)
+        .collect()
+}
+
 /// Interner keys — the **lens-owned** id space, on the lens Redis.
 ///
 /// Not the shared `didint:{didint}:*` space that rust-smasher and
@@ -356,61 +375,94 @@ impl Projector {
         // keep the create row of an unfollowed pair and resurrect a dead edge.
         // Joins are INNER, so an account still lacking an id drops out rather
         // than projecting to 0 and colliding with a real account.
-        self.exec(&format!(
-            // grace_hash, because the default hash join builds both 42M-row
-            // sides in memory while streaming 2.79 billion rows through them
-            // and ClickHouse refused at 21.6 GiB. max_threads caps how many
-            // in-flight blocks pile up alongside it.
-            //
-            // 🔴 max_bytes_in_join is what makes grace_hash actually bucket.
-            // It is the per-bucket threshold the algorithm splits on; left at
-            // its default of 0 — unlimited — grace_hash builds one bucket and
-            // degrades into the plain hash join it was chosen to avoid. This
-            // read "grace_hash buckets to disk and stays bounded" and set no
-            // threshold, which was true only while one bucket happened to fit.
-            // It stopped fitting on 2026-09-27 and the projection failed three
-            // nights running, leaving follow_graph_int frozen at its 9/26
-            // contents while the nightly refresh rebuilt 195k lens blobs from
-            // it. Note the query ceiling is no longer the 21.6 GiB above: it is
-            // 10 GiB, set on the `default` user profile.
-            //
-            // Measured on prod, 1,000 left rows so it is purely the build side:
-            //   unset  OOM at 11.78 GiB      1 GB   3.36 GiB peak
-            //   2 GB   5.08 GiB peak         500 MB 2.72 GiB peak
-            // 1 GB keeps roughly 3x headroom under the ceiling, so the map can
-            // grow well past today's 42M before this needs revisiting.
-            //
-            // The map is collapsed by OPTIMIZE before this runs, so no FINAL
-            // here. FINAL inside the join looked right and cost 21.7 GiB — it
-            // turns the 42M-row side into an aggregating transform feeding a
-            // 2.79B-row join. Collapsing the small table once beforehand is the
-            // same guarantee for a fraction of the memory.
-            //
-            // The edges themselves are deliberately NOT deduplicated here. `follow_edges` is keyed on
-            // (follower, rkey), and a follow → unfollow → refollow cycle issues
-            // a new rkey, so an unwitnessed delete leaves two live creates for
-            // one pair. Collapsing them with GROUP BY means holding 2.77
-            // billion distinct pairs in a hash table, which exceeded
-            // ClickHouse's 21.6 GiB limit outright.
-            //
-            // The duplicates only matter because they would make one follow
-            // count twice in a reach total, so they are counted away where the
-            // working set is small — `second_degree::reach_query` counts
-            // distinct followers over one viewer's seeds, tens of thousands of
-            // rows rather than billions.
-            "INSERT INTO {db}.{STAGING_TABLE} (follower_int, followee_int)
-             SELECT m1.id, m2.id
-             FROM (
-                 SELECT follower, followee FROM (
-                     SELECT follower, followee, op FROM {db}.follow_edges FINAL
-                 ) WHERE op = 'create' AND followee != ''
-             ) AS e
-             INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
-             INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
-             SETTINGS join_algorithm = 'grace_hash', max_threads = 4,
-                      max_bytes_in_join = 1000000000"
-        ))
-        .await?;
+        // 🔴 One pass no longer fits, and the limit is DISK, not memory.
+        // ClickHouse Cloud keeps temporary data inside the filesystem cache
+        // (`temporary_data_in_cache`), and temporary data may hold at most 40%
+        // of it: 141.53 GB of our 353.8 GB cache. grace_hash spills nearly the
+        // whole left side — ~3B edges carrying two DID strings each, through
+        // two chained joins — and that spill crossed 141.53 GB on 2026-10-02.
+        // Every run from then until 10/25 died at exactly that figure, as
+        // `Code: 243 … Failed to reserve … for temporary file` or, when the
+        // failed write surfaced elsewhere first, `Code: 734 … Cannot write to
+        // canceled buffer`, ~11 minutes in, and follow_graph_int stayed frozen
+        // at its 10/01 contents. Memory was a steady 4.5-4.9 GiB throughout.
+        //
+        // So the edges go through in REBUILD_SLICES passes by follower
+        // partition. The joins are row-by-row, so the union of the slices is
+        // exactly the single query's output; each pass spills ~1/8 as much and
+        // reads only its own partitions. FINAL stays correct per slice because
+        // all versions of one (follower, rkey) share a partition.
+        //
+        // grace_hash, because the default hash join builds both 42M-row
+        // sides in memory while streaming 2.79 billion rows through them
+        // and ClickHouse refused at 21.6 GiB. max_threads caps how many
+        // in-flight blocks pile up alongside it.
+        //
+        // 🔴 max_bytes_in_join is what makes grace_hash actually bucket.
+        // It is the per-bucket threshold the algorithm splits on; left at
+        // its default of 0 — unlimited — grace_hash builds one bucket and
+        // degrades into the plain hash join it was chosen to avoid. This
+        // read "grace_hash buckets to disk and stays bounded" and set no
+        // threshold, which was true only while one bucket happened to fit.
+        // It stopped fitting on 2026-09-27 and the projection failed three
+        // nights running, leaving follow_graph_int frozen at its 9/26
+        // contents while the nightly refresh rebuilt 195k lens blobs from
+        // it. Note the query ceiling is no longer the 21.6 GiB above: it is
+        // 10 GiB, set on the `default` user profile.
+        //
+        // Measured on prod, 1,000 left rows so it is purely the build side:
+        //   unset  OOM at 11.78 GiB      1 GB   3.36 GiB peak
+        //   2 GB   5.08 GiB peak         500 MB 2.72 GiB peak
+        // 1 GB keeps roughly 3x headroom under the ceiling, so the map can
+        // grow well past today's 42M before this needs revisiting.
+        //
+        // The map is collapsed by OPTIMIZE before this runs, so no FINAL
+        // here. FINAL inside the join looked right and cost 21.7 GiB — it
+        // turns the 42M-row side into an aggregating transform feeding a
+        // 2.79B-row join. Collapsing the small table once beforehand is the
+        // same guarantee for a fraction of the memory.
+        //
+        // The edges themselves are deliberately NOT deduplicated here. `follow_edges` is keyed on
+        // (follower, rkey), and a follow → unfollow → refollow cycle issues
+        // a new rkey, so an unwitnessed delete leaves two live creates for
+        // one pair. Collapsing them with GROUP BY means holding 2.77
+        // billion distinct pairs in a hash table, which exceeded
+        // ClickHouse's 21.6 GiB limit outright.
+        //
+        // The duplicates only matter because they would make one follow
+        // count twice in a reach total, so they are counted away where the
+        // working set is small — `second_degree::reach_query` counts
+        // distinct followers over one viewer's seeds, tens of thousands of
+        // rows rather than billions.
+        for k in 0..REBUILD_SLICES {
+            let partitions = slice_partitions(REBUILD_SLICES, k)
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let started = std::time::Instant::now();
+            self.exec(&format!(
+                "INSERT INTO {db}.{STAGING_TABLE} (follower_int, followee_int)
+                 SELECT m1.id, m2.id
+                 FROM (
+                     SELECT follower, followee FROM (
+                         SELECT follower, followee, op FROM {db}.follow_edges FINAL
+                         WHERE cityHash64(follower) % {FOLLOW_EDGES_PARTITIONS} IN ({partitions})
+                     ) WHERE op = 'create' AND followee != ''
+                 ) AS e
+                 INNER JOIN {db}.{MAP_TABLE} AS m1 ON e.follower = m1.did
+                 INNER JOIN {db}.{MAP_TABLE} AS m2 ON e.followee = m2.did
+                 SETTINGS join_algorithm = 'grace_hash', max_threads = 4,
+                          max_bytes_in_join = 1000000000"
+            ))
+            .await?;
+            info!(
+                slice = k + 1,
+                of = REBUILD_SLICES,
+                secs = started.elapsed().as_secs(),
+                "projection slice written"
+            );
+        }
 
         // Two DIFFERENT accounts sharing an id is silent: the join fans out,
         // edges are attributed to the wrong people, and the projection still
@@ -648,6 +700,16 @@ mod tests {
     #[test]
     fn live_and_staging_are_distinct() {
         assert_ne!(LIVE_TABLE, STAGING_TABLE);
+        let mut seen = vec![0u32; FOLLOW_EDGES_PARTITIONS as usize];
+        for k in 0..REBUILD_SLICES {
+            for p in slice_partitions(REBUILD_SLICES, k) {
+                seen[p as usize] += 1;
+            }
+        }
+        assert!(
+            seen.iter().all(|&n| n == 1),
+            "every follow_edges partition is rebuilt exactly once"
+        );
         assert!(STAGING_TABLE.starts_with(LIVE_TABLE));
     }
 

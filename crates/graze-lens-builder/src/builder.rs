@@ -17,6 +17,7 @@ use graze_common::ClickHouseConfig;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::community_cache::CommunityCache;
 use crate::config::Config;
 use crate::domain;
 use crate::interner::Interner;
@@ -149,6 +150,8 @@ pub struct Builder {
     sink: Option<Sink>,
     /// Shared DID interner, on the cache Redis. Required for v2/follows2.
     interner: Option<Interner>,
+    /// Community member lists, shared by every build on this pod.
+    community_members: CommunityCache,
 }
 
 impl Builder {
@@ -162,11 +165,16 @@ impl Builder {
             redis,
             http,
             clickhouse: config.clickhouse.clone(),
-            config,
             completeness: None,
             backfiller: None,
             sink: None,
             interner: None,
+            community_members: CommunityCache::new(
+                config.community_cache_ttl,
+                config.community_cache_entries,
+                config.community_cache_rows,
+            ),
+            config,
         })
     }
 
@@ -797,20 +805,47 @@ impl Builder {
             self.mark_state(viewer, "ready").await?;
             return Ok(BuildOutcome::Empty);
         }
-        let communities: Vec<u32> = affinity.iter().map(|(c, _)| *c).collect();
-        let members_sql = priors::community_members_query(
-            &self.clickhouse.database,
-            &communities,
-            self.config.community_cap,
-        );
-        let mut map = priors::parse_members_tsv(
-            &self.query_text(&members_sql).await?,
+        let mut lists = Vec::with_capacity(affinity.len());
+        for &(community, _) in &affinity {
+            lists.push(self.community_top_members(community).await?);
+        }
+        let lists: Vec<&[priors::MemberRow]> = lists.iter().map(|l| l.as_slice()).collect();
+        let members = priors::merge_members(&lists, self.config.community_cap);
+        let mut map = priors::score_members(
+            &members,
             &affinity,
             seeds.len(),
             self.config.second_degree_top_k,
         );
         second_degree::exclude_first_degree(&mut map, &seeds);
         self.publish_scored(viewer, FACET_COMMUNITY, map, &seeds)
+            .await
+    }
+
+    /// One community's most-followed members, shared across builds on this
+    /// pod; see `community_cache`.
+    async fn community_top_members(
+        &self,
+        community: u32,
+    ) -> anyhow::Result<std::sync::Arc<Vec<priors::MemberRow>>> {
+        self.community_members
+            .get_or_fetch(community, || async {
+                let started = std::time::Instant::now();
+                let sql = priors::community_top_members_query(
+                    &self.clickhouse.database,
+                    community,
+                    self.config.community_cap,
+                );
+                let rows =
+                    priors::parse_community_top_tsv(&self.query_text(&sql).await?, community);
+                debug!(
+                    community,
+                    rows = rows.len(),
+                    ms = started.elapsed().as_millis() as u64,
+                    "community members fetched"
+                );
+                Ok(rows)
+            })
             .await
     }
 

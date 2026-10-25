@@ -129,23 +129,85 @@ pub fn community_affinity_query(database: &str, seeds: &[u32], top: usize) -> St
     )
 }
 
-/// Members of the viewer's top communities, ranked by in-community fame.
+/// One member of a community, as the community facet consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberRow {
+    pub account: u32,
+    pub community: u32,
+    pub followers: u64,
+}
+
+/// The `cap` most-followed members of ONE community, ordered by
+/// `followers DESC, account ASC`.
 ///
-/// Small-right again: the member set for a handful of communities is the
-/// bounded side, `account_stats` streams past it.
-pub fn community_members_query(database: &str, communities: &[u32], cap: usize) -> String {
+/// The facet used to ask for the viewer's whole community set in one join —
+/// `account_stats INNER JOIN community_members WHERE community IN (a,b,c)
+/// ORDER BY followers DESC, account ASC LIMIT cap`. Measured 2026-10-25 that
+/// ran ~16k times in 3.7h of the nightly refresh at 1.57 GiB each, 80% of them
+/// for the SAME three communities, because LPA leaves three giants (1.8M,
+/// 4.4M, 5.4M members) and a long tail of singletons, so nearly every viewer's
+/// top-3 is the same giants. Asking per community instead makes the answer
+/// cacheable by community (see `community_cache`), and the old answer is
+/// recovered exactly by [`merge_members`]: every account sits in exactly one
+/// community, so the global top-`cap` is drawn from the per-community top-`cap`s.
+///
+/// An `IN` filter rather than a join: it builds a set of UInt32s instead of a
+/// hash table of (account, community) rows — 220 MiB against 1.57 GiB on the
+/// 5.4M-member community — and it returns the same rows, since `account` is
+/// unique in `community_members`.
+pub fn community_top_members_query(database: &str, community: u32, cap: usize) -> String {
     format!(
-        "SELECT m.account, m.community, s.followers \
-         FROM {database}.account_stats AS s \
-         INNER JOIN ( \
-             SELECT account, community FROM {database}.community_members \
-             WHERE community IN ({list}) \
-         ) AS m ON s.account_int = m.account \
-         ORDER BY s.followers DESC, m.account ASC \
+        "SELECT account_int, followers \
+         FROM {database}.account_stats \
+         WHERE account_int IN ( \
+             SELECT account FROM {database}.community_members \
+             WHERE community = {community} \
+         ) \
+         ORDER BY followers DESC, account_int ASC \
          LIMIT {cap} \
          FORMAT TabSeparated",
-        list = seed_list_of(communities),
     )
+}
+
+/// Parse `(account, followers)` rows from [`community_top_members_query`].
+pub fn parse_community_top_tsv(text: &str, community: u32) -> Vec<MemberRow> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut cols = line.split('\t');
+        let (Some(a), Some(f)) = (cols.next(), cols.next()) else {
+            continue;
+        };
+        let (Ok(account), Ok(followers)) = (a.trim().parse::<u32>(), f.trim().parse::<u64>())
+        else {
+            continue;
+        };
+        out.push(MemberRow {
+            account,
+            community,
+            followers,
+        });
+    }
+    out
+}
+
+/// Combine per-community top lists into what the single set query returned:
+/// the `cap` most-followed members across all of them, `followers DESC,
+/// account ASC`.
+///
+/// Order matters beyond the cap: [`score_members`] sorts stably, so members
+/// tied on score keep this order, exactly as they kept ClickHouse's.
+/// `community` is a final tiebreak only so the order is total; with one
+/// community per account it never decides anything.
+pub fn merge_members(lists: &[&[MemberRow]], cap: usize) -> Vec<MemberRow> {
+    let mut all: Vec<MemberRow> = lists.iter().flat_map(|l| l.iter().copied()).collect();
+    all.sort_unstable_by(|x, y| {
+        y.followers
+            .cmp(&x.followers)
+            .then(x.account.cmp(&y.account))
+            .then(x.community.cmp(&y.community))
+    });
+    all.truncate(cap);
+    all
 }
 
 /// Parse `(id, reach, score)` rows into a scored map, normalising weights
@@ -226,10 +288,40 @@ pub fn parse_affinity_tsv(text: &str, seeds: usize) -> Vec<(u32, f32)> {
     out
 }
 
-/// Parse `(account, community, followers)` member rows, weighting each member
-/// by `affinity_share(community) × ln(2 + fame)`, normalised to the best.
+/// Parse `(account, community, followers)` member rows and score them with
+/// [`score_members`].
 pub fn parse_members_tsv(
     text: &str,
+    affinity: &[(u32, f32)],
+    seeds: usize,
+    top_k: usize,
+) -> SecondDegree {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut cols = line.split('\t');
+        let (Some(a), Some(c), Some(f)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        let (Ok(account), Ok(community), Ok(followers)) = (
+            a.trim().parse::<u32>(),
+            c.trim().parse::<u32>(),
+            f.trim().parse::<u64>(),
+        ) else {
+            continue;
+        };
+        rows.push(MemberRow {
+            account,
+            community,
+            followers,
+        });
+    }
+    score_members(&rows, affinity, seeds, top_k)
+}
+
+/// Weight each member by `affinity_share(community) × ln(2 + fame)`,
+/// normalised to the best.
+pub fn score_members(
+    rows: &[MemberRow],
     affinity: &[(u32, f32)],
     seeds: usize,
     top_k: usize,
@@ -239,18 +331,12 @@ pub fn parse_members_tsv(
     let mut all_ids: Vec<u32> = Vec::new();
     let mut max_reach = 0u32;
 
-    for line in text.lines() {
-        let mut cols = line.split('\t');
-        let (Some(a), Some(c), Some(f)) = (cols.next(), cols.next(), cols.next()) else {
-            continue;
-        };
-        let (Ok(a), Ok(c), Ok(f)) = (
-            a.trim().parse::<u32>(),
-            c.trim().parse::<u32>(),
-            f.trim().parse::<u64>(),
-        ) else {
-            continue;
-        };
+    for &MemberRow {
+        account: a,
+        community: c,
+        followers: f,
+    } in rows
+    {
         let Some(sh) = share(c) else { continue };
         all_ids.push(a);
         // The count community can honestly give: how many of the viewer's own
@@ -413,6 +499,77 @@ mod tests {
         assert!(
             m.all_ids.contains(&200),
             "but the other member still blooms"
+        );
+    }
+
+    /// Per-community top lists merged must equal the old single query: the
+    /// global top-`cap` by `followers DESC, account ASC`, ties included.
+    #[test]
+    fn merged_community_tops_match_the_set_query() {
+        let row = |account, community, followers| MemberRow {
+            account,
+            community,
+            followers,
+        };
+        let all = vec![
+            row(1, 5, 100),
+            row(2, 5, 90),
+            row(3, 5, 90),
+            row(4, 5, 1),
+            row(10, 9, 95),
+            row(11, 9, 90),
+            row(12, 9, 2),
+            row(20, 7, 90),
+        ];
+        let cap = 4;
+        // What `ORDER BY followers DESC, account ASC LIMIT cap` over the
+        // union returns.
+        let mut expected = all.clone();
+        expected.sort_by(|x, y| {
+            y.followers
+                .cmp(&x.followers)
+                .then(x.account.cmp(&y.account))
+        });
+        expected.truncate(cap);
+
+        let top_of = |c: u32| {
+            let mut l: Vec<MemberRow> = all.iter().copied().filter(|r| r.community == c).collect();
+            l.sort_by(|x, y| {
+                y.followers
+                    .cmp(&x.followers)
+                    .then(x.account.cmp(&y.account))
+            });
+            l.truncate(cap);
+            l
+        };
+        let (a, b, c) = (top_of(5), top_of(9), top_of(7));
+        // Input order of the lists must not matter: viewers name the same
+        // communities in different orders.
+        assert_eq!(merge_members(&[&a, &b, &c], cap), expected);
+        assert_eq!(merge_members(&[&c, &a, &b], cap), expected);
+        assert_eq!(
+            expected.iter().map(|r| r.account).collect::<Vec<_>>(),
+            vec![1, 10, 2, 3]
+        );
+    }
+
+    #[test]
+    fn community_top_rows_carry_their_community() {
+        let rows = parse_community_top_tsv("7\t900\n8\t12\nbad\n", 41);
+        assert_eq!(
+            rows,
+            vec![
+                MemberRow {
+                    account: 7,
+                    community: 41,
+                    followers: 900
+                },
+                MemberRow {
+                    account: 8,
+                    community: 41,
+                    followers: 12
+                },
+            ]
         );
     }
 

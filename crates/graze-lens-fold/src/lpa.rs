@@ -44,6 +44,10 @@ const LABELS_NEXT: &str = "lpa_labels_next";
 const VOTES: &str = "lpa_votes";
 const TOP: &str = "lpa_top";
 
+/// The per-bucket threshold that makes grace_hash actually bucket; see the
+/// votes step. Same value project.rs uses for its joins.
+const JOIN_BUCKET_BYTES: u64 = 1_000_000_000;
+
 pub struct LpaConfig {
     pub clickhouse: ClickHouseConfig,
     pub timeout: Duration,
@@ -120,6 +124,18 @@ impl Lpa {
             //
             // The budget is GROUP_BY_SPILL_BYTES; see project.rs for why it
             // is 3 GB and not the 8 GB this used to hold.
+            //
+            // 🔴 The join, not the GROUP BY, was what held the memory. Without
+            // max_bytes_in_join, grace_hash never splits into buckets (the
+            // threshold defaults to 0, unlimited) and builds all 42.5M labels
+            // as one in-memory hash table — the same gap project.rs hit on
+            // 2026-09-27. Measured 2026-10-25 on round 1 (every account its own
+            // label, the worst round) as the 12 GiB `batch` user: 9.52 GiB and
+            // killed at the user limit without it; 3.81 GiB, 207 s, 6.74 GiB
+            // spilled with it. A 1/8 slice without it still took 6.47 GiB while
+            // spilling only 485 MiB of GROUP BY state, which is how we know it
+            // was the join. Votes are identical either way (row count and
+            // per-row hash over 71.7M rows).
             self.exec(&format!("DROP TABLE IF EXISTS {db}.{VOTES}"))
                 .await?;
             self.exec(&format!(
@@ -129,6 +145,7 @@ impl Lpa {
                  INNER JOIN {db}.{LABELS} AS l ON e.dst = l.account
                  GROUP BY e.src, l.label
                  SETTINGS join_algorithm = 'grace_hash', max_threads = 4,
+                          max_bytes_in_join = {JOIN_BUCKET_BYTES},
                           max_bytes_before_external_group_by = {GROUP_BY_SPILL_BYTES}"
             ))
             .await
@@ -157,7 +174,8 @@ impl Lpa {
                  SELECT l.account AS account, if(t.label = 0, l.label, t.label) AS label
                  FROM {db}.{LABELS} AS l
                  ANY LEFT JOIN {db}.{TOP} AS t ON l.account = t.account
-                 SETTINGS join_algorithm = 'grace_hash', max_threads = 4"
+                 SETTINGS join_algorithm = 'grace_hash', max_threads = 4,
+                          max_bytes_in_join = {JOIN_BUCKET_BYTES}"
             ))
             .await
             .with_context(|| format!("carry-forward, round {round}"))?;

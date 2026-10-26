@@ -7,22 +7,18 @@
 # `graze-personalization-secrets` full of CHANGE_ME placeholders. Neither has existed on the
 # cluster since at least the AWS move, and nothing live references them.
 #
-# 🔴 DO NOT `kubectl apply` THIS FILE AS-IS. ADMIN_API_KEY below is a placeholder, and the live
-# value is a real credential: applying would overwrite it and break the admin API. It is a
-# credential sitting in a ConfigMap, which is why it is masked here; it belongs in a Secret
-# (personalization-secrets), and once it moves there this file can be applied normally.
-#
-# To diff without exposing the key, substitute the live value into a pipe, never into the file:
-#
-#   KEY=$(kubectl get configmap personalization-env -o jsonpath='{.data.ADMIN_API_KEY}')
-#   sed "s|^\( *\)ADMIN_API_KEY: .*|\1ADMIN_API_KEY: \"$KEY\"|" kube/configmap.yaml | kubectl diff -f -
+# ADMIN_API_KEY is deliberately NOT here. It is a credential, and lives in the
+# `personalization-secrets` Secret, which every consumer loads AFTER this ConfigMap, so the
+# Secret's value is the one in effect. It used to sit here too (an identical copy, already
+# shadowed by the Secret); it was removed 2026-10-26 and personalization-api was restarted
+# canary-first to prove new pods get it from the Secret (admin paths: no key 401, key 200).
+# Do not add it back.
 #
 # Per-workload `env:` entries in the Deployment and CronJob manifests OVERRIDE these values
 # (RUST_LOG, the ClickHouse workload user, experiment flags), so read both before concluding
 # what a pod actually runs with.
 apiVersion: v1
 data:
-  ADMIN_API_KEY: MASKED-SEE-HEADER
   CLICKHOUSE_DATABASE: default
   CLICKHOUSE_SECURE: "true"
   DEFAULT_TIME_WINDOW_HOURS: "144"

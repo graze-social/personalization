@@ -69,16 +69,12 @@ spec:
             component: project
         spec:
           restartPolicy: Never
-          # Required: the default service account carries no pull secrets, so
-          # without this the pod fails with ImagePullBackOff against DOCR.
-          imagePullSecrets:
-            - name: docr-graze-social-labs
           containers:
             - name: project
-              # Built from commit 1a835eb (feat/lens-completeness-guard).
-              # Digest-pinned: both `latest` and the short-SHA tag are mutable
-              # on DOCR.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:c4051e638abdaae248bd9da03ae4a84c161f6c4c99cc964cad8aae2813fd5e19
+              # Built 2026-10-25 from main 15ec477 (pers#92 3 GB group-by spill, on top of
+              # pers#91 8-slice rebuild) plus the ECR push step, as build/lens-batch-spill-ecr.
+              # Validated by a full manual run as batch: peak 4.84 GiB.
+              image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization@sha256:2f3b6444ef7ba3ab036bd22932d5f4b199abe57d95d1b9973e2cf5ac4332d299
               command: ["/app/graze-lens-project"]
               resources:
                 requests:
@@ -122,6 +118,18 @@ spec:
                   value: "60000000"
                 - name: RUST_LOG
                   value: "info"
+                # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+                # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+                - name: CLICKHOUSE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_USER
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_PASSWORD
               securityContext:
                 runAsNonRoot: true
                 readOnlyRootFilesystem: true

@@ -38,15 +38,12 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
-      # Required: the default service account carries no pull secrets, so
-      # without this the pod fails with ImagePullBackOff against DOCR.
-      imagePullSecrets:
-        - name: docr-graze-social-labs
       containers:
         - name: fold
-          # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
-          # the short-SHA tag are mutable on DOCR.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9a3c8adddad484fe900319fc0e2fe2505e02ceda88d0a3c41e6e80e64094c03a
+          # `d-9a3c8adddad4` is the 2026-09-30 AWS-cutover mirror of the DOCR image
+          # sha256:9a3c8add...; it still resolves to that digest. graze/personalization tags are
+          # MUTABLE on ECR, so pin by @sha256 when this next moves.
+          image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization:d-9a3c8adddad4
           command: ["/app/graze-lens-fold"]
           resources:
             requests:
@@ -82,6 +79,18 @@ spec:
               value: "45"
             - name: RUST_LOG
               value: "info"
+            # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+            # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-workload-users
+                  key: BATCH_USER
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-workload-users
+                  key: BATCH_PASSWORD
           readinessProbe:
             httpGet:
               path: /healthz

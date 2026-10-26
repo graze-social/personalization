@@ -39,12 +39,12 @@ spec:
             component: lpa
         spec:
           restartPolicy: Never
-          imagePullSecrets:
-            - name: docr-graze-social-labs
           containers:
             - name: lpa
-              # Digest-pinned; updated together with the other lens workloads.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9a3c8adddad484fe900319fc0e2fe2505e02ceda88d0a3c41e6e80e64094c03a
+              # Built 2026-10-26 from main c1775a4 (pers#93: grace_hash bucket size, so LPA fits
+              # the batch user) plus the ECR push step, as build/lpa-grace-buckets-ecr.
+              # Validated by a full manual run as batch: peak 3.92 GiB.
+              image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization@sha256:773c3c8562128ac086d1f2bfa9650102f7db8a545b89999e89c70e46be3cd2d4
               command: ["/app/graze-lens-lpa"]
               resources:
                 requests:
@@ -75,6 +75,18 @@ spec:
                   value: "3600"
                 - name: RUST_LOG
                   value: "info"
+                # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+                # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+                - name: CLICKHOUSE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_USER
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_PASSWORD
               securityContext:
                 runAsNonRoot: true
                 readOnlyRootFilesystem: true

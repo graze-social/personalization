@@ -137,20 +137,30 @@ spec:
       template:
         spec:
           restartPolicy: Never
-          imagePullSecrets:
-            - name: dockerhub-secret
           volumes:
             - name: src
               configMap:
                 name: personalization-dose-check-src
           containers:
             - name: dose
-              image: dgaff/graze-analysis@sha256:3c1d7b3647d6b6781b2c79ed55273a5366a1a69bee2ab1a612abf3a4074c7913
+              image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/graze-analysis:d-3c1d7b3647d6
               command: ["python", "/src/dose.py"]
               volumeMounts:
                 - name: src
                   mountPath: /src
               env:
+                # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+                # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+                - name: CLICKHOUSE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_USER
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_PASSWORD
                 # Must match the moment FOLLOW_SEED_EXPERIMENT_ENABLED went to 1. Re-set it if the
                 # experiment is ever restarted, or pre-flip rows silently join the control arm.
                 - name: FOLLOW_SEED_FLIP_AT

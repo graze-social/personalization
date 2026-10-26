@@ -1,60 +1,52 @@
+# The live `personalization-env` ConfigMap: bulk config for every personalization workload
+# (personalization-api, candidate-sync, like-streamer, follow-seeds, and the analysis CronJobs),
+# all of which load it with `envFrom: configMapRef`. Recorded from graze-prod (EKS us-west-2) on
+# 2026-10-26.
+#
+# This file previously held a ConfigMap `graze-personalization-config` and a Secret
+# `graze-personalization-secrets` full of CHANGE_ME placeholders. Neither has existed on the
+# cluster since at least the AWS move, and nothing live references them.
+#
+# 🔴 DO NOT `kubectl apply` THIS FILE AS-IS. ADMIN_API_KEY below is a placeholder, and the live
+# value is a real credential: applying would overwrite it and break the admin API. It is a
+# credential sitting in a ConfigMap, which is why it is masked here; it belongs in a Secret
+# (personalization-secrets), and once it moves there this file can be applied normally.
+#
+# To diff without exposing the key, substitute the live value into a pipe, never into the file:
+#
+#   KEY=$(kubectl get configmap personalization-env -o jsonpath='{.data.ADMIN_API_KEY}')
+#   sed "s|^\( *\)ADMIN_API_KEY: .*|\1ADMIN_API_KEY: \"$KEY\"|" kube/configmap.yaml | kubectl diff -f -
+#
+# Per-workload `env:` entries in the Deployment and CronJob manifests OVERRIDE these values
+# (RUST_LOG, the ClickHouse workload user, experiment flags), so read both before concluding
+# what a pod actually runs with.
 apiVersion: v1
+data:
+  ADMIN_API_KEY: MASKED-SEE-HEADER
+  CLICKHOUSE_DATABASE: default
+  CLICKHOUSE_SECURE: "true"
+  DEFAULT_TIME_WINDOW_HOURS: "144"
+  EXCLUSION_LIST: "did:plc:cxzhucds4aqj2npthbrhemvl"
+  FEED_CACHE_BATCH_SIZE: "1000"
+  FEED_GENERATOR_DID: "did:web:beta.graze.social"
+  GRAZE_AUDIT_ALL_USERS: "false"
+  GRAZE_AUDIT_ENABLED: "false"
+  GRAZE_AUDIT_SAMPLE_RATE: "0.5"
+  GRAZE_READ_ONLY_MODE: "false"
+  HTTP_HOST: "0.0.0.0"
+  HTTP_PORT: "8080"
+  HTTP_WORKERS: "4"
+  INVERTED_MIN_POST_LIKES: "10"
+  LIKE_TTL_DAYS: "6"
+  METRICS_ENABLED: "true"
+  METRICS_PORT: "8081"
+  MIN_POOL_SCOREABLE_POSTS: "500"
+  MIN_POOL_SCOREABLE_SHARE: "0.04"
+  REDIS_SOCKET_TIMEOUT: "30"
+  RUST_BACKTRACE: full
+  RUST_LOG: debug
+  SEEN_POSTS_TTL_HOURS: "24"
 kind: ConfigMap
 metadata:
-  name: graze-personalization-config
-  labels:
-    app: graze-personalization
-data:
-  # ClickHouse configuration (non-sensitive)
-  clickhouse-port: "8443"
-  clickhouse-database: "default"
-  clickhouse-secure: "true"
-
-  # Jetstream configuration
-  jetstream-url: "wss://jetstream2.us-west.bsky.network/subscribe"
-
-  # Like Graph configuration
-  like-ttl-days: "6"
-  like-batch-size: "500"
-  like-batch-interval-ms: "100"
-
-  # Algorithm Sync configuration
-  algo-posts-ttl-hours: "1"
-  algo-posts-limit: "20000"
-  sync-rate-limit-seconds: "300"
-  sync-refresh-threshold-minutes: "30"
-
-  # Personalization defaults (treatment params for algos 479, 3654, 2300)
-  default-result-ttl-seconds: "300"
-  default-max-user-likes: "10000"
-  default-max-sources-per-post: "1500"
-  default-max-total-sources: "100000"
-  default-min-co-likes: "2"
-  default-min-post-likes: "2"
-  default-max-likers-per-post: "1500"
-  default-max-algo-checks: "15000"
-  default-speed-gate-ms: "500"
----
-apiVersion: v1
-kind: Secret
-metadata:
-  name: graze-personalization-secrets
-  labels:
-    app: graze-personalization
-type: Opaque
-stringData:
-  # IMPORTANT: Replace these with actual values before deploying!
-  # Consider using external secret management (e.g., Sealed Secrets, Vault)
-  
-  # Redis URL (with TLS)
-  redis-url: "rediss://default:CHANGE_ME@your-redis-host:25061"
-
-  # ClickHouse host and credentials
-  clickhouse-host: "your-clickhouse-host.cloud"
-  clickhouse-user: "default"
-  clickhouse-password: "CHANGE_ME"
-
-  # Admin API key: required for admin endpoints (feeds, special-posts, etc.).
-  # Must match PERSONALIZATION_ADMIN_API_KEY used by feed-processor (Bearer token).
-  # Replace with a secure value before deploying; use external secret management in production.
-  admin-api-key: "CHANGE_ME"
+  name: personalization-env
+  namespace: default

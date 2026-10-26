@@ -33,11 +33,12 @@ spec:
             component: refresh
         spec:
           restartPolicy: Never
-          imagePullSecrets:
-            - name: docr-graze-social-labs
           containers:
             - name: refresh
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:9788abaeb43a8b2c90ebceb64d5e7863fd2d2667084274d8973999f8c06f8121
+              # `d-9788abaeb43a` is the 2026-09-30 AWS-cutover mirror of the DOCR image
+              # sha256:9788abae...; it still resolves to that digest. graze/personalization tags
+              # are MUTABLE on ECR, so pin by @sha256 when this next moves.
+              image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization:d-9788abaeb43a
               command: ["/app/graze-lens-refresh"]
               resources:
                 requests:
@@ -58,6 +59,18 @@ spec:
                 # them on the queue at once — see bin/refresh.rs.
                 - name: LENS_REFRESH_SPREAD_SECONDS
                   value: "14400"
+                # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+                # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+                - name: CLICKHOUSE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_USER
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_PASSWORD
               securityContext:
                 runAsNonRoot: true
                 readOnlyRootFilesystem: true

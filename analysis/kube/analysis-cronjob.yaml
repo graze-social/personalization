@@ -27,11 +27,9 @@ spec:
       template:
         spec:
           restartPolicy: Never
-          imagePullSecrets:
-            - name: dockerhub-secret
           containers:
             - name: analysis
-              image: dgaff/graze-analysis@sha256:3c1d7b3647d6b6781b2c79ed55273a5366a1a69bee2ab1a612abf3a4074c7913
+              image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/graze-analysis:d-3c1d7b3647d6
               # Override the entrypoint so one job runs both the experiment readouts and the
               # density-drift guard. The guard exits non-zero only on a *detection* (a feed that has
               # already stopped being personalized), so a real regression shows up as a failed Job
@@ -67,6 +65,19 @@ spec:
                   [ $contract -ne 0 ] && exit $contract
                   [ $drift -ne 0 ] && exit $drift
                   exit $readout
+              # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+              # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+              env:
+                - name: CLICKHOUSE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_USER
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_PASSWORD
               # Same wiring the personalization-api deployment uses. CLICKHOUSE_HOST/PORT/USER/
               # PASSWORD live in app-secrets; DATABASE and SECURE come from the configmap. Reusing
               # them means no new credential to provision and no chance of the analysis reading a

@@ -1,3 +1,8 @@
+# ⚠️ ONE-OFF JOB TEMPLATE, NOT LIVE. Checked against graze-prod on 2026-10-26: no such Job
+# exists, so there was nothing to match. It still pulls from the retired DigitalOcean registry
+# (DOCR) with the `docr-graze-social-labs` pull secret, neither of which graze-prod has: applied
+# as-is it fails with ImagePullBackOff. Re-point the image at ECR and drop the pull secret first.
+#
 # graze-lens-bootstrap-hop1-remaining — the repair pass over accounts the full
 # cohort run could not read.
 #

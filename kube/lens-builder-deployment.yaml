@@ -6,14 +6,15 @@
 # serving — every request just takes the fail-open branch.
 #
 # Prereqs (created out of band):
-#   * secret `app-secrets` — CLICKHOUSE_{HOST,USER,PASSWORD}, PERSONALIZATION_REDIS_URL
+#   * secret `app-secrets` — CLICKHOUSE_HOST, PERSONALIZATION_REDIS_URL
+#   * secret `clickhouse-workload-users` — BATCH_USER / BATCH_PASSWORD (see env)
 #   * ClickHouse tables — `feed-processor/scripts/create_follow_edges_tables.py`
 #
-# Image is pinned by digest, not tag. Both `latest` and the short-SHA tag are
-# mutable on DOCR, and a reused tag has silently changed what was running before
-# (see the note in feeder-rs/kube/feeder-rs-deployment.yml). Get the digest from
-# the docker-release workflow run, or:
-#   doctl registry repository list-tags graze-personalization --format Tag,ManifestDigest
+# Image is pinned by digest, not tag. Tags are mutable on ECR (graze/personalization
+# is MUTABLE), and a reused tag has silently changed what was running before (see
+# the note in feeder-rs/kube/feeder-rs-deployment.yml). Get the digest from the ECR
+# push, or:
+#   aws ecr describe-images --repository-name graze/personalization --image-ids imageTag=<sha>
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -47,25 +48,12 @@ spec:
         prometheus.io/port: "9090"
         prometheus.io/path: "/metrics"
     spec:
-      # Required: the default service account carries no pull secrets, so
-      # without this the pod fails with ImagePullBackOff against DOCR.
-      imagePullSecrets:
-        - name: docr-graze-social-labs
       containers:
         - name: builder
-          # Built from commit a24d3b2 (feat/graze-lens). Digest-pinned: both `latest` and
-          # the short-SHA tag are mutable on DOCR.
-          # `48350bf` — blob v3, which carries the raw count beside each
-          # weight (#75). Deployed 2026-09-03; a forced refresh rebuilt all
-          # published blobs, verified GLZ3 in Redis with follows BOOLEAN
-          # (max_count 1) and follows2/niche/community COUNTABLE with
-          # max_count <= seed_count.
-          #
-          # ONLY this deployment moved. graze-lens-fold and the four lens
-          # cronjobs share this image tag and are deliberately still on
-          # 9a3c8add: they run different binaries that this change does not
-          # touch, so moving them would be blast radius for nothing.
-          image: registry.digitalocean.com/graze-social-labs/personalization@sha256:e10d73dc1ab11549be4c6ed2a31acf9b011593d1736a88fee5f5d35032b0ff43
+          # Built 2026-10-25 from df8aff7, the head of pers#90 (merged as be1dc7e with an identical
+          # tree: community members fetched once per community and cached), plus the ECR push
+          # step from the unmerged `ecr-dual-push` branch, as build/lens-community-cache-ecr.
+          image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization@sha256:9e398aabda5e0f4224a02179759cd24b062482def5c96d94f0ec691fe6d98f7b
           command: ["/app/graze-lens-builder"]
           resources:
             requests:
@@ -119,6 +107,18 @@ spec:
               value: "200000"
             - name: RUST_LOG
               value: "info"
+            # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+            # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-workload-users
+                  key: BATCH_USER
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-workload-users
+                  key: BATCH_PASSWORD
           securityContext:
             runAsNonRoot: true
             readOnlyRootFilesystem: true

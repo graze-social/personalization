@@ -5,9 +5,15 @@
 # exist, and applying the old file would have stood up a second, broken one beside the real
 # service rather than touching it. Rewritten from the live object on 2026-10-26.
 #
-# 🔴 The image is the MUTABLE tag `latestrs` with imagePullPolicy Always: any restart pulls
-# whatever that tag points at now. It is recorded as it runs, not endorsed. Pin a digest the next
-# time this is deployed.
+# Image pinned by digest on 2026-10-26: sha256:f18cb940..., the same image the pod had been
+# running under the mutable tag `latestrs` (also tagged d-f18cb9404550), so pinning changed no
+# code. Bump the digest with each release.
+#
+# Recreate, not RollingUpdate. This is a singleton Jetstream consumer sharing one cursor in Redis,
+# and not every write is idempotent: the per-user like counts (HINCRBY on `ulc`) and the
+# user-liked-authors counters INCREMENT. A surge rollout runs two streamers over the same events
+# and double-counts every like in the overlap. Recreate stops the old pod first; the new one
+# resumes from the committed cursor, so the few-second gap loses nothing.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -21,10 +27,7 @@ spec:
     matchLabels:
       app: personalization-like-streamer
   strategy:
-    rollingUpdate:
-      maxSurge: "25%"
-      maxUnavailable: "25%"
-    type: RollingUpdate
+    type: Recreate
   template:
     metadata:
       # Cluster history from a `kubectl rollout restart` at the 2026-10-05 cutover. It is in
@@ -56,8 +59,7 @@ spec:
             name: app-secrets
         - secretRef:
             name: personalization-secrets
-        image: "715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization:latestrs"
-        imagePullPolicy: Always
+        image: "715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization@sha256:f18cb94045501f3a1a375c12025d5706136a16e6c180f55b0c1a388eba190df3"
         name: personalization-like-streamer
         resources:
           limits:

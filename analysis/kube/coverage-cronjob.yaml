@@ -218,19 +218,30 @@ spec:
       template:
         spec:
           restartPolicy: Never
-          imagePullSecrets:
-            - name: dockerhub-secret
           volumes:
             - name: src
               configMap:
                 name: personalization-coverage-src
           containers:
             - name: coverage
-              image: dgaff/graze-analysis@sha256:3c1d7b3647d6b6781b2c79ed55273a5366a1a69bee2ab1a612abf3a4074c7913
+              image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/graze-analysis:d-3c1d7b3647d6
               command: ["python", "/src/coverage.py"]
               volumeMounts:
                 - name: src
                   mountPath: /src
+              # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+              # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+              env:
+                - name: CLICKHOUSE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_USER
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_PASSWORD
               # Same ordering as personalization-api and the analysis CronJob: both app-secrets and
               # personalization-secrets define REDIS_URL and the later entry wins, so this reads the
               # same backing stores the service does.

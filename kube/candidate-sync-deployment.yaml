@@ -1,79 +1,68 @@
+# The live `personalization-candidate-sync` Deployment, as it runs on graze-prod (EKS us-west-2).
+#
+# This file previously described `graze-personalization-candidate-sync` running
+# `python -m graze_personalization candidate-sync`, the pre-Rust service. That Deployment does not
+# exist, and applying the old file would have stood up a second, broken one beside the real
+# service rather than touching it. Rewritten from the live object on 2026-10-26.
+#
+# The image is pinned to what was running that day. Deploys are `kubectl set image`, so bump this
+# with every release or it becomes a rollback waiting for the next `apply`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: graze-personalization-candidate-sync
   labels:
-    app: graze-personalization
-    component: candidate-sync
+    app: personalization-candidate-sync
+  name: personalization-candidate-sync
+  namespace: default
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: graze-personalization
-      component: candidate-sync
+      app: personalization-candidate-sync
+  strategy:
+    rollingUpdate:
+      maxSurge: "25%"
+      maxUnavailable: "25%"
+    type: RollingUpdate
   template:
     metadata:
-      labels:
-        app: graze-personalization
-        component: candidate-sync
+      # Cluster history from a `kubectl rollout restart` at the 2026-10-05 cutover. It is in
+      # the live last-applied-configuration, so leaving it out would make `apply` delete it --
+      # a pod-template change, i.e. a full restart. Kept so applying this file is a no-op.
       annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9090"
-        prometheus.io/path: "/metrics"
+        kubectl.kubernetes.io/restartedAt: "2026-10-05T21:43:54-04:00"
+      labels:
+        app: personalization-candidate-sync
     spec:
       containers:
-        - name: sync
-          image: dgaff/graze-personalization:latest
-          command: ["python", "-m", "graze_personalization", "candidate-sync"]
-          resources:
-            requests:
-              memory: "256Mi"
-              cpu: "100m"
-            limits:
-              memory: "512Mi"
-              cpu: "500m"
-          env:
-            - name: REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: redis-url
-            - name: CLICKHOUSE_HOST
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: clickhouse-host
-            - name: CLICKHOUSE_PORT
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: clickhouse-port
-            - name: CLICKHOUSE_USER
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: clickhouse-user
-            - name: CLICKHOUSE_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: clickhouse-password
-            - name: CLICKHOUSE_SECURE
-              valueFrom:
-                configMapKeyRef:
-                  name: graze-personalization-config
-                  key: clickhouse-secure
-            - name: WORKER_TYPE
-              value: "candidate-sync"
-            - name: ALGO_POSTS_LIMIT
-              value: "20000"
-            - name: SYNC_RATE_LIMIT_SECONDS
-              value: "300"
-          securityContext:
-            runAsNonRoot: true
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
+      - command:
+        - /app/graze-candidate-sync
+        env:
+        - name: CLICKHOUSE_USER
+          valueFrom:
+            secretKeyRef:
+              key: BATCH_USER
+              name: clickhouse-workload-users
+        - name: CLICKHOUSE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: BATCH_PASSWORD
+              name: clickhouse-workload-users
+        - name: SYNC_FALLBACK_MAX_AGE_HOURS
+          value: "336"
+        envFrom:
+        - configMapRef:
+            name: personalization-env
+        - secretRef:
+            name: app-secrets
+        - secretRef:
+            name: personalization-secrets
+        image: "715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization:d-2fc398a91fd0"
+        name: personalization-candidate-sync
+        resources:
+          limits:
+            cpu: 500m
+            memory: 768Mi
+          requests:
+            cpu: 200m
+            memory: 512Mi

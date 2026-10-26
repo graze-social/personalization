@@ -27,16 +27,27 @@ spec:
       template:
         spec:
           restartPolicy: Never
-          imagePullSecrets:
-            - name: docr-graze-social-labs
           containers:
             - name: follow-seeds
-              # Pinned by DIGEST. The release workflow publishes `latest` and a short SHA, both
-              # mutable, so a tag here would silently change what this job runs. Bump it with any
-              # deploy that changes the binary.
-              image: registry.digitalocean.com/graze-social-labs/personalization@sha256:c7b9af9c17055c245768826eeeb61caf221c5e57238aa288f03590df912d709d
+              # `d-c7b9af9c1705` is the 2026-09-30 AWS-cutover mirror of the DOCR image
+              # sha256:c7b9af9c...; it still resolves to that digest. The release workflow's own
+              # tags (`latest`, short SHA) are mutable, and so are ECR tags here: pin by @sha256
+              # next time.
+              image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization:d-c7b9af9c1705
               command: ["/app/graze-build-follow-seeds"]
               env:
+                # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+                # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+                - name: CLICKHOUSE_USER
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_USER
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: clickhouse-workload-users
+                      key: BATCH_PASSWORD
                 # Headroom over the ~290/day arrival rate, so a backlog after an outage still clears.
                 - name: FOLLOW_SEED_MAX_USERS
                   value: "1500"

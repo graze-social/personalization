@@ -1,4 +1,5 @@
-# The live `personalization-api` Deployment, as it actually runs on the DO sfo3 cluster.
+# The live `personalization-api` Deployment, as it actually runs on graze-prod (EKS us-west-2,
+# namespace default) since the 2026-10-06 move off the DO sfo3 cluster.
 #
 # This file previously described a Deployment named `graze-personalization-api` running
 # `python -m graze_personalization api`. That object does not exist in the cluster, and no
@@ -32,19 +33,18 @@
 # Swap `diff` for `apply` to apply. The diff is the check on everything except the image, and it
 # changes nothing; it returned zero bytes against revision 58 on 2026-09-02.
 #
-# Two live fields are deliberately absent, and neither causes a diff: the pod template's
-# `kubectl.kubernetes.io/restartedAt` annotation (cluster history from a past `rollout restart`,
-# not desired state -- `apply` leaves it alone because it is not in the object's
-# last-applied-configuration), and the API defaults the server fills in itself
-# (progressDeadlineSeconds, revisionHistoryLimit, dnsPolicy, terminationGracePeriodSeconds, ...).
+# The API defaults the server fills in itself (progressDeadlineSeconds, revisionHistoryLimit,
+# dnsPolicy, terminationGracePeriodSeconds, ...) are deliberately absent and cause no diff. The pod
+# template's `kubectl.kubernetes.io/restartedAt` annotation is deliberately PRESENT: it is in the
+# live last-applied-configuration, so omitting it would make `apply` delete it and restart the
+# fleet. As of 2026-10-26 the only diff against live is the placeholder image.
 #
-# ── Not in this repo, also unmanaged ──
+# ── Related manifests ──
 #
-# Service `personalization-api` (ClusterIP, 80 -> 8080, selector app=personalization-api) and
-# PodDisruptionBudget `personalization-api-pdb` (minAvailable: 2) are live and have no manifest
-# here. `kube/service.yaml` describes a DIFFERENT, non-existent Service. The PDB is load-bearing
-# for the deploy policy: with 3 replicas and minAvailable 2, a rollout can only ever take one pod
-# at a time.
+# Service `personalization-api` (ClusterIP, 80 -> 8080) is in `kube/service.yaml` and the
+# PodDisruptionBudget `personalization-api-pdb` (minAvailable: 2) in `kube/api-pdb.yaml`; both
+# matched live on 2026-10-26. The PDB is load-bearing for the deploy policy: with 3 replicas and
+# minAvailable 2, a rollout can only ever take one pod at a time.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -67,6 +67,11 @@ spec:
       maxUnavailable: 0
   template:
     metadata:
+      # Cluster history from a `kubectl rollout restart` at the 2026-10-05 cutover. It is in
+      # the live last-applied-configuration, so leaving it out would make `apply` delete it --
+      # a pod-template change, i.e. a full restart. Kept so applying this file is a no-op.
+      annotations:
+        kubectl.kubernetes.io/restartedAt: "2026-10-05T21:43:54-04:00"
       labels:
         app: personalization-api
     spec:
@@ -76,7 +81,7 @@ spec:
           #
           # Real deploys pin a DIGEST and never a tag: `latest` and the short-SHA tag are both
           # mutable, and concurrent release builds from different refs overwrite `latest`.
-          image: registry.digitalocean.com/graze-social-labs/personalization:PLACEHOLDER-SEE-HEADER
+          image: 715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization:PLACEHOLDER-SEE-HEADER
           # Explicit, and NOT the API default for a digest-pinned image (which is IfNotPresent).
           imagePullPolicy: Always
           command: ["/app/graze-api"]
@@ -94,6 +99,18 @@ spec:
             - secretRef:
                 name: personalization-secrets
           env:
+            # ClickHouse workload user. Explicit env beats the CLICKHOUSE_USER /
+            # CLICKHOUSE_PASSWORD that envFrom app-secrets also supplies.
+            - name: CLICKHOUSE_USER
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-workload-users
+                  key: FEED_SERVING_USER
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clickhouse-workload-users
+                  key: FEED_SERVING_PASSWORD
             # Pool-size gate (step 0 of compute_personalization). Lives here and NOT in the
             # ConfigMap, which is easy to miss when checking whether the gate is enabled.
             - name: MIN_CANDIDATE_POOL_FOR_PERSONALIZATION
@@ -129,6 +146,21 @@ spec:
               value: v1
             - name: FOLLOW_SEED_WEIGHT_MODE
               value: uniform
+            # Interleaving experiment. CONTROL and TREATMENT are both post_first, with SELF_CHECK
+            # on: this is the A/A self-check that validates the interleaving readout, not a live
+            # comparison. Changing either arm starts a real experiment.
+            - name: INTERLEAVE_ENABLED
+              value: "1"
+            - name: INTERLEAVE_SELF_CHECK
+              value: "1"
+            - name: INTERLEAVE_CONTROL
+              value: post_first
+            - name: INTERLEAVE_TREATMENT
+              value: post_first
+            - name: INTERLEAVE_TRAFFIC_PCT
+              value: "10"
+            - name: INTERLEAVE_SALT
+              value: v1
           resources:
             requests:
               cpu: 100m
@@ -166,6 +198,3 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
-      imagePullSecrets:
-        - name: dockerhub-secret
-        - name: docr-graze-social-labs

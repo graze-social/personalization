@@ -1,56 +1,68 @@
+# The live `personalization-like-streamer` Deployment, as it runs on graze-prod (EKS us-west-2).
+#
+# This file previously described `graze-personalization-like-streamer` running
+# `python -m graze_personalization like-streamer`, the pre-Rust service. That Deployment does not
+# exist, and applying the old file would have stood up a second, broken one beside the real
+# service rather than touching it. Rewritten from the live object on 2026-10-26.
+#
+# 🔴 The image is the MUTABLE tag `latestrs` with imagePullPolicy Always: any restart pulls
+# whatever that tag points at now. It is recorded as it runs, not endorsed. Pin a digest the next
+# time this is deployed.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: graze-personalization-like-streamer
   labels:
-    app: graze-personalization
-    component: like-streamer
+    app: personalization-like-streamer
+  name: personalization-like-streamer
+  namespace: default
 spec:
-  replicas: 1  # Singleton - only one instance should run
-  strategy:
-    type: Recreate  # No rolling update for singleton
+  replicas: 1
   selector:
     matchLabels:
-      app: graze-personalization
-      component: like-streamer
+      app: personalization-like-streamer
+  strategy:
+    rollingUpdate:
+      maxSurge: "25%"
+      maxUnavailable: "25%"
+    type: RollingUpdate
   template:
     metadata:
-      labels:
-        app: graze-personalization
-        component: like-streamer
+      # Cluster history from a `kubectl rollout restart` at the 2026-10-05 cutover. It is in
+      # the live last-applied-configuration, so leaving it out would make `apply` delete it --
+      # a pod-template change, i.e. a full restart. Kept so applying this file is a no-op.
       annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9090"
-        prometheus.io/path: "/metrics"
+        kubectl.kubernetes.io/restartedAt: "2026-10-05T21:43:55-04:00"
+      labels:
+        app: personalization-like-streamer
     spec:
       containers:
-        - name: streamer
-          image: dgaff/graze-personalization:latest
-          command: ["python", "-m", "graze_personalization", "like-streamer"]
-          resources:
-            requests:
-              memory: "128Mi"
-              cpu: "100m"
-            limits:
-              memory: "256Mi"
-              cpu: "500m"
-          envFrom:
-            - configMapRef:
-                name: graze-personalization-config
-          env:
-            - name: REDIS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: graze-personalization-secrets
-                  key: redis-url
-            - name: WORKER_TYPE
-              value: "like-streamer"
-          securityContext:
-            runAsNonRoot: true
-            readOnlyRootFilesystem: true
-            allowPrivilegeEscalation: false
-      securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-        fsGroup: 1000
-      terminationGracePeriodSeconds: 30
+      - command:
+        - /app/graze-like-streamer
+        env:
+        - name: CLICKHOUSE_USER
+          valueFrom:
+            secretKeyRef:
+              key: INGEST_WRITER_USER
+              name: clickhouse-workload-users
+        - name: CLICKHOUSE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              key: INGEST_WRITER_PASSWORD
+              name: clickhouse-workload-users
+        envFrom:
+        - configMapRef:
+            name: personalization-env
+        - secretRef:
+            name: app-secrets
+        - secretRef:
+            name: personalization-secrets
+        image: "715841359524.dkr.ecr.us-west-2.amazonaws.com/graze/personalization:latestrs"
+        imagePullPolicy: Always
+        name: personalization-like-streamer
+        resources:
+          limits:
+            cpu: 300m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 320Mi

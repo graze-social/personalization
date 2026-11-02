@@ -32,7 +32,14 @@ const QUEUE: &str = "queue:lens";
 /// time-shaped either, and the module docs above already say deltas keep
 /// `follows` live between builds. All four keep their 7-day TTL and rebuild on
 /// demand, which spreads that load over real requests instead of one burst.
-const FACETS: &[&str] = &["velocity", "community"];
+///
+/// `followers` is here for a different reason. It cannot be kept live by the
+/// fold's deltas (those track the reader's OWN follows), so without a nightly
+/// rebuild a reader's newest followers would wait out the 7-day TTL. It is also
+/// the cheapest build there is — one primary-key prefix read of
+/// `follow_edges_rev`, no graph expansion — and the reverse index it reads is
+/// rebuilt at 09:17 UTC, ahead of this job.
+const FACETS: &[&str] = &["velocity", "community", "followers"];
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

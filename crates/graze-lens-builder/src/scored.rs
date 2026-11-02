@@ -111,6 +111,7 @@ pub const FACET_POPULAR: u8 = 4;
 pub const FACET_VELOCITY: u8 = 5;
 pub const FACET_COMMUNITY: u8 = 6;
 pub const FACET_DOMAIN: u8 = 7;
+pub const FACET_FOLLOWERS: u8 = 8;
 
 /// The full-confidence weight. A first-degree follow is exactly this.
 pub const WEIGHT_MAX: u16 = u16::MAX;

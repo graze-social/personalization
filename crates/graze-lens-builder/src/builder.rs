@@ -43,6 +43,9 @@ pub const FACET_COMMUNITY: &str = "community";
 /// Feed-scoped: who this feed's recent authors collectively follow. Built per
 /// algorithm id, not per viewer; the reader sums it with viewer facets.
 pub const FACET_DOMAIN: &str = "domain";
+/// People who follow the viewer: the reverse of `follows`. Read from the
+/// nightly reverse index, so it is up to a day behind the follow stream.
+pub const FACET_FOLLOWERS: &str = "followers";
 
 /// Facets this builder can actually produce.
 ///
@@ -59,6 +62,7 @@ pub fn is_buildable_facet(facet: &str) -> bool {
             | FACET_VELOCITY
             | FACET_COMMUNITY
             | FACET_DOMAIN
+            | FACET_FOLLOWERS
     )
 }
 
@@ -73,6 +77,7 @@ fn facet_header_id(name: &str) -> Option<u8> {
         FACET_VELOCITY => Some(crate::scored::FACET_VELOCITY),
         FACET_COMMUNITY => Some(crate::scored::FACET_COMMUNITY),
         FACET_DOMAIN => Some(crate::scored::FACET_DOMAIN),
+        FACET_FOLLOWERS => Some(crate::scored::FACET_FOLLOWERS),
         _ => None,
     }
 }
@@ -108,6 +113,27 @@ WHERE op = 'create' AND followee != ''
 LIMIT {limit:UInt64}
 "#;
 
+/// Current followers of one viewer, from the reverse index.
+///
+/// `follow_edges_rev` is `ORDER BY (followee, follower)`, so this is a primary
+/// key prefix read, not a scan. It is rebuilt nightly from the *folded* forward
+/// table (`graze-lens-rev-rebuild`), which is what makes it safe to read without
+/// the `op` dance `FOLLOWS_QUERY` needs: retracted edges are already gone. The
+/// cost is freshness — a follow made since the last rebuild is invisible until
+/// the next one. `DISTINCT` covers the window before ReplacingMergeTree merges.
+///
+/// 🔴 Never alias the output column to `followee`. ClickHouse resolves SELECT
+/// aliases inside WHERE, so `follower AS followee ... WHERE followee = ?` filters
+/// on `follower` and returns the viewer themself, once — a plausible-looking
+/// one-member blob. That shipped to the canary on 2026-11-02. `Row` accepts
+/// `follower` by serde alias instead.
+const FOLLOWERS_QUERY: &str = r#"
+SELECT DISTINCT follower
+FROM {database:Identifier}.follow_edges_rev
+WHERE followee = {follower:String} AND follower != ''
+LIMIT {limit:UInt64}
+"#;
+
 #[derive(Deserialize)]
 struct ChResponse {
     data: Vec<Row>,
@@ -115,6 +141,8 @@ struct ChResponse {
 
 #[derive(Deserialize)]
 struct Row {
+    /// `follower` when the row came from `FOLLOWERS_QUERY`; see its comment.
+    #[serde(alias = "follower")]
     followee: String,
 }
 
@@ -358,6 +386,16 @@ impl Builder {
             return Ok(BuildOutcome::UnknownFacet);
         }
 
+        // Followers do not come from the viewer's own follow history, so the
+        // completeness guard and the PDS backfill (which are about *their*
+        // follows) answer nothing here. It also never writes `building` or
+        // `failed`: `lensmeta` state is per viewer, not per facet, and the v1
+        // `follows` set reads it — a followers build must not switch off a
+        // reader's working follows lens while it runs or after it fails.
+        if facet == FACET_FOLLOWERS {
+            return self.build_followers(viewer).await;
+        }
+
         self.mark_state(viewer, "building").await?;
 
         if let Some(store) = &self.completeness {
@@ -394,6 +432,83 @@ impl Builder {
         // v2 scored blob, so the reader can change formats without a flag day.
         // `follows²` is v2 only — a set cannot carry reach.
         self.publish_for_facet(viewer, facet, &followees).await
+    }
+
+    /// Build and publish `followers`: a boolean blob of everyone who follows
+    /// the viewer, encoded exactly like the v2 `follows` mirror — every member
+    /// at full weight, count 1, no bloom and no top-K cut — so "follows me" is
+    /// an exact membership test, the same as "I follow them".
+    async fn build_followers(&self, viewer: &str) -> anyhow::Result<BuildOutcome> {
+        let Some(interner) = &self.interner else {
+            warn!(viewer, "no interner configured; cannot build followers");
+            return Ok(BuildOutcome::NeedsBackfill);
+        };
+
+        let followers = self.fetch_edges(FOLLOWERS_QUERY, viewer).await?;
+        debug!(viewer, count = followers.len(), "fetched followers");
+
+        if followers.len() > self.config.max_set_size {
+            // No state written (see `build`). The reader re-requests at most
+            // once per its enqueue cooldown, and the query is a capped prefix
+            // read, so a large account costs little to refuse.
+            warn!(
+                viewer,
+                count = followers.len(),
+                max = self.config.max_set_size,
+                "followers over size budget; refusing to publish"
+            );
+            return Ok(BuildOutcome::TooLarge);
+        }
+
+        // An empty blob, not a missing one, for a viewer nobody follows: it is
+        // a correct answer, and publishing it stops the reader re-requesting.
+        let ids = interner.intern_many(&followers).await?;
+        let entries: Vec<(u32, u16, u16)> = ids
+            .values()
+            .map(|id| (*id, crate::scored::WEIGHT_MAX, 1u16))
+            .collect();
+        let seed_count = crate::scored::count_from_u32(entries.len() as u32);
+        let blob = crate::scored::encode_v3_in_space(
+            crate::scored::FACET_FOLLOWERS,
+            interner.idspace(),
+            crate::scored::KIND_BOOLEAN,
+            now_secs(),
+            1,
+            seed_count,
+            entries,
+        );
+        info!(
+            viewer,
+            followers = ids.len(),
+            bytes = blob.len(),
+            "built followers"
+        );
+
+        // Not `publish_blob`: that also writes `state = ready`, and for a
+        // reader with no v1 `follows` set, ready-with-no-members is how the v1
+        // path says "follows nobody" — it would stop building their follows
+        // lens for good. Only the blob, its size, and the active registration
+        // (which is how the nightly refresh finds it again).
+        let key = format!("lens:v2:{FACET_FOLLOWERS}:{viewer}");
+        let ttl = self.config.set_ttl.as_secs();
+        let mut conn = self.redis.get().await?;
+        deadpool_redis::redis::pipe()
+            .atomic()
+            .set_ex(&key, &blob, ttl)
+            .hset(
+                Self::meta_key(viewer),
+                format!("v2_{FACET_FOLLOWERS}_bytes"),
+                blob.len(),
+            )
+            .expire(Self::meta_key(viewer), ttl as i64)
+            .sadd(ACTIVE_KEY, viewer)
+            .query_async::<()>(&mut conn)
+            .await?;
+        Ok(if ids.is_empty() {
+            BuildOutcome::Empty
+        } else {
+            BuildOutcome::Published
+        })
     }
 
     /// Build and publish `follows²` from the traversal projection.
@@ -667,6 +782,9 @@ impl Builder {
             }
             FACET_VELOCITY => self.publish_velocity(viewer, followees).await,
             FACET_COMMUNITY => self.publish_community(viewer, followees).await,
+            // Routed to `build_followers` before any follows are fetched; it
+            // never reaches this dispatch.
+            FACET_FOLLOWERS => Ok(BuildOutcome::UnknownFacet),
             other => {
                 warn!(viewer, facet = other, "facet admitted but not dispatched");
                 Ok(BuildOutcome::UnknownFacet)
@@ -850,6 +968,13 @@ impl Builder {
     }
 
     async fn fetch_follows(&self, viewer: &str) -> anyhow::Result<Vec<String>> {
+        self.fetch_edges(FOLLOWS_QUERY, viewer).await
+    }
+
+    /// Run a one-viewer edge query (`FOLLOWS_QUERY` or `FOLLOWERS_QUERY`) and
+    /// return the DIDs on the other end. Both bind the viewer as `follower` and
+    /// name the result column `followee`, so they share one response shape.
+    async fn fetch_edges(&self, query: &'static str, viewer: &str) -> anyhow::Result<Vec<String>> {
         let max_execution = self.config.max_execution_seconds.to_string();
         let limit = (self.config.max_set_size + 1).to_string();
 
@@ -870,7 +995,7 @@ impl Builder {
                 ("param_follower", viewer),
                 ("param_limit", limit.as_str()),
             ])
-            .body(FOLLOWS_QUERY)
+            .body(query)
             .send()
             .await?;
 
@@ -958,6 +1083,7 @@ mod tests {
             FACET_VELOCITY,
             FACET_COMMUNITY,
             FACET_DOMAIN,
+            FACET_FOLLOWERS,
         ] {
             assert!(is_buildable_facet(f), "{f} should build");
         }
@@ -972,6 +1098,22 @@ mod tests {
         assert!(!is_buildable_facet("FOLLOWS"), "matching is exact");
     }
 
+    /// The alias trap in `FOLLOWERS_QUERY`: any `AS followee` makes its WHERE
+    /// filter the wrong column.
+    #[test]
+    fn followers_query_filters_on_the_real_followee_column() {
+        assert!(
+            !FOLLOWERS_QUERY.contains(" AS "),
+            "no aliases: ClickHouse resolves them in WHERE"
+        );
+        assert!(FOLLOWERS_QUERY.contains("WHERE followee = {follower:String}"));
+        let parsed: ChResponse =
+            serde_json::from_str(r#"{"data":[{"follower":"did:plc:a"},{"follower":"did:plc:b"}]}"#)
+                .expect("follower rows parse");
+        let dids: Vec<String> = parsed.data.into_iter().map(|r| r.followee).collect();
+        assert_eq!(dids, ["did:plc:a", "did:plc:b"]);
+    }
+
     /// Facet header ids must be distinct — a collision would let the reader
     /// accept a blob built for a different signal.
     #[test]
@@ -984,6 +1126,7 @@ mod tests {
             crate::scored::FACET_VELOCITY,
             crate::scored::FACET_COMMUNITY,
             crate::scored::FACET_DOMAIN,
+            crate::scored::FACET_FOLLOWERS,
         ];
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();

@@ -121,8 +121,14 @@ LIMIT {limit:UInt64}
 /// the `op` dance `FOLLOWS_QUERY` needs: retracted edges are already gone. The
 /// cost is freshness — a follow made since the last rebuild is invisible until
 /// the next one. `DISTINCT` covers the window before ReplacingMergeTree merges.
+///
+/// 🔴 Never alias the output column to `followee`. ClickHouse resolves SELECT
+/// aliases inside WHERE, so `follower AS followee ... WHERE followee = ?` filters
+/// on `follower` and returns the viewer themself, once — a plausible-looking
+/// one-member blob. That shipped to the canary on 2026-11-02. `Row` accepts
+/// `follower` by serde alias instead.
 const FOLLOWERS_QUERY: &str = r#"
-SELECT DISTINCT follower AS followee
+SELECT DISTINCT follower
 FROM {database:Identifier}.follow_edges_rev
 WHERE followee = {follower:String} AND follower != ''
 LIMIT {limit:UInt64}
@@ -135,6 +141,8 @@ struct ChResponse {
 
 #[derive(Deserialize)]
 struct Row {
+    /// `follower` when the row came from `FOLLOWERS_QUERY`; see its comment.
+    #[serde(alias = "follower")]
     followee: String,
 }
 
@@ -1088,6 +1096,22 @@ mod tests {
         assert!(!is_buildable_facet("mutuals"), "not implemented yet");
         assert!(!is_buildable_facet(""));
         assert!(!is_buildable_facet("FOLLOWS"), "matching is exact");
+    }
+
+    /// The alias trap in `FOLLOWERS_QUERY`: any `AS followee` makes its WHERE
+    /// filter the wrong column.
+    #[test]
+    fn followers_query_filters_on_the_real_followee_column() {
+        assert!(
+            !FOLLOWERS_QUERY.contains(" AS "),
+            "no aliases: ClickHouse resolves them in WHERE"
+        );
+        assert!(FOLLOWERS_QUERY.contains("WHERE followee = {follower:String}"));
+        let parsed: ChResponse =
+            serde_json::from_str(r#"{"data":[{"follower":"did:plc:a"},{"follower":"did:plc:b"}]}"#)
+                .expect("follower rows parse");
+        let dids: Vec<String> = parsed.data.into_iter().map(|r| r.followee).collect();
+        assert_eq!(dids, ["did:plc:a", "did:plc:b"]);
     }
 
     /// Facet header ids must be distinct — a collision would let the reader

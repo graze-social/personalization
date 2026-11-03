@@ -42,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     // derives its interner from the blob pool — passing a separate pool here is
     // what put cache-Redis ids inside lens-space blobs for days.
     let builder = Arc::new(Builder::with_backfill(pool, config.clone()).context("builder")?);
+    tokio::spawn(log_memory(builder.clone()));
     let queue = Arc::new(queue);
     let semaphore = Arc::new(tokio::sync::Semaphore::new(config.concurrency.max(1)));
 
@@ -160,4 +161,48 @@ async fn main() -> anyhow::Result<()> {
     .await;
 
     Ok(())
+}
+
+/// Log this process's memory once a minute.
+///
+/// The only memory signal there is: `/metrics` serves nothing, `kubectl top` is
+/// forbidden to the deploying user, and the image has no shell to exec into.
+/// Without this, the first sign of growth is an OOMKill.
+async fn log_memory(builder: Arc<Builder>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        ticker.tick().await;
+        info!(
+            cgroup_bytes = cgroup_memory_bytes(),
+            rss_bytes = rss_bytes(),
+            interner_cached = builder.interner_cached_entries(),
+            "memory"
+        );
+    }
+}
+
+/// The figure the OOM killer compares with the limit. cgroup v2, then v1.
+fn cgroup_memory_bytes() -> u64 {
+    [
+        "/sys/fs/cgroup/memory.current",
+        "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    ]
+    .iter()
+    .find_map(|p| std::fs::read_to_string(p).ok()?.trim().parse().ok())
+    .unwrap_or(0)
+}
+
+fn rss_bytes() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmRSS:"))?
+                .trim()
+                .trim_end_matches(" kB")
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
+        .map_or(0, |kb| kb * 1024)
 }

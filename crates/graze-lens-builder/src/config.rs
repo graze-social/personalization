@@ -88,6 +88,10 @@ pub struct Config {
     /// Most communities, and most member rows across them, a pod caches.
     pub community_cache_entries: usize,
     pub community_cache_rows: usize,
+    /// Most DIDs the lens interner caches in this process (~110 B each).
+    /// This was unbounded, and the nightly refresh grew it until the pod was
+    /// OOMKilled; see `graze_common::lens_interner::Interner::cache`.
+    pub interner_cache_entries: usize,
     /// Window for the velocity facet: "discovered in the last N days".
     pub velocity_days: u32,
     /// How many of the viewer's top communities the community facet draws from.
@@ -159,6 +163,10 @@ impl Config {
             )?),
             community_cache_entries: parse("LENS_COMMUNITY_CACHE_ENTRIES", 4_096)?,
             community_cache_rows: parse("LENS_COMMUNITY_CACHE_ROWS", 1_048_576)?,
+            interner_cache_entries: parse(
+                "LENS_INTERNER_CACHE_ENTRIES",
+                crate::interner::DEFAULT_CACHE_ENTRIES,
+            )?,
             velocity_days: parse("LENS_VELOCITY_DAYS", 7)?,
             community_top: parse("LENS_COMMUNITY_TOP", 3)?,
 
@@ -209,6 +217,7 @@ impl Config {
             community_cache_ttl: Duration::from_secs(600),
             community_cache_entries: 4_096,
             community_cache_rows: 1_048_576,
+            interner_cache_entries: crate::interner::DEFAULT_CACHE_ENTRIES,
             velocity_days: 7,
             community_top: 3,
             concurrency: 8,

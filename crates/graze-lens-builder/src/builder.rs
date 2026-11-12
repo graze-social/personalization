@@ -223,8 +223,10 @@ impl Builder {
     /// lookup on the serve path could ever match. Deriving the interner from the
     /// blob pool makes the ids and the blobs impossible to separate again.
     pub fn with_backfill(redis: Pool, config: Config) -> anyhow::Result<Self> {
-        let mut builder = Self::new(redis.clone(), config)?;
-        builder.interner = Some(Interner::lens(redis));
+        let interner =
+            Interner::lens(redis.clone()).with_cache_entries(config.interner_cache_entries);
+        let mut builder = Self::new(redis, config)?;
+        builder.interner = Some(interner);
         let cfg = &builder.config;
 
         let http = reqwest::Client::builder()
@@ -262,6 +264,11 @@ impl Builder {
             "follow_edges",
         )?);
         Ok(builder)
+    }
+
+    /// DIDs held in this process's interner cache. For the memory log line.
+    pub fn interner_cached_entries(&self) -> usize {
+        self.interner.as_ref().map_or(0, |i| i.cached_entries())
     }
 
     pub fn set_key(facet: &str, viewer: &str) -> String {

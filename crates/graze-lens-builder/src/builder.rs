@@ -655,6 +655,11 @@ impl Builder {
                 // the whale failing to build.
                 ("max_query_size", "10485760".to_string()),
                 ("cancel_http_readonly_queries_on_client_close", "1".into()),
+                // ClickHouse only compresses a response when asked, whatever
+                // Accept-Encoding says. These responses are TSV lists of DIDs
+                // that come back through the NAT gateway, which bills per
+                // byte; reqwest decompresses transparently.
+                ("enable_http_compression", "1".into()),
             ])
             .body(sql.to_string())
             .send()
@@ -990,6 +995,8 @@ impl Builder {
                 // Abandoned-but-still-running queries have cost us real money
                 // before; make ClickHouse drop this one if we disconnect.
                 ("cancel_http_readonly_queries_on_client_close", "1"),
+                // See `query_text`: without this the response is sent raw.
+                ("enable_http_compression", "1"),
                 ("param_database", self.clickhouse.database.as_str()),
                 // Bound, never interpolated: a DID is caller-supplied data.
                 ("param_follower", viewer),
